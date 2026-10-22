@@ -13,17 +13,14 @@
 namespace dEngine {
 	class RenderGraph;
 
-	// Pass 的图拓扑：节点身份 + 读写边（use = 资源 × usage）。
 	// usage 为 ProcessRegister 从 Desc 回填的渲染语义，是 barrier compiler 的输入
 	struct PassTopology {
 		uint32_t id = static_cast<uint32_t>(-1);
 		std::string name;
-		std::vector<ResourceUse> reads;   // 读边：资源 id + 读用途
-		std::vector<ResourceUse> writes;  // 写边：资源 id + 写用途
+		std::vector<ResourceUse> reads;// id + usage
+		std::vector<ResourceUse> writes;
 	};
 
-	// Resource 的图拓扑：节点身份 + 生产者/消费者 + 生命周期标志。
-	// reader 侧 usage 在 reader 的 PassTopology 里，此处不冗余存储
 	struct ResourceTopology {
 		uint32_t id = static_cast<uint32_t>(-1);
 		std::string name;

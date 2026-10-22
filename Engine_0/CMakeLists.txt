@@ -3,20 +3,7 @@
 #
 
 # 将源代码添加到此项目的可执行文件。
-add_executable (Engine_0 
-"Engine_0.cpp" 
-"Engine_0.h" 
-"RenderGraphDesc.h" 
-"RenderGraphAbstracted.h" 
-"RenderGraph.cpp" 
-"RenderGraphNodes.h" 
-"RenderGraphNodes.cpp" 
-"vmaExporter.cpp" 
-"rhi/RHIDesc.h" 
-"rhi/RHI.h" 
-"rhi/RHI.cpp"
-"external/spv_reflect/spirv_reflect.c"
-"external/spv_reflect/spirv_reflect.h")
+add_executable (Engine_0 "Engine_0.cpp" "Engine_0.h" "RenderGraphDesc.h" "RenderGraphAbstracted.h" "RenderGraph.cpp" "RenderGraphNodes.h" "RenderGraphNodes.cpp" "vmaExporter.cpp" "rhi/RHIDesc.h" "rhi/RHI.h" "rhi/RHI.cpp")
 
 find_package(Vulkan REQUIRED)
 find_package(glfw3 REQUIRED)
