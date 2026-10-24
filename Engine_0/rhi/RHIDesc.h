@@ -152,11 +152,23 @@ namespace dEngine::rhi {
 	enum class CullMode  { None, Front, Back };
 	enum class IndexType { UInt16, UInt32 };
 
+	// 可编程着色器阶段。Tess/Task/Mesh 为预留：枚举与组合校验先行，
+	// 管线状态创建（tessellation state / mesh 特性）待后续版本
+	enum class ShaderStage { Vertex, Fragment, TessControl, TessEval, Geometry, Task, Mesh };
+
+	// 单个着色器阶段：SPIR-V 二进制路径（离线编译产出，如 glslc），RHI 直接读取
+	struct ShaderStageDesc {
+		ShaderStage stage;
+		std::string spirvPath;
+	};
+
 	// 反射产出的资源类别（亦可手工声明时使用）
 	enum class ResourceType { SampledImage, StorageImage, UniformBuffer, StorageBuffer };
 
-	// 单条描述符声明：反射输出或手工填写
+	// 单条描述符声明：由 SPIR-V 反射产出（name 为 shader 顶层变量名，
+	// 图层按「变量名 == 资源名」约定对账）
 	struct DescriptorBinding {
+		std::string  name;
 		uint32_t     set = 0;
 		uint32_t     binding = 0;
 		ResourceType type = ResourceType::SampledImage;
@@ -164,7 +176,8 @@ namespace dEngine::rhi {
 	};
 
 	struct GraphicsPipelineDesc {
-		std::string vsSpirvPath, psSpirvPath;   // SPIR-V 二进制路径（离线编译产出，如 glslc），RHI 直接读取
+		// 着色器阶段集合（数组驱动，合法组合由 RHI 校验：Vertex 与 Task/Mesh 互斥、Tess 成对等）
+		std::vector<ShaderStageDesc> shaders;
 
 		// 附件格式签名：dynamic rendering 需要，与图的附件绑定对应
 		std::array<ImageFormat, kMaxColorAttachments> colorFormats {};
@@ -177,10 +190,9 @@ namespace dEngine::rhi {
 		CompareOp depthCompareOp = CompareOp::Less;
 		CullMode  cullMode = CullMode::Back;
 		bool      blendEnable = false;   // 单附件统一，逐附件后置
-		// descriptor 绑定：本轮由上层手工填写（如冒烟测试 / 渲染图的 ShaderBinding）；
-		// SPIR-V 反射落地后由反射填充同一字段
-		std::vector<DescriptorBinding> bindings {};
-		// push constant 块大小（字节）：0=无；VS/FS 共享、offset 固定 0（第一版最小集）
+		// 描述符布局：不在此声明——由 RHI 对各 stage SPIR-V 反射得出（见 Pipeline::SetLayout），
+		// 图层按「shader 变量名 == 图资源名」对账后回填 ShaderBinding 的 set/binding
+		// push constant 块大小（字节）：0=无；全部 stage 共享、offset 固定 0（第一版最小集）
 		uint32_t    pushConstantSize = 0;
 	};
 

@@ -13,9 +13,9 @@ Engine_0 的后端抽象层（Render Hardware Interface），位于渲染图（R
 
 | 文件 | 内容 |
 |---|---|
-| `RHIDesc.h` | 后端无关描述层：格式词表、LoadOp/StoreOp、同步枚举（`PipelineStage`/`Access`，按位组合）、资源创建参数、`GraphicsPipelineDesc`、barrier/rendering 结构、`QueueClass` 词表 |
+| `RHIDesc.h` | 后端无关描述层：格式词表、LoadOp/StoreOp、同步枚举（`PipelineStage`/`Access`，按位组合）、资源创建参数、着色器阶段词表（`ShaderStage`/`ShaderStageDesc`）、`GraphicsPipelineDesc`、barrier/rendering 结构、`QueueClass` 词表 |
 | `RHI.h` | 对象层声明：Device、资源、管线、描述符、同步原语、CommandList、Submit、FrameSlot、Swapchain |
-| `RHI.cpp` | Vulkan 实现（约 2000 行，含词表映射与冒烟验证过的全部路径） |
+| `RHI.cpp` | Vulkan 实现（约 2200 行，含词表映射、SPIR-V 反射与冒烟验证过的全部路径） |
 
 ## 3. 初始化与销毁
 
@@ -61,23 +61,30 @@ auto buffer = device->CreateBuffer(binfo);
 
 ```cpp
 rhi::GraphicsPipelineDesc pso;
-pso.vsSpirvPath = shaderDir + "/fullscreen.vert.spv"; // SPIR-V 离线编译（CMake glslc）
-pso.psSpirvPath = shaderDir + "/textured.frag.spv";
+pso.shaders = {                                                       // 阶段数组（组合由 RHI 校验）
+	{ rhi::ShaderStage::Vertex,   shaderDir + "/fullscreen.vert.spv" }, // SPIR-V 离线编译（CMake glslc）
+	{ rhi::ShaderStage::Fragment, shaderDir + "/textured.frag.spv" },
+};
 pso.colorFormats[0] = swapchain->Format();  // 附件格式签名须与实际附件视图一致
 pso.colorAttachmentCount = 1;
 pso.depthFormat = rhi::ImageFormat::None;   // None = 关闭深度测试
 pso.cullMode = rhi::CullMode::None;
-pso.pushConstantSize = 64;                  // 0=无；VS/FS 共享、offset 0、4 对齐且 ≤128
-pso.bindings = { rhi::DescriptorBinding{ 0, 0, rhi::ResourceType::SampledImage, 1 } }; // 反射落地前手工填
+pso.pushConstantSize = 64;                  // 0=无；全部 stage 共享、offset 0、4 对齐且 ≤128
 
 auto pipeline = device->CreatePipeline(pso);
 auto set = device->AllocateDescriptorSet(*pipeline->SetLayout(0));
 set->Write(0, *texture, rhi::ImageSubresource{ 0, 0 });   // combined image sampler（内置默认采样器）
 set->Write(0, *uniformBuffer, 0, size);                   // uniform/storage 缓冲
+set->Write(0, *layeredTexture, rhi::ImageSubresource{ 0, 0 }, 4); // 数组绑定：从 layer 0 起连续 4 层
 ```
 
-- `DescriptorSetLayout` 由管线反射产物持有（当前绑定来自 `pso.bindings`，SPIR-V 反射落地后由反射填充同一字段）。
-- 描述符写入在**录制前**完成（预编译路径），`Write` 声明采样图布局为 ShaderReadOnly。
+- **描述符布局完全由 SPIR-V 反射得出**（spv_reflect，`external/` 引入）：`CreatePipeline` 对各 stage 的 SPIR-V 一读两用——同一份 code 喂反射与 `vkCreateShaderModule`，产出每 set 的绑定表（变量名/set/binding/类型/数组长度），`DescriptorSetLayout` 由管线持有。**不再接受手工 `bindings` 声明**。
+- `DescriptorBinding::name` 携带 shader 顶层变量名，供上层按名匹配（渲染图约定「shader 变量名 == 图资源名」）。
+- 跨 stage 撞 (set,binding) 的共用槽位须同名同类型同长度；绑定的 stageFlags 取**实际使用该槽位的 stage 并集**（非 ALL_GRAPHICS 粗放值）。
+- 阶段组合校验：无重复、Vertex 与 Task/Mesh 互斥、须有 Vertex 或 Mesh、Task⇒Mesh、Tess 成对；**当前可用阶段为 Vertex/Fragment/Geometry**（tess/task/mesh 仅枚举预留，入口明确拒绝）。
+- 描述符写入在**录制前**完成（预编译路径）。图侧由 `RealizePass` 在对账后一次性分配并写入，句柄来自资源节点、元素数来自反射。
+- `Write` 的 `count` 覆盖数组绑定：图像按 layer 递增逐层展开（第 i 个元素用 `{mip, layer + i}`），缓冲按 range 步进（`offset + i*range`，`count > 1` 时 range 须非 0）。
+- 写入的描述符类型与布局由分配时记录的 binding 表决定：SampledImage → `COMBINED_IMAGE_SAMPLER`（内置采样器 + ShaderReadOnly），StorageImage → `STORAGE_IMAGE`（无采样器 + General）。
 
 ## 6. 命令录制（CommandList）
 
@@ -181,10 +188,13 @@ uint32_t family = device->QueueFamily(rhi::QueueClass::AsyncCompute); // QFOT ba
 |---|---|
 | barrier compiler / resource state tracker | 未实现；barrier 由调用方逐条手工声明 |
 | QFOT 执行路径 | 字段占位；配对 release/acquire + semaphore 串联待 compiler（state tracker 应同时维护 layout 与 queueFamily） |
-| SPIR-V 反射 | 未实现；`pso.bindings` 手工填写 |
+| Tess/Task/Mesh 着色阶段 | 枚举与组合校验预留；状态创建未实现（tessellation state / mesh 扩展特性），CreatePipeline 入口明确拒绝 |
+| 分离式描述符类型（SAMPLED_IMAGE/SAMPLER 分离、texel buffer 等） | 反射报暂不支持；当前仅 combined sampler / storage image / UBO / SSBO |
 | 上传路径（staging → CopyBufferToImage） | `CopyBufferToImage` 命令已具备，无配套 Upload API |
 | sRGB 格式词表 | 缺失，`*_SRGB` 归一为 UNORM |
 | Buffer 节点（渲染图侧） | 未实现 |
+| 运行时长度描述符数组（`T[]`） | 反射报暂不支持：变长数组的 descriptorCount 无从得知，被静默当成标量会导致越界；固定长度数组（`T[4]`）已可写入 |
+| 图侧描述符写入时机 | 在 `RealizePass` 一次性完成；若将来出现每帧轮转的绑定（ping-pong、跨帧资源），需把写入拆到每帧提交前 |
 
 ## 10. 陷阱备忘
 

@@ -135,8 +135,12 @@ namespace dEngine::rhi {
 		~DescriptorSet();
 
 		VkDescriptorSet NativeHandle() const;
-		void Write(uint32_t binding, const Image& image, ImageSubresource view);
-		void Write(uint32_t binding, const Buffer& buffer, uint64_t offset, uint64_t range);
+		// 图像绑定（数组绑定按 layer 递增逐层展开：第 i 个元素用 {view.mipLevel, view.layer + i}）。
+		// 描述符类型取自分配时记录的 binding 表（SampledImage → COMBINED_IMAGE_SAMPLER，
+		// StorageImage → STORAGE_IMAGE），据此选择采样器与 imageLayout
+		void Write(uint32_t binding, const Image& image, ImageSubresource view, uint32_t count = 1);
+		// 缓冲绑定（数组绑定按 range 步进：第 i 个元素 offset + i*range，count > 1 时 range 须非 0）
+		void Write(uint32_t binding, const Buffer& buffer, uint64_t offset, uint64_t range, uint32_t count = 1);
 	private:
 		friend class Device;
 		DescriptorSet(VkDevice device, VkDescriptorPool pool, VkSampler defaultSampler,

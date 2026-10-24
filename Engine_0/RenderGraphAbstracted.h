@@ -13,14 +13,17 @@
 namespace dEngine {
 	class RenderGraph;
 
+	// Pass 的图拓扑：节点身份 + 读写边（use = 资源 × usage）。
 	// usage 为 ProcessRegister 从 Desc 回填的渲染语义，是 barrier compiler 的输入
 	struct PassTopology {
 		uint32_t id = static_cast<uint32_t>(-1);
 		std::string name;
-		std::vector<ResourceUse> reads;// id + usage
-		std::vector<ResourceUse> writes;
+		std::vector<ResourceUse> reads;   // 读边：资源 id + 读用途
+		std::vector<ResourceUse> writes;  // 写边：资源 id + 写用途
 	};
 
+	// Resource 的图拓扑：节点身份 + 生产者/消费者 + 生命周期标志。
+	// reader 侧 usage 在 reader 的 PassTopology 里，此处不冗余存储
 	struct ResourceTopology {
 		uint32_t id = static_cast<uint32_t>(-1);
 		std::string name;
@@ -45,7 +48,9 @@ namespace dEngine {
 		uint32_t get_id() const { return m_topo.id; };
 		const std::string& get_name() const { return m_topo.name; }
 		const ResourceTopology& get_topology() const { return m_topo; }
-		static std::unique_ptr<Resource> AutoAllocator(ResourceTopology&& topo, Type type, ResourceDesc desc);
+		// 类型工厂：external 非空走 Borrow（不创建、不拥有），否则按 desc 走 Own
+		static std::unique_ptr<Resource> AutoAllocator(ResourceTopology&& topo, Type type, ResourceDesc desc,
+			ImageSubresource view = {}, const rhi::Image* external = nullptr);
 	protected:
 		explicit Resource(ResourceTopology&& topo) : m_topo(std::move(topo)) {}
 		ResourceTopology m_topo;
@@ -84,20 +89,42 @@ namespace dEngine {
 			ResolveSrcReadSetMismatch,
 			ShaderReadSetMismatch,
 			ShaderWriteSetMismatch,
-			DuplicateSetBinding,
 			AttachmentShaderConflict,
 			PassTypeUnspecified,
 			ResourceTypeUnspecified,
 			PassTypeDescMismatch,
-			ResourceTypeDescMismatch
+			ResourceTypeDescMismatch,
+			DeviceNotSet,
+			ColorSlotNotDense,
+			ShaderBindingTypeMismatch,
+			ShaderBindingNameNotFound,
+			ShaderVariableUnbound,
+			PipelineCreationFailed,
+			DescriptorSetAllocationFailed
 		};
-		RenderGraph():pass_top_id(-1),resource_top_id(-1) {}
+		RenderGraph() :pass_top_id(-1), resource_top_id(-1), m_graphicDevice(nullptr) {}
+		RenderGraph(rhi::Device* device):pass_top_id(-1),resource_top_id(-1),m_graphicDevice(device) {}
 		// type 必填（抽象基类无降级路径），desc 可缺省（如无描述的 Compute pass）
 		void RegisterPass(std::string name, std::set<std::string> read, std::set<std::string> write,Pass::Type type,PassDesc desc={});
 		void RegisterResource(std::string name, std::set<std::string> readers, std::string writer, Resource::Type type,ResourceDesc desc={});
+		// 借用外部已创建的原生 image 作为图资源节点（交换链、外部导入、同一 image 的多视图别名）：
+		// 节点不创建、不拥有、不参与 usage 汇总，底层句柄与生命周期由外部负责
+		void RegisterResource(std::string name, std::set<std::string> readers, std::string writer,
+			const rhi::Image* external, ImageSubresource view = {});
 		void ProcessRegister();
 		void GenerateSubmitSequence();
-		void SetDevice(rhi::Device);
+		
+		//日后可能会传递其它类型的device
+		void SetDevice(rhi::Device* graphic);
+		void RealizeResource(Resource* resource);//识别node类型并创建rhi实例（幂等：重复调用跳过）
+		void RealizePass(Pass* pass);
+		void RealizeAllResources();
+		void RealizeAllPasses();
+		void RealizeAll();
+
+		// 节点池访问（id 越界返回 nullptr；实例化产物由节点自身持有，Image::get_rhi / RenderPass::get_rhi 取用）
+		Resource* GetResource(uint32_t resourceId) const;
+		Pass*     GetPass(uint32_t passId) const;
 
 		void PrintGraph();
 
@@ -130,6 +157,8 @@ namespace dEngine {
 			std::string writer_name;
 			Resource::Type type;
 			ResourceDesc desc;
+			ImageSubresource  view {};                  // 节点代表的子资源视图
+			const rhi::Image* externalImage = nullptr;   // 非空 = 借用外部句柄
 		};
 		uint32_t pass_top_id;
 		uint32_t resource_top_id;
@@ -138,10 +167,13 @@ namespace dEngine {
 
 		std::vector<uint32_t> submitSeq;
 
+		// 全图扫描：该资源被各 pass 以何种 usage 触及，并集为创建位（图的职责，用户不必手填 usage）
+		rhi::ImageUsage DeriveImageUsage(uint32_t resourceId) const;
+
 
 		std::optional<std::map<std::string, reg_tmp_pass>> tmp_passes;
 		std::optional<std::map<std::string, reg_tmp_resource>> tmp_resources;
 
-		rhi::Device m_device;
+		rhi::Device* m_graphicDevice;
 	};
 }

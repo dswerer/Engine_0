@@ -3,7 +3,20 @@
 #
 
 # 将源代码添加到此项目的可执行文件。
-add_executable (Engine_0 "Engine_0.cpp" "Engine_0.h" "RenderGraphDesc.h" "RenderGraphAbstracted.h" "RenderGraph.cpp" "RenderGraphNodes.h" "RenderGraphNodes.cpp" "vmaExporter.cpp" "rhi/RHIDesc.h" "rhi/RHI.h" "rhi/RHI.cpp")
+add_executable (Engine_0 
+"Engine_0.cpp" 
+"Engine_0.h" 
+"RenderGraphDesc.h" 
+"RenderGraphAbstracted.h" 
+"RenderGraph.cpp" 
+"RenderGraphNodes.h" 
+"RenderGraphNodes.cpp" 
+"vmaExporter.cpp" 
+"rhi/RHIDesc.h" 
+"rhi/RHI.h" 
+"rhi/RHI.cpp"
+"external/spv_reflect/spirv_reflect.h"
+"external/spv_reflect/spirv_reflect.c")
 
 find_package(Vulkan REQUIRED)
 find_package(glfw3 REQUIRED)
@@ -20,6 +33,9 @@ if (MSVC)
   target_compile_options (Engine_0 PRIVATE /utf-8)
 endif()
 
+# spv_reflect 默认引用仓库内 spirv-headers 子目录；改用 Vulkan SDK 自带的 SPIRV-Headers
+target_compile_definitions (Engine_0 PRIVATE SPIRV_REFLECT_USE_SYSTEM_SPIRV_H)
+
 target_link_libraries(Engine_0 PUBLIC
 	Vulkan::Vulkan
 	glfw
@@ -31,7 +47,8 @@ set(ENGINE_SHADER_DIR "${CMAKE_BINARY_DIR}/shaders")
 set(ENGINE_SHADER_SOURCES
 	"${CMAKE_CURRENT_SOURCE_DIR}/shaders/fullscreen.vert"
 	"${CMAKE_CURRENT_SOURCE_DIR}/shaders/textured.frag"
-	"${CMAKE_CURRENT_SOURCE_DIR}/shaders/ubo.frag")
+	"${CMAKE_CURRENT_SOURCE_DIR}/shaders/ubo.frag"
+	"${CMAKE_CURRENT_SOURCE_DIR}/shaders/solid.frag")
 
 if (Vulkan_GLSLC_EXECUTABLE)
 	set(ENGINE_GLSLC "${Vulkan_GLSLC_EXECUTABLE}")

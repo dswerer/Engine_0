@@ -20,11 +20,29 @@ std::unique_ptr<Pass> Pass::AutoAllocator(PassTopology&& topo, Type newType, Pas
 	return nullptr;
 }
 
-std::unique_ptr<Resource> Resource::AutoAllocator(ResourceTopology&& topo, Type type, ResourceDesc desc) {
+// Borrow 路径：不创建底层 image，描述信息从外部句柄回填（格式/尺寸仍供管线格式签名与校验使用）
+Image::Image(ResourceTopology&& topo, const rhi::Image* external, ImageSubresource view)
+	: Resource(std::move(topo)), mView(view), mExternal(external) {
+	const rhi::ImageCreateInfo& d = external->Desc();
+	mDesc.width = d.width;
+	mDesc.height = d.height;
+	mDesc.depth = d.depth;
+	mDesc.arrayLayers = d.arrayLayers;
+	mDesc.mipLevels = d.mipLevels;
+	mDesc.samples = d.samples;
+	mDesc.format = d.format;
+	mDesc.viewType = d.viewType;
+}
+
+std::unique_ptr<Resource> Resource::AutoAllocator(ResourceTopology&& topo, Type type, ResourceDesc desc,
+	ImageSubresource view, const rhi::Image* external) {
 	switch (type) {
 	case Resource::Image:
+		// 借用优先：外部句柄存在时不创建、不拥有，desc 可为 monostate
+		if (external != nullptr)
+			return std::make_unique<dEngine::Image>(std::move(topo), external, view);
 		if (auto* d = std::get_if<ImageDesc>(&desc))
-			return std::make_unique<dEngine::Image>(std::move(topo), std::move(*d));
+			return std::make_unique<dEngine::Image>(std::move(topo), std::move(*d), view);
 		RenderGraph::HandleError(RenderGraph::ErrorCode::ResourceTypeDescMismatch);
 		break;
 	default:

@@ -19,6 +19,9 @@ namespace dEngine {
 	using rhi::ClearValue;
 	using rhi::ImageSubresource;
 	using rhi::kMaxColorAttachments;
+	using rhi::CompareOp;
+	using rhi::CullMode;
+	using rhi::ShaderStageDesc;
 
 #pragma region ImageDesc // 图像描述
 
@@ -68,26 +71,43 @@ namespace dEngine {
 		std::optional<uint32_t> resourceId;
 		Usage                   usage = Usage::Auto; // Auto: 按资源 format 推断（深度格式→DepthStencil，否则 Color）
 		uint32_t                slot = 0;            // 仅 ColorAttachment 有语义；depth/resolve 忽略
-		ImageSubresource        view {};
 		LoadOp                  load = LoadOp::DontCare;
 		StoreOp                 store = StoreOp::Store;
 		ClearValue              clear {};
 	};
 
-	// shader 资源绑定，与 AttachmentBinding 平级
+	// shader 资源绑定，与 AttachmentBinding 平级。
+	// 匹配约定：shader 变量名 == 图资源名——RHI 反射产出管线布局后，RealizePass 按名对账
 	struct ShaderBinding {
 		std::string             resourceName;
 		std::optional<uint32_t> resourceId;
 		Usage                   usage = Usage::Auto; // Auto: 推断为 SampledRead
-		uint32_t                set = 0;
-		uint32_t                binding = 0;
-		ImageSubresource        view {};
+		// 反射回填（RealizePass 对账成功后写入；注册期不填）——与 resourceId 的两阶段模式同构
+		std::optional<uint32_t> set;
+		std::optional<uint32_t> binding;
+	};
+
+	// 管线状态描述：shader 与固定功能状态，与附件布局（attachments/viewport）分离。
+	// 两类信息不在此处由用户填写：
+	//   附件格式签名（colorFormats/depthFormat）—— Realize 时由图从附件按 slot 推导；
+	//   描述符布局 —— 由 RHI 对 SPIR-V 反射得出，RealizePass 按「变量名 == 资源名」对账回填 set/binding
+	struct PipelineDesc {
+		std::vector<ShaderStageDesc> shaders; // 各阶段 SPIR-V 路径（离线 glslc 产出；组合合法性由 RHI 校验）
+
+		// 固定功能（与 RHI 最小集对齐；实际深度开关还受有无深度附件约束，无深度时 RHI 自动关闭）
+		bool      depthTestEnable  = true;
+		bool      depthWriteEnable = true;
+		bool      blendEnable      = false;      // 单附件统一，逐附件后置
+		CompareOp depthCompareOp   = CompareOp::Less;
+		CullMode  cullMode         = CullMode::Back;
+		uint32_t  pushConstantSize = 0;          // 0=无；全部 stage 共享、offset 固定 0
 	};
 
 	struct RenderPassDesc {
 		std::vector<AttachmentBinding> attachments;    // 顺序无语义，slot 显式
 		std::vector<ShaderBinding>     shaderBindings; // 与 attachments 平级
 		ViewportDesc                   viewport {};
+		PipelineDesc                   pipeline {};    // 管线状态（shader/blend/depth/cull）
 	};
 
 #pragma endregion

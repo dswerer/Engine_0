@@ -19,63 +19,6 @@ using namespace dEngine;
 
 int main()
 {
-	RenderGraph graph;
-
-	// GBuffer 的 RenderPassDesc：一个颜色附件(slot0) + 一个深度附件
-	RenderPassDesc gbufferDesc;
-	{
-		AttachmentBinding colorAtt;
-		colorAtt.resourceName = "Color";
-		colorAtt.slot = 0;
-		colorAtt.load = LoadOp::Clear;
-		colorAtt.clear.value = std::array<float, 4>{ 0.0f, 0.0f, 0.0f, 1.0f };
-		gbufferDesc.attachments.push_back(colorAtt);
-
-		AttachmentBinding depthAtt;
-		depthAtt.resourceName = "Depth";
-		depthAtt.usage = Usage::DepthStencilAttachment;
-		depthAtt.load = LoadOp::Clear;
-		depthAtt.clear.value = DepthStencilValue{ 1.0f, 0 };
-		gbufferDesc.attachments.push_back(depthAtt);
-	}
-
-	// ToneMap 的 RenderPassDesc：Backbuffer 附件 + 采样 Blurred
-	RenderPassDesc tonemapDesc;
-	{
-		AttachmentBinding backAtt;
-		backAtt.resourceName = "Backbuffer";
-		backAtt.slot = 0;
-		backAtt.load = LoadOp::Clear;
-		backAtt.clear.value = std::array<float, 4>{ 0.0f, 0.0f, 0.0f, 1.0f };
-		tonemapDesc.attachments.push_back(backAtt);
-
-		ShaderBinding sb;
-		sb.resourceName = "Blurred";
-		sb.set = 0;
-		sb.binding = 0;
-		tonemapDesc.shaderBindings.push_back(sb);
-	}
-
-	// 示例图：GBuffer -> Blur -> ToneMap
-	graph.RegisterPass("GBuffer", {},               {"Color", "Depth"}, Pass::Render, gbufferDesc);
-	graph.RegisterPass("Blur",    {"Color"},        {"Blurred"},        Pass::Compute);
-	graph.RegisterPass("ToneMap", {"Blurred"},      {"Backbuffer"},     Pass::Render, tonemapDesc);
-
-	// 资源用 Pass 名声明写者/读者（单写者模型）
-	ImageDesc colorDesc;  colorDesc.width = 1920; colorDesc.height = 1080; colorDesc.format = ImageFormat::RGBA16F;
-	ImageDesc depthDesc;  depthDesc.width = 1920; depthDesc.height = 1080; depthDesc.format = ImageFormat::D32F;
-	ImageDesc blurDesc;   blurDesc.width = 1920;  blurDesc.height = 1080; blurDesc.format = ImageFormat::RGBA16F;
-	ImageDesc backDesc;   backDesc.width = 1920;  backDesc.height = 1080; backDesc.format = ImageFormat::RGBA8;
-
-	graph.RegisterResource("Color",      {"Blur"},    "GBuffer", Resource::Image, colorDesc);
-	graph.RegisterResource("Depth",      {},          "GBuffer", Resource::Image, depthDesc);
-	graph.RegisterResource("Blurred",    {"ToneMap"}, "Blur",    Resource::Image, blurDesc);
-	graph.RegisterResource("Backbuffer", {},          "ToneMap", Resource::Image, backDesc);
-
-	graph.ProcessRegister();
-	graph.GenerateSubmitSequence();
-	graph.PrintGraph();
-
 	// 冒烟测试：初始化 RHI 设备与交换链（隐藏窗口，不渲染）
 	if (!glfwInit()) {
 		cerr << "glfwInit 失败\n";
@@ -97,6 +40,101 @@ int main()
 		const uint32_t api = device->ApiVersion();
 		cout << "Device: " << device->DeviceName()
 		     << " (Vulkan " << (api >> 22) << "." << ((api >> 12) & 0x3FF) << ")\n";
+
+		// 渲染图：注册、解析、实例化。graph 嵌套在设备作用域内——句柄归节点、随节点 RAII 先于 device 析构
+		RenderGraph graph(device.get());
+
+		// shader 目录（glslc 离线产物；未定义说明环境无 glslc，图内管线创建将因空路径失败）
+#ifdef ENGINE_SHADER_DIR
+		const std::string shaderDir = ENGINE_SHADER_DIR;
+#else
+		const std::string shaderDir;
+#endif
+
+		// GBuffer 的 RenderPassDesc：一个颜色附件(slot0) + 一个深度附件
+		RenderPassDesc gbufferDesc;
+		{
+			AttachmentBinding colorAtt;
+			colorAtt.resourceName = "Color";
+			colorAtt.slot = 0;
+			colorAtt.load = LoadOp::Clear;
+			colorAtt.clear.value = std::array<float, 4>{ 0.0f, 0.0f, 0.0f, 1.0f };
+			gbufferDesc.attachments.push_back(colorAtt);
+
+			AttachmentBinding depthAtt;
+			depthAtt.resourceName = "Depth";
+			depthAtt.usage = Usage::DepthStencilAttachment;
+			depthAtt.load = LoadOp::Clear;
+			depthAtt.clear.value = DepthStencilValue{ 1.0f, 0 };
+			gbufferDesc.attachments.push_back(depthAtt);
+
+			// 管线状态：只写附件不读资源，用无绑定的纯色片元；格式签名/描述符布局由图派生
+			gbufferDesc.pipeline.shaders = {
+				{ rhi::ShaderStage::Vertex,   shaderDir + "/fullscreen.vert.spv" },
+				{ rhi::ShaderStage::Fragment, shaderDir + "/solid.frag.spv" },
+			};
+			gbufferDesc.pipeline.cullMode = CullMode::None; // 与既有冒烟一致
+		}
+
+		// ToneMap 的 RenderPassDesc：Backbuffer 附件 + 采样 Blurred
+		RenderPassDesc tonemapDesc;
+		{
+			AttachmentBinding backAtt;
+			backAtt.resourceName = "Backbuffer";
+			backAtt.slot = 0;
+			backAtt.load = LoadOp::Clear;
+			backAtt.clear.value = std::array<float, 4>{ 0.0f, 0.0f, 0.0f, 1.0f };
+			tonemapDesc.attachments.push_back(backAtt);
+
+			ShaderBinding sb;
+			sb.resourceName = "Blurred"; // 须与 textured.frag 的采样变量名一致（按名对账约定）
+			tonemapDesc.shaderBindings.push_back(sb);
+
+			// 管线状态：set/binding 由 RHI 反射 textured.frag 得出，图按名对账回填
+			tonemapDesc.pipeline.shaders = {
+				{ rhi::ShaderStage::Vertex,   shaderDir + "/fullscreen.vert.spv" },
+				{ rhi::ShaderStage::Fragment, shaderDir + "/textured.frag.spv" },
+			};
+			tonemapDesc.pipeline.cullMode = CullMode::None;
+		}
+
+		// 示例图：GBuffer -> Blur -> ToneMap
+		graph.RegisterPass("GBuffer", {},               {"Color", "Depth"}, Pass::Render, gbufferDesc);
+		graph.RegisterPass("Blur",    {"Color"},        {"Blurred"},        Pass::Compute);
+		graph.RegisterPass("ToneMap", {"Blurred"},      {"Backbuffer"},     Pass::Render, tonemapDesc);
+
+		// 资源用 Pass 名声明写者/读者（单写者模型）
+		ImageDesc colorDesc;  colorDesc.width = 1920; colorDesc.height = 1080; colorDesc.format = ImageFormat::RGBA16F;
+		ImageDesc depthDesc;  depthDesc.width = 1920; depthDesc.height = 1080; depthDesc.format = ImageFormat::D32F;
+		ImageDesc blurDesc;   blurDesc.width = 1920;  blurDesc.height = 1080; blurDesc.format = ImageFormat::RGBA16F;
+		ImageDesc backDesc;   backDesc.width = 1920;  backDesc.height = 1080; backDesc.format = ImageFormat::RGBA8;
+
+		graph.RegisterResource("Color",      {"Blur"},    "GBuffer", Resource::Image, colorDesc);
+		graph.RegisterResource("Depth",      {},          "GBuffer", Resource::Image, depthDesc);
+		graph.RegisterResource("Blurred",    {"ToneMap"}, "Blur",    Resource::Image, blurDesc);
+		graph.RegisterResource("Backbuffer", {},          "ToneMap", Resource::Image, backDesc);
+
+		graph.ProcessRegister();
+		graph.GenerateSubmitSequence();
+		graph.PrintGraph();
+
+		// 实例化冒烟：usage 全图派生 + 后端 Image/Pipeline 创建（句柄归节点，get_rhi 取用）
+		graph.RealizeAll();
+		{
+			uint32_t realizedImages = 0, realizedPipelines = 0;
+			for (uint32_t i = 0; graph.GetResource(i) != nullptr; ++i) {
+				Resource* res = graph.GetResource(i);
+				if (res->get_type() == Resource::Image && static_cast<Image*>(res)->get_rhi())
+					++realizedImages;
+			}
+			for (uint32_t i = 0; graph.GetPass(i) != nullptr; ++i) {
+				Pass* p = graph.GetPass(i);
+				if (p->get_type() == Pass::Render && static_cast<RenderPass*>(p)->get_rhi())
+					++realizedPipelines;
+			}
+			cout << "RenderGraph realize ok: " << realizedImages << " images, "
+			     << realizedPipelines << " pipelines\n";
+		}
 
 		rhi::ImageCreateInfo imageInfo;
 		imageInfo.width = 1920; imageInfo.height = 1080;
@@ -169,8 +207,7 @@ int main()
 		}
 
 #ifdef ENGINE_SHADER_DIR
-		// 管线与描述符冒烟：shader 由 CMake 调 glslc 离线编译到 ENGINE_SHADER_DIR
-		const std::string shaderDir = ENGINE_SHADER_DIR;
+		// 管线与描述符冒烟：shader 由 CMake 调 glslc 离线编译到 ENGINE_SHADER_DIR（shaderDir 已在图注册前定义）
 
 		// A：全屏三角形 + 采样纹理（combined image sampler 路径）
 		rhi::ImageCreateInfo texInfo;
@@ -179,13 +216,15 @@ int main()
 		texInfo.usage  = rhi::ImageUsage::Sampled;
 		if (auto tex = device->CreateImage(texInfo)) {
 			rhi::GraphicsPipelineDesc psoA;
-			psoA.vsSpirvPath = shaderDir + "/fullscreen.vert.spv";
-			psoA.psSpirvPath = shaderDir + "/textured.frag.spv";
+			psoA.shaders = {
+				{ rhi::ShaderStage::Vertex,   shaderDir + "/fullscreen.vert.spv" },
+				{ rhi::ShaderStage::Fragment, shaderDir + "/textured.frag.spv" },
+			};
 			psoA.colorFormats[0] = rhi::ImageFormat::RGBA8;
 			psoA.colorAttachmentCount = 1;
 			psoA.depthFormat = rhi::ImageFormat::None; // 无深度附件，管线内部自动关闭深度测试
 			psoA.cullMode = rhi::CullMode::None;
-			psoA.bindings = { rhi::DescriptorBinding{ 0, 0, rhi::ResourceType::SampledImage, 1 } };
+			// 描述符布局由 RHI 反射 textured.frag 得出（无需手填 bindings）
 
 			if (auto pipeline = device->CreatePipeline(psoA)) {
 				const rhi::DescriptorSetLayout* layout = pipeline->SetLayout(0);
@@ -206,13 +245,15 @@ int main()
 		uboInfo.hostVisible = true;
 		if (auto ubo = device->CreateBuffer(uboInfo)) {
 			rhi::GraphicsPipelineDesc psoB;
-			psoB.vsSpirvPath = shaderDir + "/fullscreen.vert.spv";
-			psoB.psSpirvPath = shaderDir + "/ubo.frag.spv";
+			psoB.shaders = {
+				{ rhi::ShaderStage::Vertex,   shaderDir + "/fullscreen.vert.spv" },
+				{ rhi::ShaderStage::Fragment, shaderDir + "/ubo.frag.spv" },
+			};
 			psoB.colorFormats[0] = rhi::ImageFormat::RGBA8;
 			psoB.colorAttachmentCount = 1;
 			psoB.depthFormat = rhi::ImageFormat::None;
 			psoB.cullMode = rhi::CullMode::None;
-			psoB.bindings = { rhi::DescriptorBinding{ 0, 0, rhi::ResourceType::UniformBuffer, 1 } };
+			// 描述符布局由 RHI 反射 ubo.frag 得出（无需手填 bindings）
 
 			if (auto pipeline = device->CreatePipeline(psoB)) {
 				const rhi::DescriptorSetLayout* layout = pipeline->SetLayout(0);
@@ -235,13 +276,15 @@ int main()
 			auto tex2 = device->CreateImage(texInfo2);
 
 			rhi::GraphicsPipelineDesc pso;
-			pso.vsSpirvPath = shaderDir + "/fullscreen.vert.spv";
-			pso.psSpirvPath = shaderDir + "/textured.frag.spv";
+			pso.shaders = {
+				{ rhi::ShaderStage::Vertex,   shaderDir + "/fullscreen.vert.spv" },
+				{ rhi::ShaderStage::Fragment, shaderDir + "/textured.frag.spv" },
+			};
 			pso.colorFormats[0] = swapchain2->Format(); // 与 backbuffer 视图格式一致
 			pso.colorAttachmentCount = 1;
 			pso.depthFormat = rhi::ImageFormat::None;
 			pso.cullMode = rhi::CullMode::None;
-			pso.bindings = { rhi::DescriptorBinding{ 0, 0, rhi::ResourceType::SampledImage, 1 } };
+			// 描述符布局由 RHI 反射得出（无需手填 bindings）
 
 			auto pipeline2 = device->CreatePipeline(pso);
 			auto set2 = (pipeline2 && pipeline2->SetLayout(0))

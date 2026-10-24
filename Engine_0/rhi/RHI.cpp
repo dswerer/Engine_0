@@ -1,6 +1,7 @@
 #include "RHI.h"
 
 #include "../external/vk_mem_alloc.h"
+#include "../external/spv_reflect/spirv_reflect.h"
 
 // Win32 表面：vulkan_win32.h 依赖 windows.h 提供的 HWND / HINSTANCE
 #define WIN32_LEAN_AND_MEAN
@@ -361,6 +362,160 @@ namespace {
 		std::vector<uint32_t> code(static_cast<size_t>(size) / 4);
 		if (!file.read(reinterpret_cast<char*>(code.data()), size)) return {};
 		return code;
+	}
+
+	// ShaderStage -> Vulkan stage 位。Task/Mesh 位的存在不等于设备已启用相应扩展——
+	// 当前版本在 CreatePipeline 入口对未支持的阶段明确拒绝
+	VkShaderStageFlagBits ToVkStage(ShaderStage stage) {
+		switch (stage) {
+			case ShaderStage::Vertex:      return VK_SHADER_STAGE_VERTEX_BIT;
+			case ShaderStage::Fragment:    return VK_SHADER_STAGE_FRAGMENT_BIT;
+			case ShaderStage::TessControl: return VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT;
+			case ShaderStage::TessEval:    return VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
+			case ShaderStage::Geometry:    return VK_SHADER_STAGE_GEOMETRY_BIT;
+			case ShaderStage::Task:        return VK_SHADER_STAGE_TASK_BIT_EXT;
+			case ShaderStage::Mesh:        return VK_SHADER_STAGE_MESH_BIT_EXT;
+			default:                       return VK_SHADER_STAGE_VERTEX_BIT;
+		}
+	}
+
+	const char* ShaderStageName(ShaderStage stage) {
+		switch (stage) {
+			case ShaderStage::Vertex:      return "vertex";
+			case ShaderStage::Fragment:    return "fragment";
+			case ShaderStage::TessControl: return "tessellation control";
+			case ShaderStage::TessEval:    return "tessellation evaluation";
+			case ShaderStage::Geometry:    return "geometry";
+			case ShaderStage::Task:        return "task";
+			case ShaderStage::Mesh:        return "mesh";
+			default:                       return "unknown";
+		}
+	}
+
+	// 图形管线着色器阶段组合校验：至少一个阶段、无重复；
+	// Vertex 与 Task/Mesh 互斥（顶点来源二选一）；Task 须伴随 Mesh；TessControl/TessEval 成对
+	bool ValidateStageCombination(const std::vector<ShaderStageDesc>& shaders) {
+		if (shaders.empty()) {
+			std::cerr << "[RHI] 管线须至少声明一个着色器阶段\n";
+			return false;
+		}
+		bool hasVertex = false, hasMesh = false, hasTask = false, hasTC = false, hasTE = false;
+		for (size_t i = 0; i < shaders.size(); ++i) {
+			for (size_t j = i + 1; j < shaders.size(); ++j) {
+				if (shaders[i].stage == shaders[j].stage) {
+					std::cerr << "[RHI] 重复的着色器阶段: " << ShaderStageName(shaders[i].stage) << "\n";
+					return false;
+				}
+			}
+			switch (shaders[i].stage) {
+				case ShaderStage::Vertex:      hasVertex = true; break;
+				case ShaderStage::Mesh:        hasMesh = true;   break;
+				case ShaderStage::Task:        hasTask = true;   break;
+				case ShaderStage::TessControl: hasTC = true;     break;
+				case ShaderStage::TessEval:    hasTE = true;     break;
+				default: break;
+			}
+		}
+		if (hasVertex && (hasMesh || hasTask)) {
+			std::cerr << "[RHI] Vertex 与 Task/Mesh 互斥（顶点来源二选一）\n";
+			return false;
+		}
+		if (!hasVertex && !hasMesh) {
+			std::cerr << "[RHI] 图形管线须有 Vertex 或 Mesh 阶段\n";
+			return false;
+		}
+		if (hasTask && !hasMesh) {
+			std::cerr << "[RHI] Task 阶段必须伴随 Mesh\n";
+			return false;
+		}
+		if (hasTC != hasTE) {
+			std::cerr << "[RHI] TessControl/TessEval 须成对出现\n";
+			return false;
+		}
+		return true;
+	}
+
+	// SpvReflectDescriptorType -> ResourceType（描述层词表）。
+	// 分离式 SAMPLED_IMAGE / SAMPLER、texel buffer、dynamic buffer、input attachment
+	// 等当前词表未覆盖，遇到即报暂不支持
+	bool ToResourceType(SpvReflectDescriptorType t, ResourceType& out) {
+		switch (t) {
+			case SPV_REFLECT_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER: out = ResourceType::SampledImage;   return true;
+			case SPV_REFLECT_DESCRIPTOR_TYPE_STORAGE_IMAGE:          out = ResourceType::StorageImage;   return true;
+			case SPV_REFLECT_DESCRIPTOR_TYPE_UNIFORM_BUFFER:         out = ResourceType::UniformBuffer;  return true;
+			case SPV_REFLECT_DESCRIPTOR_TYPE_STORAGE_BUFFER:         out = ResourceType::StorageBuffer;  return true;
+			default:                                                                                      return false;
+		}
+	}
+
+	// SPIR-V 反射：枚举本 stage 的全部描述符绑定（顶层变量名/set/binding/类型/数组长度）。
+	// 描述符布局的唯一事实来源——CreatePipeline 不再接受手工 bindings 声明
+	bool ReflectDescriptorBindings(const std::vector<uint32_t>& code, const char* stageLabel,
+		std::vector<DescriptorBinding>& out) {
+		SpvReflectShaderModule module{};
+		if (spvReflectCreateShaderModule(code.size() * sizeof(uint32_t), code.data(), &module)
+			!= SPV_REFLECT_RESULT_SUCCESS) {
+			std::cerr << "[RHI] SPIR-V 反射失败（" << stageLabel << "）\n";
+			return false;
+		}
+
+		uint32_t count = 0;
+		std::vector<SpvReflectDescriptorBinding*> bindings;
+		if (spvReflectEnumerateDescriptorBindings(&module, &count, nullptr) == SPV_REFLECT_RESULT_SUCCESS
+			&& count > 0) {
+			bindings.resize(count);
+			if (spvReflectEnumerateDescriptorBindings(&module, &count, bindings.data())
+				!= SPV_REFLECT_RESULT_SUCCESS) {
+				std::cerr << "[RHI] 枚举描述符绑定失败（" << stageLabel << "）\n";
+				spvReflectDestroyShaderModule(&module);
+				return false;
+			}
+		}
+
+		out.reserve(out.size() + count);
+		for (uint32_t i = 0; i < count; ++i) {
+			const SpvReflectDescriptorBinding* b = bindings[i];
+			DescriptorBinding db;
+			db.set = b->set;
+			db.binding = b->binding;
+			// 无名描述符变量（SPIR-V 中缺 OpName）：图层按「变量名 == 资源名」对账，
+			// 无名即无法定位，在此 fail-fast；否则会兜底成 ShaderVariableUnbound，误导排查方向
+			if (b->name == nullptr || b->name[0] == '\0') {
+				std::cerr << "[RHI] " << stageLabel << " 反射到无名的描述符变量: set" << db.set
+					<< " binding" << db.binding << "（顶层变量须具名）\n";
+				spvReflectDestroyShaderModule(&module);
+				return false;
+			}
+			db.name = b->name;
+			// 运行时长度数组（OpTypeRuntimeArray）：spv_reflect 把该维记为
+			// SPV_REFLECT_ARRAY_DIM_RUNTIME(=0)，逐维乘下来 count 归零。此时布局的
+			// descriptorCount 无法从 shader 得知，若靠 max(1u, count) 兜底会被静默当成标量，
+			// 造成「布局只给 1 个元素、shader 却按变长索引」的越界——此处显式拒绝
+			bool runtimeArray = false;
+			for (uint32_t d = 0; d < b->array.dims_count; ++d) {
+				if (b->array.dims[d] == SPV_REFLECT_ARRAY_DIM_RUNTIME) {
+					runtimeArray = true;
+					break;
+				}
+			}
+			if (runtimeArray) {
+				std::cerr << "[RHI] " << stageLabel << " 反射到运行时长度数组绑定: " << db.name
+					<< "（暂不支持，请改用固定长度，如 [4]）\n";
+				spvReflectDestroyShaderModule(&module);
+				return false;
+			}
+			db.arrayCount = std::max(1u, b->count);
+			if (!ToResourceType(b->descriptor_type, db.type)) {
+				std::cerr << "[RHI] " << stageLabel << " 反射到暂不支持的描述符类型: "
+					<< db.name << "（descriptor_type=" << b->descriptor_type << "）\n";
+				spvReflectDestroyShaderModule(&module);
+				return false;
+			}
+			out.push_back(std::move(db));
+		}
+
+		spvReflectDestroyShaderModule(&module);
+		return true;
 	}
 
 } // namespace
@@ -1211,54 +1366,77 @@ DescriptorSet::~DescriptorSet()
 
 VkDescriptorSet DescriptorSet::NativeHandle() const { return m_set; }
 
-// 图像绑定：写入持久视图 + RHI 内置默认采样器（combined image sampler）
-void DescriptorSet::Write(uint32_t binding, const Image& image, ImageSubresource view)
+// 图像绑定：数组按 layer 递增逐层展开；类型取自分配时记录的 binding 表
+// （SampledImage → combined 描述符 + 内置采样器；StorageImage → storage 描述符、无采样器）
+void DescriptorSet::Write(uint32_t binding, const Image& image, ImageSubresource view, uint32_t count)
 {
-	const ImageView& imageView = image.CreateView(view);
-	if (imageView.NativeHandle() == VK_NULL_HANDLE) {
-		std::cerr << "[RHI] 描述符写入失败：图像视图无效（binding " << binding << "）\n";
+	if (count == 0) {
+		std::cerr << "[RHI] 描述符写入失败：count 为 0（binding " << binding << "）\n";
 		return;
 	}
 
-	VkDescriptorImageInfo imageInfo{};
-	imageInfo.sampler = m_defaultSampler;
-	imageInfo.imageView = imageView.NativeHandle();
-	// 固定只读布局：实际绘制前须由 barrier 把资源转到该布局
-	imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	VkDescriptorType type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	if (auto it = m_bindingTypes.find(binding); it != m_bindingTypes.end()) {
+		if (it->second == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+	}
+	const bool storage = (type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+
+	std::vector<VkDescriptorImageInfo> imageInfos(count);
+	for (uint32_t i = 0; i < count; ++i) {
+		const ImageSubresource sub{ view.mipLevel, view.layer + i };
+		const ImageView& imageView = image.CreateView(sub);
+		if (imageView.NativeHandle() == VK_NULL_HANDLE) {
+			std::cerr << "[RHI] 描述符写入失败：图像视图无效（binding " << binding
+				<< " 元素 " << i << "）\n";
+			return;
+		}
+		imageInfos[i].sampler = storage ? VK_NULL_HANDLE : m_defaultSampler;
+		imageInfos[i].imageView = imageView.NativeHandle();
+		// 固定布局：实际使用前须由 barrier 把资源转到该布局
+		imageInfos[i].imageLayout = storage
+			? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	}
 
 	VkWriteDescriptorSet write{};
 	write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
 	write.dstSet = m_set;
 	write.dstBinding = binding;
 	write.dstArrayElement = 0;
-	write.descriptorCount = 1;
-	write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-	write.pImageInfo = &imageInfo;
+	write.descriptorCount = count;
+	write.descriptorType = type;
+	write.pImageInfo = imageInfos.data();
 
 	vkUpdateDescriptorSets(m_device, 1, &write, 0, nullptr);
 }
 
-// 缓冲绑定：range 为 0 表示到缓冲末尾；类型由分配时记录的 binding 表决定
-void DescriptorSet::Write(uint32_t binding, const Buffer& buffer, uint64_t offset, uint64_t range)
+// 缓冲绑定：range 为 0 表示到缓冲末尾；数组按 range 步进（第 i 个元素 offset + i*range）
+void DescriptorSet::Write(uint32_t binding, const Buffer& buffer, uint64_t offset, uint64_t range, uint32_t count)
 {
-	VkDescriptorBufferInfo bufferInfo{};
-	bufferInfo.buffer = buffer.NativeHandle();
-	bufferInfo.offset = offset;
-	bufferInfo.range = range;
+	if (count == 0 || (count > 1 && range == 0)) {
+		std::cerr << "[RHI] 描述符写入失败：数组绑定需 count > 0 且 range 可步进（binding " << binding << "）\n";
+		return;
+	}
 
 	VkDescriptorType type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
 	if (auto it = m_bindingTypes.find(binding); it != m_bindingTypes.end()) {
 		if (it->second == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
 	}
 
+	std::vector<VkDescriptorBufferInfo> bufferInfos(count);
+	for (uint32_t i = 0; i < count; ++i) {
+		bufferInfos[i].buffer = buffer.NativeHandle();
+		bufferInfos[i].offset = offset + static_cast<uint64_t>(i) * range;
+		bufferInfos[i].range = range;
+	}
+
 	VkWriteDescriptorSet write{};
 	write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
 	write.dstSet = m_set;
 	write.dstBinding = binding;
 	write.dstArrayElement = 0;
-	write.descriptorCount = 1;
+	write.descriptorCount = count;
 	write.descriptorType = type;
-	write.pBufferInfo = &bufferInfo;
+	write.pBufferInfo = bufferInfos.data();
 
 	vkUpdateDescriptorSets(m_device, 1, &write, 0, nullptr);
 }
@@ -1323,15 +1501,78 @@ const DescriptorSetLayout* Pipeline::SetLayout(uint32_t setIndex) const
 // dynamic rendering 下的图形管线：多态渲染无需 VkRenderPass，附件格式经 VkPipelineRenderingCreateInfo 声明
 std::unique_ptr<Pipeline> Device::CreatePipeline(const GraphicsPipelineDesc& desc)
 {
-	// ---- 按 set 分组（组内 binding 升序，保证布局可预测）----
-	uint32_t setCount = 0;
-	for (const auto& b : desc.bindings) setCount = std::max(setCount, b.set + 1);
+	// ---- 阶段组合校验（Vertex×Mesh 互斥、Tess 成对、至少一个顶点来源阶段）----
+	if (!ValidateStageCombination(desc.shaders))
+		return nullptr;
+	// 当前版本仅实现 Vertex/Fragment/Geometry 的状态创建：
+	// Tess 需要 tessellation state，Task/Mesh 需要设备扩展与特性，待后续版本
+	for (const auto& s : desc.shaders) {
+		switch (s.stage) {
+			case ShaderStage::Vertex:
+			case ShaderStage::Fragment:
+			case ShaderStage::Geometry:
+				break;
+			default:
+				std::cerr << "[RHI] 暂不支持的着色器阶段: " << ShaderStageName(s.stage)
+					<< "（tess/mesh 待后续版本）\n";
+				return nullptr;
+		}
+	}
 
-	std::vector<std::vector<DescriptorBinding>> bySet(setCount);
-	for (const auto& b : desc.bindings) bySet[b.set].push_back(b);
+	// ---- 读取 SPIR-V（一读两用：同一份 code 喂反射与 vkCreateShaderModule）----
+	std::vector<std::vector<uint32_t>> codes(desc.shaders.size());
+	for (size_t i = 0; i < desc.shaders.size(); ++i) {
+		codes[i] = ReadSpirv(desc.shaders[i].spirvPath);
+		if (codes[i].empty()) {
+			std::cerr << "[RHI] 读取 SPIR-V 失败: " << desc.shaders[i].spirvPath << "\n";
+			return nullptr;
+		}
+	}
+
+	// ---- 反射描述符布局：逐 stage 枚举后按 (set,binding) 合并 ----
+	// 撞槽的跨 stage 共用槽位须同名同类型同长度（Vulkan 布局兼容性 + 「变量名==资源名」对账约定），
+	// 并按槽位累积 stageFlags（替代此前 ALL_GRAPHICS 的粗放值）
+	std::vector<DescriptorBinding>  merged;
+	std::vector<VkShaderStageFlags> mergedStages; // 与 merged 同下标：该槽位的 stage 并集
+	for (size_t i = 0; i < desc.shaders.size(); ++i) {
+		std::vector<DescriptorBinding> stageBindings;
+		if (!ReflectDescriptorBindings(codes[i], ShaderStageName(desc.shaders[i].stage), stageBindings))
+			return nullptr;
+		const VkShaderStageFlags stageFlag = ToVkStage(desc.shaders[i].stage);
+		for (auto& b : stageBindings) {
+			bool slotFound = false;
+			for (size_t j = 0; j < merged.size(); ++j) {
+				if (merged[j].set == b.set && merged[j].binding == b.binding) {
+					if (merged[j].type != b.type || merged[j].arrayCount != b.arrayCount || merged[j].name != b.name) {
+						std::cerr << "[RHI] 跨 stage 反射到失配的共用槽位: set" << b.set
+							<< " binding" << b.binding << "（" << merged[j].name << " vs " << b.name << "）\n";
+						return nullptr;
+					}
+					mergedStages[j] |= stageFlag; // 共用槽位：stageFlags 取并集
+					slotFound = true;
+					break;
+				}
+			}
+			if (!slotFound) {
+				merged.push_back(std::move(b));
+				mergedStages.push_back(stageFlag);
+			}
+		}
+	}
+	// push constant 的 stage 集合：desc 级声明（非反射），覆盖全部 stage
+	VkShaderStageFlags allStages = 0;
+	for (const auto& s : desc.shaders) allStages |= ToVkStage(s.stage);
+
+	// ---- 按 set 分组（组内 binding 升序，保证布局可预测）；携带 stageFlags 供建布局 ----
+	uint32_t setCount = 0;
+	for (const auto& b : merged) setCount = std::max(setCount, b.set + 1);
+
+	struct GroupedBinding { DescriptorBinding desc; VkShaderStageFlags stages; };
+	std::vector<std::vector<GroupedBinding>> bySet(setCount);
+	for (size_t i = 0; i < merged.size(); ++i) bySet[merged[i].set].push_back({ merged[i], mergedStages[i] });
 	for (auto& group : bySet) {
 		std::sort(group.begin(), group.end(),
-			[](const DescriptorBinding& a, const DescriptorBinding& c) { return a.binding < c.binding; });
+			[](const GroupedBinding& a, const GroupedBinding& c) { return a.desc.binding < c.desc.binding; });
 	}
 
 	// ---- 各 set 的描述符集合布局（由 Pipeline 持有）----
@@ -1342,13 +1583,16 @@ std::unique_ptr<Pipeline> Device::CreatePipeline(const GraphicsPipelineDesc& des
 	for (uint32_t i = 0; i < setCount; ++i) {
 		std::vector<VkDescriptorSetLayoutBinding> vkBindings;
 		vkBindings.reserve(bySet[i].size());
+		std::vector<DescriptorBinding> groupDescs; // DescriptorSetLayout 侧仅持声明（stageFlags 已烙进 Vk 对象）
+		groupDescs.reserve(bySet[i].size());
 		for (const auto& b : bySet[i]) {
 			VkDescriptorSetLayoutBinding vb{};
-			vb.binding = b.binding;
-			vb.descriptorType = ToVkDescriptorType(b.type);
-			vb.descriptorCount = b.arrayCount;
-			vb.stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS; // 绑定未携带 stage 信息，统一给图形全阶段
+			vb.binding = b.desc.binding;
+			vb.descriptorType = ToVkDescriptorType(b.desc.type);
+			vb.descriptorCount = b.desc.arrayCount;
+			vb.stageFlags = b.stages; // 反射累积：实际使用该槽位的 stage 并集
 			vkBindings.push_back(vb);
+			groupDescs.push_back(b.desc);
 		}
 
 		VkDescriptorSetLayoutCreateInfo layoutCI{};
@@ -1363,17 +1607,17 @@ std::unique_ptr<Pipeline> Device::CreatePipeline(const GraphicsPipelineDesc& des
 		}
 		rawLayouts.push_back(raw);
 		layouts.push_back(std::unique_ptr<DescriptorSetLayout>(
-			new DescriptorSetLayout(m_device, raw, std::move(bySet[i]))));
+			new DescriptorSetLayout(m_device, raw, std::move(groupDescs))));
 	}
 
-	// ---- 管线布局（push constant：VS/FS 共享、offset 0；desc 未声明则无 range）----
+	// ---- 管线布局（push constant：全部 stage 共享、offset 0；desc 未声明则无 range）----
 	VkPushConstantRange pushRange{};
 	if (desc.pushConstantSize > 0) {
 		if (desc.pushConstantSize % 4 != 0 || desc.pushConstantSize > 128) {
 			std::cerr << "[RHI] pushConstantSize 须 4 字节对齐且 <= 128: " << desc.pushConstantSize << "\n";
 			return nullptr;
 		}
-		pushRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+		pushRange.stageFlags = allStages;
 		pushRange.offset = 0;
 		pushRange.size = desc.pushConstantSize;
 	}
@@ -1391,42 +1635,36 @@ std::unique_ptr<Pipeline> Device::CreatePipeline(const GraphicsPipelineDesc& des
 		return nullptr;
 	}
 
-	// ---- shader 模块（离线 SPIR-V 二进制，入口固定 main）----
-	auto createModule = [&](const std::string& path, VkShaderModule& out) {
-		const std::vector<uint32_t> code = ReadSpirv(path);
-		if (code.empty()) {
-			std::cerr << "[RHI] 读取 SPIR-V 失败: " << path << "\n";
-			return false;
-		}
+	// ---- shader 模块（复用已读的 SPIR-V code；入口固定 main）----
+	auto createModule = [&](const std::vector<uint32_t>& code, VkShaderModule& out) {
 		VkShaderModuleCreateInfo moduleCI{};
 		moduleCI.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
 		moduleCI.codeSize = code.size() * sizeof(uint32_t);
 		moduleCI.pCode = code.data();
 		if (vkCreateShaderModule(m_device, &moduleCI, nullptr, &out) != VK_SUCCESS) {
-			std::cerr << "[RHI] vkCreateShaderModule 失败: " << path << "\n";
+			std::cerr << "[RHI] vkCreateShaderModule 失败\n";
 			return false;
 		}
 		return true;
 	};
 
-	VkShaderModule vsModule = VK_NULL_HANDLE;
-	VkShaderModule psModule = VK_NULL_HANDLE;
-	if (!createModule(desc.vsSpirvPath, vsModule) || !createModule(desc.psSpirvPath, psModule)) {
-		if (vsModule) vkDestroyShaderModule(m_device, vsModule, nullptr);
-		if (psModule) vkDestroyShaderModule(m_device, psModule, nullptr);
+	std::vector<VkShaderModule> modules(desc.shaders.size(), VK_NULL_HANDLE);
+	bool modulesOk = true;
+	for (size_t i = 0; i < desc.shaders.size() && modulesOk; ++i)
+		modulesOk = createModule(codes[i], modules[i]);
+	if (!modulesOk) {
+		for (VkShaderModule m : modules) if (m) vkDestroyShaderModule(m_device, m, nullptr);
 		vkDestroyPipelineLayout(m_device, pipelineLayout, nullptr);
 		return nullptr;
 	}
 
-	VkPipelineShaderStageCreateInfo stages[2]{};
-	stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-	stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-	stages[0].module = vsModule;
-	stages[0].pName = "main";
-	stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-	stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-	stages[1].module = psModule;
-	stages[1].pName = "main";
+	std::vector<VkPipelineShaderStageCreateInfo> stages(desc.shaders.size());
+	for (size_t i = 0; i < desc.shaders.size(); ++i) {
+		stages[i].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+		stages[i].stage = ToVkStage(desc.shaders[i].stage);
+		stages[i].module = modules[i];
+		stages[i].pName = "main";
+	}
 
 	// ---- 固定功能状态 ----
 	// 顶点输入留空：顶点数据由 shader 内建 gl_VertexIndex 生成（无顶点缓冲）
@@ -1512,8 +1750,8 @@ std::unique_ptr<Pipeline> Device::CreatePipeline(const GraphicsPipelineDesc& des
 	VkGraphicsPipelineCreateInfo pipelineCI{};
 	pipelineCI.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
 	pipelineCI.pNext = &renderingInfo;
-	pipelineCI.stageCount = 2;
-	pipelineCI.pStages = stages;
+	pipelineCI.stageCount = static_cast<uint32_t>(stages.size());
+	pipelineCI.pStages = stages.data();
 	pipelineCI.pVertexInputState = &vertexInput;
 	pipelineCI.pInputAssemblyState = &inputAssembly;
 	pipelineCI.pViewportState = &viewportState;
@@ -1530,8 +1768,7 @@ std::unique_ptr<Pipeline> Device::CreatePipeline(const GraphicsPipelineDesc& des
 	VkPipeline pipeline = VK_NULL_HANDLE;
 	const VkResult result = vkCreateGraphicsPipelines(m_device, m_pipelineCache, 1, &pipelineCI, nullptr, &pipeline);
 
-	vkDestroyShaderModule(m_device, vsModule, nullptr);
-	vkDestroyShaderModule(m_device, psModule, nullptr);
+	for (VkShaderModule m : modules) vkDestroyShaderModule(m_device, m, nullptr);
 
 	if (result != VK_SUCCESS) {
 		std::cerr << "[RHI] vkCreateGraphicsPipelines 失败: " << result << "\n";

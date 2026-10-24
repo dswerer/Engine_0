@@ -50,8 +50,6 @@ void RenderGraph::HandleError(ErrorCode code) {
 		std::cerr << "RenderGraph: 读类 shader 绑定应在 read 集" << std::endl; break;
 	case ErrorCode::ShaderWriteSetMismatch:
 		std::cerr << "RenderGraph: StorageWrite 绑定应在 write 集" << std::endl; break;
-	case ErrorCode::DuplicateSetBinding:
-		std::cerr << "RenderGraph: set/binding 重复" << std::endl; break;
 	case ErrorCode::AttachmentShaderConflict:
 		std::cerr << "RenderGraph: 资源同时作为附件与 shader 绑定（同 pass 又读又写）" << std::endl; break;
 	case ErrorCode::PassTypeUnspecified:
@@ -62,6 +60,18 @@ void RenderGraph::HandleError(ErrorCode code) {
 		std::cerr << "RenderGraph: Pass 类型与 Desc 不匹配" << std::endl; break;
 	case ErrorCode::ResourceTypeDescMismatch:
 		std::cerr << "RenderGraph: Resource 类型与 Desc 不匹配（或该类型节点尚未实现）" << std::endl; break;
+	case ErrorCode::DeviceNotSet:
+		std::cerr << "RenderGraph: 未设置 Device（先调用 SetDevice 再 Realize）" << std::endl; break;
+	case ErrorCode::ColorSlotNotDense:
+		std::cerr << "RenderGraph: 颜色附件 slot 不连续（须稠密 0..n-1，供 Realize 派生格式签名）" << std::endl; break;
+	case ErrorCode::ShaderBindingTypeMismatch:
+		std::cerr << "RenderGraph: shader 绑定的资源类型×usage 与反射类型不匹配" << std::endl; break;
+	case ErrorCode::ShaderBindingNameNotFound:
+		std::cerr << "RenderGraph: shader 绑定的资源在反射布局中无同名变量（shader 不使用该资源）" << std::endl; break;
+	case ErrorCode::ShaderVariableUnbound:
+		std::cerr << "RenderGraph: 反射变量在图中无同名资源（漏接）" << std::endl; break;
+	case ErrorCode::PipelineCreationFailed:
+		std::cerr << "RenderGraph: 管线创建失败（详细原因见上方 RHI 日志）" << std::endl; break;
 	default:
 		std::cerr << "RenderGraph: 未知校验错误" << std::endl; break;
 	}
@@ -144,12 +154,16 @@ void RenderGraph::ValidateAttachments(const std::set<uint32_t>& read, const std:
 		if (att.usage == Usage::ResolveSrc && read.count(id) == 0)
 			throw ErrorCode::ResolveSrcReadSetMismatch;
 	}
+
+	// 颜色槽须稠密 0..n-1：Realize 派生管线格式签名按 slot 就位，缺口会留下格式空洞
+	if (!colorSlots.empty() && *colorSlots.rbegin() + 1 != colorSlots.size())
+		throw ErrorCode::ColorSlotNotDense;
 }
 
 void RenderGraph::ValidateShaderBindings(const std::set<uint32_t>& read, const std::set<uint32_t>& write,
 	const RenderPassDesc& desc)
 {
-	std::set<std::pair<uint32_t, uint32_t>> setBindingKeys;
+	// set/binding 已改由 SPIR-V 反射分配（RealizePass 回填），注册期不再校验
 	for (auto& sb : desc.shaderBindings) {
 		switch (sb.usage) {
 		case Usage::SampledRead:
@@ -169,9 +183,6 @@ void RenderGraph::ValidateShaderBindings(const std::set<uint32_t>& read, const s
 			if (read.count(id) == 0)
 				throw ErrorCode::ShaderReadSetMismatch;
 		}
-
-		if (!setBindingKeys.insert({ sb.set, sb.binding }).second)
-			throw ErrorCode::DuplicateSetBinding;
 	}
 }
 
@@ -212,6 +223,22 @@ void RenderGraph::RegisterResource(std::string name, std::set<std::string> reade
 	rtr.writer_name = writer;
 	rtr.type = type;
 	rtr.desc = std::move(desc);
+	tmp_resources.value()[name] = rtr;
+}
+
+void RenderGraph::RegisterResource(std::string name, std::set<std::string> reader, std::string writer,
+	const rhi::Image* external, ImageSubresource view) {
+	if (external == nullptr) HandleError(ErrorCode::ResourceNotRegistered); // 借用路径必须给出有效句柄
+	if (!tmp_resources.has_value()) {
+		tmp_resources.emplace();
+	}
+	reg_tmp_resource rtr;
+	rtr.id = ++this->resource_top_id;
+	rtr.readers_name = reader;
+	rtr.writer_name = writer;
+	rtr.type = Resource::Image;
+	rtr.view = view;
+	rtr.externalImage = external;
 	tmp_resources.value()[name] = rtr;
 }
 
@@ -298,7 +325,9 @@ void RenderGraph::ProcessRegister() {
 		topo.name = name;
 		topo.readers = std::move(reader);
 		topo.writer = writer_id;
-		resourcePool[id] = Resource::AutoAllocator(std::move(topo), type, std::move(resource.second.desc));
+		topo.external = (resource.second.externalImage != nullptr); // 借用节点：生命周期不在图内
+		resourcePool[id] = Resource::AutoAllocator(std::move(topo), type, std::move(resource.second.desc),
+			resource.second.view, resource.second.externalImage);
 	}
 
 	tmp_passes.reset();
@@ -471,8 +500,10 @@ void RenderGraph::PrintGraph() {
 			}
 			std::cout << "]\n      bind =[";
 			for (auto& b : d.shaderBindings) {
-				std::cout << "set" << b.set << ".binding" << b.binding << " "
-					<< b.resourceName << "(#"
+				// set/binding 注册期为空（反射回填在 Realize 后），未回填时打印占位
+				std::cout << "set" << (b.set ? std::to_string(*b.set) : std::string("-"))
+					<< ".binding" << (b.binding ? std::to_string(*b.binding) : std::string("-"))
+					<< " " << b.resourceName << "(#"
 					<< (b.resourceId ? std::to_string(*b.resourceId) : std::string("-"))
 					<< "," << UsageName(b.usage) << ") ";
 			}
@@ -484,4 +515,223 @@ void RenderGraph::PrintGraph() {
 	for (uint32_t id : submitSeq) std::cout << PassName(id) << "(#" << id << ") -> ";
 	std::cout << "END\n";
 }
+
+#pragma region Realize // 节点实例化：描述层 -> RHI 后端
+
+void RenderGraph::SetDevice(rhi::Device* graphic) {
+	m_graphicDevice = graphic;
+}
+
+// usage 边 -> RHI 创建位。Auto 边来自无 desc 的 pass（当前即 ComputePass）：
+// 读边保守展开 Sampled|Storage（两种 compute 访问都可能），写边 Storage。
+// ResolveSrc/Dst 按渲染期内解析处理：源以颜色附件身份被读，目的被写
+static rhi::ImageUsage UsageToImageBits(Usage u, bool isWrite) {
+	switch (u) {
+	case Usage::ColorAttachment:        return rhi::ImageUsage::ColorAttachment;
+	case Usage::DepthStencilAttachment: return rhi::ImageUsage::DepthStencil;
+	case Usage::SampledRead:            return rhi::ImageUsage::Sampled;
+	case Usage::StorageRead:            return rhi::ImageUsage::Storage;
+	case Usage::StorageWrite:           return rhi::ImageUsage::Storage;
+	case Usage::ResolveSrc:             return rhi::ImageUsage::ColorAttachment;
+	case Usage::ResolveDst:             return rhi::ImageUsage::ColorAttachment;
+	case Usage::Auto:
+	default:
+		return isWrite ? rhi::ImageUsage::Storage
+			: (rhi::ImageUsage::Sampled | rhi::ImageUsage::Storage);
+	}
+}
+
+rhi::ImageUsage RenderGraph::DeriveImageUsage(uint32_t resourceId) const {
+	rhi::ImageUsage bits = rhi::ImageUsage::None;
+	for (auto& p : passPool) {
+		const PassTopology& topo = p->get_topology();
+		for (auto& use : topo.writes)
+			if (use.resourceId == resourceId)
+				bits = bits | UsageToImageBits(use.usage, true);
+		for (auto& use : topo.reads)
+			if (use.resourceId == resourceId)
+				bits = bits | UsageToImageBits(use.usage, false);
+	}
+	return bits;
+}
+
+void RenderGraph::RealizeResource(Resource* resource) {
+	if (m_graphicDevice == nullptr)
+		HandleError(ErrorCode::DeviceNotSet);
+
+	switch (resource->get_type()) {
+	case Resource::Image: {
+		auto* img = static_cast<Image*>(resource);
+		if (img->is_borrowed())
+			return; // 借用节点：句柄与 usage 均由外部负责，图侧不创建、不汇总
+		if (img->m_rhiHandle)
+			return; // 幂等：已实例化直接返回
+		const ImageDesc& d = img->get_desc();
+		rhi::ImageCreateInfo info;
+		info.width = d.width;
+		info.height = d.height;
+		info.depth = d.depth;
+		info.arrayLayers = d.arrayLayers;
+		info.mipLevels = d.mipLevels;
+		info.samples = d.samples;
+		info.format = d.format;
+		info.viewType = d.viewType;
+		info.usage = DeriveImageUsage(resource->get_id()); // 全图访问并集回填，用户不必手填
+		img->m_rhiHandle = m_graphicDevice->CreateImage(info);
+		break;
+	}
+	case Resource::Buffer:
+		HandleError(ErrorCode::ResourceTypeDescMismatch); // Buffer 节点尚未落地
+	default:
+		HandleError(ErrorCode::ResourceTypeUnspecified);
+	}
+}
+
+void RenderGraph::RealizePass(Pass* pass) {
+	if (m_graphicDevice == nullptr)
+		HandleError(ErrorCode::DeviceNotSet);
+
+	switch (pass->get_type()) {
+	case Pass::Render: {
+		auto* rp = static_cast<RenderPass*>(pass);
+		if (rp->m_rhiHandle)
+			return; // 幂等：已实例化直接返回
+		const RenderPassDesc& desc = rp->get_desc();
+
+		// ---- 管线状态：来自 PipelineDesc（shader / 固定功能）----
+		rhi::GraphicsPipelineDesc info;
+		info.shaders           = desc.pipeline.shaders;
+		info.depthTestEnable   = desc.pipeline.depthTestEnable;
+		info.depthWriteEnable  = desc.pipeline.depthWriteEnable;
+		info.depthCompareOp    = desc.pipeline.depthCompareOp;
+		info.cullMode          = desc.pipeline.cullMode;
+		info.blendEnable       = desc.pipeline.blendEnable;
+		info.pushConstantSize  = desc.pipeline.pushConstantSize;
+
+		// ---- 附件格式签名：由图从附件派生（图的价值点，用户不必手填）----
+		// 颜色按 slot 就位（注册期已校验稠密），深度取 DepthStencil 附件；
+		// 格式取节点 ImageDesc——经 RHI 同一映射，与实例化图像的原生格式一致
+		for (const auto& att : desc.attachments) {
+			Resource* res = GetResource(*att.resourceId);
+			if (!res)
+				HandleError(ErrorCode::ResourceNotRegistered);
+			if (res->get_type() != Resource::Image)
+				HandleError(ErrorCode::ResourceTypeDescMismatch); // 附件只能挂 Image 节点
+			RealizeResource(res); // 幂等：附件资源先于管线就绪，解除对 RealizeAll 调用顺序的依赖
+			if (att.usage == Usage::ColorAttachment) {
+				info.colorFormats[att.slot] = static_cast<Image*>(res)->get_desc().format;
+				info.colorAttachmentCount = std::max(info.colorAttachmentCount, att.slot + 1);
+			}
+			else if (att.usage == Usage::DepthStencilAttachment) {
+				info.depthFormat = static_cast<Image*>(res)->get_desc().format;
+			}
+			// ResolveSrc/Dst 渲染期内解析，不进管线格式签名
+		}
+
+		rp->m_rhiHandle = m_graphicDevice->CreatePipeline(info);
+		if (!rp->m_rhiHandle)
+			HandleError(ErrorCode::PipelineCreationFailed); // 详细原因已由 RHI 打印
+
+		// ---- 反射对账：管线布局（RHI 反射产出，携带变量名）× shaderBindings，按「变量名 == 资源名」匹配 ----
+		// 反射变量无图资源 = 漏接；图资源未被反射命中 = 声明了 shader 不用的绑定；
+		// 命中后按 资源类型×usage 推导期望类型与反射类型比对，回填 set/binding，
+		// 并按反射的 set 顺序分配描述符集、写入内容（句柄来自节点，元素数来自反射）
+		uint32_t setCount = 0;
+		while (rp->m_rhiHandle->SetLayout(setCount) != nullptr)
+			++setCount;
+		rp->m_sets.resize(setCount);
+		for (uint32_t s = 0; s < setCount; ++s) {
+			auto set = m_graphicDevice->AllocateDescriptorSet(*rp->m_rhiHandle->SetLayout(s));
+			if (!set)
+				HandleError(ErrorCode::DescriptorSetAllocationFailed); // 详细原因已由 RHI 打印
+			rp->m_sets[s] = std::move(set);
+		}
+
+		for (uint32_t s = 0; s < setCount; ++s) {
+			for (const auto& db : rp->m_rhiHandle->SetLayout(s)->Bindings()) {
+				auto it = std::find_if(rp->mDesc.shaderBindings.begin(), rp->mDesc.shaderBindings.end(),
+					[&db](const ShaderBinding& sb) { return sb.resourceName == db.name; });
+				if (it == rp->mDesc.shaderBindings.end())
+					HandleError(ErrorCode::ShaderVariableUnbound); // 反射变量在图中无同名资源
+
+				Resource* res = GetResource(*it->resourceId);
+				if (!res)
+					HandleError(ErrorCode::ResourceNotRegistered);
+				rhi::ResourceType expected;
+				switch (res->get_type()) {
+				case Resource::Image:
+					expected = (it->usage == Usage::SampledRead)
+						? rhi::ResourceType::SampledImage : rhi::ResourceType::StorageImage;
+					break;
+				case Resource::Buffer:
+					if (it->usage == Usage::SampledRead)
+						HandleError(ErrorCode::ShaderBindingTypeMismatch); // Buffer 无采样语义
+					expected = rhi::ResourceType::StorageBuffer;
+					break;
+				default:
+					HandleError(ErrorCode::ResourceTypeUnspecified);
+				}
+				if (expected != db.type)
+					HandleError(ErrorCode::ShaderBindingTypeMismatch); // 如 SampledRead 却反射出 StorageImage
+				it->set = db.set;
+				it->binding = db.binding;
+
+				// 写绑定内容：图像以节点自带的子资源视图为起点，数组按 layer 递增铺满反射出的长度
+				switch (res->get_type()) {
+				case Resource::Image: {
+					auto* img = static_cast<Image*>(res);
+					RealizeResource(res); // 幂等：确保句柄就绪（借用节点为空操作）
+					if (!img->get_rhi())
+						HandleError(ErrorCode::ResourceNotRegistered);
+					rp->m_sets[s]->Write(db.binding, *img->get_rhi(), img->get_view(), db.arrayCount);
+					break;
+				}
+				case Resource::Buffer:
+					HandleError(ErrorCode::ResourceTypeDescMismatch); // Buffer 节点尚未落地
+				default:
+					HandleError(ErrorCode::ResourceTypeUnspecified);
+				}
+			}
+		}
+		for (const auto& sb : rp->mDesc.shaderBindings) {
+			if (!sb.set.has_value())
+				HandleError(ErrorCode::ShaderBindingNameNotFound); // 图声明的资源未被 shader 使用
+		}
+		break;
+	}
+	case Pass::Compute:
+		break; // ComputePass 无描述（读写边由拓扑承载），管线信息落地前无事可做
+	default:
+		HandleError(ErrorCode::PassTypeUnspecified);
+	}
+}
+
+void RenderGraph::RealizeAllResources() {
+	for (auto& r : resourcePool)
+		RealizeResource(r.get());
+}
+
+void RenderGraph::RealizeAllPasses() {
+	for (auto& p : passPool)
+		RealizePass(p.get());
+}
+
+void RenderGraph::RealizeAll() {
+	RealizeAllResources();
+	RealizeAllPasses();
+}
+
+Resource* RenderGraph::GetResource(uint32_t resourceId) const {
+	if (resourceId >= resourcePool.size())
+		return nullptr;
+	return resourcePool[resourceId].get();
+}
+
+Pass* RenderGraph::GetPass(uint32_t passId) const {
+	if (passId >= passPool.size())
+		return nullptr;
+	return passPool[passId].get();
+}
+
+#pragma endregion
 
