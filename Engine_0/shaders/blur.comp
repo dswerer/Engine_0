@@ -1,0 +1,26 @@
+#version 450
+
+// 8x8 工作组：采样读 Color、storage 写 Blurred。
+// 变量名与图资源名一致——约定「shader 变量名 == 图资源名」，图层按名对账
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D Color;
+layout(set = 0, binding = 1, rgba16f) uniform image2D Blurred;
+
+void main()
+{
+	ivec2 size = imageSize(Blurred);
+	ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+	if (coord.x >= size.x || coord.y >= size.y) return;
+
+	// 3x3 盒式模糊，边界钳制
+	ivec2 maxCoord = size - 1;
+	vec4 sum = vec4(0.0);
+	for (int y = -1; y <= 1; ++y) {
+		for (int x = -1; x <= 1; ++x) {
+			ivec2 c = clamp(coord + ivec2(x, y), ivec2(0), maxCoord);
+			sum += texelFetch(Color, c, 0);
+		}
+	}
+	imageStore(Blurred, coord, sum / 9.0);
+}

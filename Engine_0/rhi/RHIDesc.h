@@ -154,7 +154,7 @@ namespace dEngine::rhi {
 
 	// 可编程着色器阶段。Tess/Task/Mesh 为预留：枚举与组合校验先行，
 	// 管线状态创建（tessellation state / mesh 特性）待后续版本
-	enum class ShaderStage { Vertex, Fragment, TessControl, TessEval, Geometry, Task, Mesh };
+	enum class ShaderStage { Vertex, Fragment, TessControl, TessEval, Geometry, Task, Mesh, Compute };
 
 	// 单个着色器阶段：SPIR-V 二进制路径（离线编译产出，如 glslc），RHI 直接读取
 	struct ShaderStageDesc {
@@ -198,6 +198,13 @@ namespace dEngine::rhi {
 
 	struct Rect2D   { int32_t x = 0, y = 0; uint32_t width = 0, height = 0; };
 	struct Viewport { float x = 0, y = 0, w = 0, h = 0, minDepth = 0.0f, maxDepth = 1.0f; };
+
+	// 计算管线：Vulkan 规定每个计算管线恰有一个 Compute 阶段
+	struct ComputePipelineDesc {
+		ShaderStageDesc shader;
+		// 描述符布局同样由该 SPIR-V 反射得出（无手工 bindings 字段）
+		uint32_t pushConstantSize = 0; // 0=无
+	};
 
 #pragma endregion
 

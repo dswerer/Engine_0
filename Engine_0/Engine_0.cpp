@@ -269,11 +269,86 @@ int main()
 
 		// 完整渲染循环冒烟：Acquire -> 录制(barrier / dynamic rendering / draw) -> Submit -> Present -> WaitForFrame
 		if (auto swapchain2 = device->CreateSwapchain()) {
-			rhi::ImageCreateInfo texInfo2;
-			texInfo2.width = 64; texInfo2.height = 64;
-			texInfo2.format = rhi::ImageFormat::RGBA8;
-			texInfo2.usage = rhi::ImageUsage::Sampled;
-			auto tex2 = device->CreateImage(texInfo2);
+			// 计算管线冒烟：Color -> 3x3 模糊 -> Blurred（storage 写），结果随后由图形管线采样
+			rhi::ImageCreateInfo colorInfo;
+			colorInfo.width = 64; colorInfo.height = 64;
+			colorInfo.format = rhi::ImageFormat::RGBA16F;
+			colorInfo.usage = rhi::ImageUsage::Sampled | rhi::ImageUsage::TransferDst; // ClearColorImage 要求 TRANSFER_DST
+			auto colorTex = device->CreateImage(colorInfo);
+
+			rhi::ImageCreateInfo blurInfo;
+			blurInfo.width = 64; blurInfo.height = 64;
+			blurInfo.format = rhi::ImageFormat::RGBA16F;
+			blurInfo.usage = rhi::ImageUsage::Storage | rhi::ImageUsage::Sampled; // 计算写 + 图形采样
+			auto blurTex = device->CreateImage(blurInfo);
+
+			rhi::ComputePipelineDesc computeDesc;
+			computeDesc.shader = { rhi::ShaderStage::Compute, shaderDir + "/blur.comp.spv" };
+			auto computePipeline = device->CreateComputePipeline(computeDesc);
+			auto computeSet = (computePipeline && computePipeline->SetLayout(0))
+				? device->AllocateDescriptorSet(*computePipeline->SetLayout(0)) : nullptr;
+			if (colorTex && blurTex && computePipeline && computeSet) {
+				computeSet->Write(0, *colorTex, rhi::ImageSubresource{ 0, 0 });
+				computeSet->Write(1, *blurTex, rhi::ImageSubresource{ 0, 0 });
+				cout << "Compute pipeline ok: set0-bindings="
+					<< computePipeline->SetLayout(0)->Bindings().size() << "\n";
+
+				// 与帧渲染同队列：barrier 足够表达依赖，CPU 侧用 WaitForFrame 等派发完成
+				rhi::CommandList computeCmd = device->BeginCommandList();
+
+				// Color: Undefined -> General（ClearColorImage 与 compute 采样都要求 GENERAL）
+				rhi::ImageBarrier colorToGeneral;
+				colorToGeneral.image = colorTex.get();
+				colorToGeneral.oldLayout = rhi::ImageLayout::Undefined;
+				colorToGeneral.newLayout = rhi::ImageLayout::General;
+				colorToGeneral.dstStage = rhi::PipelineStage::Transfer;
+				colorToGeneral.dstAccess = rhi::Access::TransferWrite;
+				computeCmd.Barrier({ &colorToGeneral, 1 }, {});
+
+				const float clearColor[4] = { 0.85f, 0.45f, 0.20f, 1.0f };
+				computeCmd.ClearColor(*colorTex, rhi::ImageSubresource{ 0, 0 }, clearColor,
+					rhi::ImageLayout::General);
+
+				// Color: General -> ShaderReadOnly（计算采样读）；Blurred: Undefined -> General（storage 写）
+				rhi::ImageBarrier colorToRead;
+				colorToRead.image = colorTex.get();
+				colorToRead.oldLayout = rhi::ImageLayout::General;
+				colorToRead.newLayout = rhi::ImageLayout::ShaderReadOnly;
+				colorToRead.srcStage = rhi::PipelineStage::Transfer;
+				colorToRead.srcAccess = rhi::Access::TransferWrite;
+				colorToRead.dstStage = rhi::PipelineStage::ComputeShader;
+				colorToRead.dstAccess = rhi::Access::ShaderRead;
+
+				rhi::ImageBarrier blurToGeneral;
+				blurToGeneral.image = blurTex.get();
+				blurToGeneral.oldLayout = rhi::ImageLayout::Undefined;
+				blurToGeneral.newLayout = rhi::ImageLayout::General;
+				blurToGeneral.dstStage = rhi::PipelineStage::ComputeShader;
+				blurToGeneral.dstAccess = rhi::Access::ShaderWrite;
+				computeCmd.Barrier({ &colorToRead, 1 }, {});
+				computeCmd.Barrier({ &blurToGeneral, 1 }, {});
+
+				computeCmd.BindPipeline(*computePipeline);
+				computeCmd.BindDescriptorSet(0, *computeSet);
+				computeCmd.Dispatch(64 / 8, 64 / 8, 1); // 8x8 工作组覆盖 64x64
+
+				// Blurred: General -> ShaderReadOnly（随后由图形管线采样）
+				rhi::ImageBarrier blurToRead;
+				blurToRead.image = blurTex.get();
+				blurToRead.oldLayout = rhi::ImageLayout::General;
+				blurToRead.newLayout = rhi::ImageLayout::ShaderReadOnly;
+				blurToRead.srcStage = rhi::PipelineStage::ComputeShader;
+				blurToRead.srcAccess = rhi::Access::ShaderWrite;
+				blurToRead.dstStage = rhi::PipelineStage::FragmentShader;
+				blurToRead.dstAccess = rhi::Access::ShaderRead;
+				computeCmd.Barrier({ &blurToRead, 1 }, {});
+
+				rhi::SubmitInfo computeSubmit;
+				computeSubmit.commandLists = { &computeCmd, 1 };
+				device->Submit(computeSubmit);
+				device->WaitForFrame();
+				cout << "Compute dispatch ok: 8x8 groups -> storage image\n";
+			}
 
 			rhi::GraphicsPipelineDesc pso;
 			pso.shaders = {
@@ -289,8 +364,8 @@ int main()
 			auto pipeline2 = device->CreatePipeline(pso);
 			auto set2 = (pipeline2 && pipeline2->SetLayout(0))
 				? device->AllocateDescriptorSet(*pipeline2->SetLayout(0)) : nullptr;
-			if (tex2 && pipeline2 && set2) {
-				set2->Write(0, *tex2, rhi::ImageSubresource{ 0, 0 });
+			if (blurTex && pipeline2 && set2) {
+				set2->Write(0, *blurTex, rhi::ImageSubresource{ 0, 0 }); // 采样计算产物
 
 				uint32_t presented = 0;
 				for (uint32_t attempts = 0; attempts < 8 && presented < 3; ++attempts) {
@@ -298,17 +373,6 @@ int main()
 					if (!frame.acquired) continue; // 交换链重建窗口，跳过本帧重试
 
 					rhi::CommandList cmd = device->BeginCommandList();
-
-					// 采样纹理：首帧 Undefined -> ShaderReadOnly（后续帧维持该布局）
-					if (presented == 0) {
-						rhi::ImageBarrier texBarrier;
-						texBarrier.image = tex2.get();
-						texBarrier.oldLayout = rhi::ImageLayout::Undefined;
-						texBarrier.newLayout = rhi::ImageLayout::ShaderReadOnly;
-						texBarrier.dstStage = rhi::PipelineStage::FragmentShader;
-						texBarrier.dstAccess = rhi::Access::ShaderRead;
-						cmd.Barrier({ &texBarrier, 1 }, {});
-					}
 
 					// backbuffer：acquire 后按 Undefined 处理，转 ColorAttachment
 					rhi::ImageBarrier toRender;

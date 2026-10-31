@@ -85,6 +85,21 @@ set->Write(0, *layeredTexture, rhi::ImageSubresource{ 0, 0 }, 4); // 数组绑�
 - 描述符写入在**录制前**完成（预编译路径）。图侧由 `RealizePass` 在对账后一次性分配并写入，句柄来自资源节点、元素数来自反射。
 - `Write` 的 `count` 覆盖数组绑定：图像按 layer 递增逐层展开（第 i 个元素用 `{mip, layer + i}`），缓冲按 range 步进（`offset + i*range`，`count > 1` 时 range 须非 0）。
 - 写入的描述符类型与布局由分配时记录的 binding 表决定：SampledImage → `COMBINED_IMAGE_SAMPLER`（内置采样器 + ShaderReadOnly），StorageImage → `STORAGE_IMAGE`（无采样器 + General）。
+- **计算管线**走同一个描述符构建路径，仅入口与阶段集合不同：
+
+```cpp
+rhi::ComputePipelineDesc cpso;
+cpso.shader = { rhi::ShaderStage::Compute, shaderDir + "/blur.comp.spv" }; // 恰一个 Compute 阶段
+cpso.pushConstantSize = 0;                          // 语义同图形管线
+
+auto cpipeline = device->CreateComputePipeline(cpso); // vkCreateComputePipelines（共用 PipelineCache）
+auto cset = device->AllocateDescriptorSet(*cpipeline->SetLayout(0)); // 布局来自该 SPIR-V 反射
+cset->Write(0, *sampledImage, rhi::ImageSubresource{ 0, 0 });        // sampler2D
+cset->Write(1, *storageImage, rhi::ImageSubresource{ 0, 0 });        // image2D（STORAGE_IMAGE / General）
+```
+
+- 图形与计算的集合布局、管线布局由同一个内部构建路径产出（`BuildSetLayouts`）：按 set 分组、组内 binding 升序、stageFlags 取实际使用并集、push constant 全 stage 共享。
+- `Pipeline::NativeBindPoint()` 区分 GRAPHICS / COMPUTE：`BindPipeline` 按其绑定点调用 `vkCmdBindPipeline`，后续 `BindDescriptorSet` / `PushConstants` 沿用同一绑定点与阶段集合，调用方无需显式传绑定点。
 
 ## 6. 命令录制（CommandList）
 
@@ -102,7 +117,8 @@ device->Submit(info);                              // 自动 vkEndCommandBuffer�
 |---|---|
 | `Barrier(images, buffers)` | `vkCmdPipelineBarrier2` 批量直译；`size==0` 用 `VK_WHOLE_SIZE`；queueFamily 字段默认 IGNORED（QFOT 占位） |
 | `BeginRendering/EndRendering` | dynamic rendering；深度格式含模板位时同时填 stencil 附件 |
-| `BindPipeline` | 记录 layout 与 pushConstantSize 供后续绑定校验 |
+| `BindPipeline` | 记录 layout / pushConstantSize / 绑定点 / 阶段集合，供后续绑定使用 |
+| `Dispatch(x,y,z)` | `vkCmdDispatch`；参数是**工作组数**（非像素尺寸），任一维为 0 即拒绝 |
 | `SetViewport` | **同时设 viewport + scissor**（避免动态 scissor 未设触发 VUID 07832） |
 | `ClearColor` | 仅 color aspect；`CopyBufferToImage` 单 region、全层、仅 mip0 |
 

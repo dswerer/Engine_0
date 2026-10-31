@@ -48,7 +48,8 @@ set(ENGINE_SHADER_SOURCES
 	"${CMAKE_CURRENT_SOURCE_DIR}/shaders/fullscreen.vert"
 	"${CMAKE_CURRENT_SOURCE_DIR}/shaders/textured.frag"
 	"${CMAKE_CURRENT_SOURCE_DIR}/shaders/ubo.frag"
-	"${CMAKE_CURRENT_SOURCE_DIR}/shaders/solid.frag")
+	"${CMAKE_CURRENT_SOURCE_DIR}/shaders/solid.frag"
+	"${CMAKE_CURRENT_SOURCE_DIR}/shaders/blur.comp")
 
 if (Vulkan_GLSLC_EXECUTABLE)
 	set(ENGINE_GLSLC "${Vulkan_GLSLC_EXECUTABLE}")

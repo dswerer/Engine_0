@@ -166,17 +166,22 @@ namespace dEngine::rhi {
 
 		VkPipeline                 NativeHandle() const;
 		VkPipelineLayout           NativeLayout() const; // 供 CommandList 绑定描述符 / push constant
+		VkPipelineBindPoint        NativeBindPoint() const; // 图形 / 计算（决定 vkCmdBindPipeline 与描述符绑定点）
+		VkShaderStageFlags         NativeStageFlags() const; // 管线实际阶段集合（push constant 用）
 		uint32_t                   PushConstantSize() const; // 0=管线未声明 push constant
 		const DescriptorSetLayout* SetLayout(uint32_t setIndex) const; // 反射产出，供分配 descriptor set
 	private:
 		friend class Device;
 		Pipeline(VkDevice device, VkPipeline pipeline, VkPipelineLayout layout, uint32_t pushConstantSize,
+			VkShaderStageFlags stageFlags, VkPipelineBindPoint bindPoint,
 			std::vector<std::unique_ptr<DescriptorSetLayout>> setLayouts);
 
 		VkDevice                                          m_device = VK_NULL_HANDLE;
 		VkPipeline                                        m_pipeline = VK_NULL_HANDLE;
 		VkPipelineLayout                                  m_layout = VK_NULL_HANDLE;
 		uint32_t                                          m_pushConstantSize = 0;
+		VkShaderStageFlags                                m_stageFlags = 0;
+		VkPipelineBindPoint                               m_bindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
 		std::vector<std::unique_ptr<DescriptorSetLayout>> m_setLayouts; // 按 set index 排布，保证 SetLayout 返回地址稳定
 	};
 
@@ -243,6 +248,9 @@ namespace dEngine::rhi {
 		void Draw(uint32_t vertexCount, uint32_t firstVertex = 0);
 		void DrawIndexed(uint32_t indexCount, uint32_t firstIndex = 0, int32_t vertexOffset = 0);
 
+		// 计算派发（工作组数非像素尺寸：通常为 ceil(宽/局部宽), ceil(高/局部高), 1）
+		void Dispatch(uint32_t groupCountX, uint32_t groupCountY = 1, uint32_t groupCountZ = 1);
+
 		// 拷贝/清场（图外工具与上传路径用）
 		void CopyBufferToImage(const Buffer& src, Image& dst, ImageLayout dstLayout);
 		void ClearColor(Image& image, ImageSubresource view, const float rgba[4], ImageLayout layout);
@@ -253,6 +261,8 @@ namespace dEngine::rhi {
 		VkCommandBuffer  m_commandBuffer = VK_NULL_HANDLE;
 		VkPipelineLayout m_pipelineLayout = VK_NULL_HANDLE; // BindPipeline 记录，供描述符 / push constant 绑定用
 		uint32_t         m_pushConstantSize = 0;            // 当前管线声明的 push constant 大小（0=无）
+		VkPipelineBindPoint m_bindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS; // 当前管线绑定点（描述符绑定沿用）
+		VkShaderStageFlags  m_stageFlags = 0;                              // 当前管线的阶段集合（push constant 用）
 	};
 
 #pragma endregion
@@ -394,6 +404,7 @@ namespace dEngine::rhi {
 		std::unique_ptr<Image>         CreateImage(const ImageCreateInfo& info);
 		std::unique_ptr<Buffer>        CreateBuffer(const BufferCreateInfo& info);
 		std::unique_ptr<Pipeline>      CreatePipeline(const GraphicsPipelineDesc& desc);
+		std::unique_ptr<Pipeline>      CreateComputePipeline(const ComputePipelineDesc& desc);
 		std::unique_ptr<DescriptorSet> AllocateDescriptorSet(const DescriptorSetLayout& layout);
 		std::unique_ptr<Fence>         CreateFence(bool signaled = false);
 		std::unique_ptr<Semaphore>     CreateSemaphore();
@@ -415,6 +426,13 @@ namespace dEngine::rhi {
 		uint32_t    ApiVersion() const;
 
 	private:
+		// 反射槽位表 -> 各 set 布局 + pipeline layout（图形 / 计算共用）。
+		// bindings 与 stages 同下标：stages[i] 为该槽位的 stageFlags 并集；失败时已建对象就地清理
+		bool BuildSetLayouts(const std::vector<DescriptorBinding>& bindings,
+			const std::vector<VkShaderStageFlags>& stages, uint32_t pushConstantSize,
+			VkShaderStageFlags pushStages,
+			std::vector<std::unique_ptr<DescriptorSetLayout>>& outLayouts, VkPipelineLayout& outLayout);
+
 		VkInstance               m_instance = VK_NULL_HANDLE;
 		VkDebugUtilsMessengerEXT m_debugMessenger = VK_NULL_HANDLE;
 		VkSurfaceKHR             m_surface = VK_NULL_HANDLE;   // 有窗口句柄时创建，否则为空（离屏路径）

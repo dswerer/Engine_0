@@ -375,6 +375,7 @@ namespace {
 			case ShaderStage::Geometry:    return VK_SHADER_STAGE_GEOMETRY_BIT;
 			case ShaderStage::Task:        return VK_SHADER_STAGE_TASK_BIT_EXT;
 			case ShaderStage::Mesh:        return VK_SHADER_STAGE_MESH_BIT_EXT;
+			case ShaderStage::Compute:     return VK_SHADER_STAGE_COMPUTE_BIT;
 			default:                       return VK_SHADER_STAGE_VERTEX_BIT;
 		}
 	}
@@ -388,6 +389,7 @@ namespace {
 			case ShaderStage::Geometry:    return "geometry";
 			case ShaderStage::Task:        return "task";
 			case ShaderStage::Mesh:        return "mesh";
+			case ShaderStage::Compute:     return "compute";
 			default:                       return "unknown";
 		}
 	}
@@ -1470,9 +1472,11 @@ std::unique_ptr<DescriptorSet> Device::AllocateDescriptorSet(const DescriptorSet
 #pragma region Pipeline // 管线与管线布局
 
 Pipeline::Pipeline(VkDevice device, VkPipeline pipeline, VkPipelineLayout layout, uint32_t pushConstantSize,
+	VkShaderStageFlags stageFlags, VkPipelineBindPoint bindPoint,
 	std::vector<std::unique_ptr<DescriptorSetLayout>> setLayouts)
 	: m_device(device), m_pipeline(pipeline), m_layout(layout)
-	, m_pushConstantSize(pushConstantSize), m_setLayouts(std::move(setLayouts)) {}
+	, m_pushConstantSize(pushConstantSize), m_stageFlags(stageFlags), m_bindPoint(bindPoint)
+	, m_setLayouts(std::move(setLayouts)) {}
 
 Pipeline::~Pipeline()
 {
@@ -1491,11 +1495,101 @@ VkPipeline Pipeline::NativeHandle() const { return m_pipeline; }
 
 VkPipelineLayout Pipeline::NativeLayout() const { return m_layout; }
 
+VkPipelineBindPoint Pipeline::NativeBindPoint() const { return m_bindPoint; }
+
+VkShaderStageFlags Pipeline::NativeStageFlags() const { return m_stageFlags; }
+
 uint32_t Pipeline::PushConstantSize() const { return m_pushConstantSize; }
 
 const DescriptorSetLayout* Pipeline::SetLayout(uint32_t setIndex) const
 {
 	return setIndex < m_setLayouts.size() ? m_setLayouts[setIndex].get() : nullptr;
+}
+
+// 反射槽位表 -> 各 set 布局 + 管线布局。图形 / 计算管线共用：
+// 两者只有阶段集合与 vkCreate*Pipelines 入口不同，描述符布局一律由反射得出。
+// 失败时已创建的布局就地释放（unique_ptr / 手工销毁），不留给调用方
+bool Device::BuildSetLayouts(const std::vector<DescriptorBinding>& bindings,
+	const std::vector<VkShaderStageFlags>& stages, uint32_t pushConstantSize,
+	VkShaderStageFlags pushStages,
+	std::vector<std::unique_ptr<DescriptorSetLayout>>& outLayouts, VkPipelineLayout& outLayout)
+{
+	// ---- push constant 合法性（全部 stage 共享、offset 固定 0）----
+	if (pushConstantSize > 0 && (pushConstantSize % 4 != 0 || pushConstantSize > 128)) {
+		std::cerr << "[RHI] pushConstantSize 须 4 字节对齐且 <= 128: " << pushConstantSize << "\n";
+		return false;
+	}
+
+	// ---- 按 set 分组（组内 binding 升序，保证布局可预测）----
+	uint32_t setCount = 0;
+	for (const auto& b : bindings) setCount = std::max(setCount, b.set + 1);
+
+	struct GroupedBinding { const DescriptorBinding* desc; VkShaderStageFlags stages; };
+	std::vector<std::vector<GroupedBinding>> bySet(setCount);
+	for (size_t i = 0; i < bindings.size(); ++i)
+		bySet[bindings[i].set].push_back({ &bindings[i], stages[i] });
+	for (auto& group : bySet) {
+		std::sort(group.begin(), group.end(),
+			[](const GroupedBinding& a, const GroupedBinding& c) { return a.desc->binding < c.desc->binding; });
+	}
+
+	// ---- 各 set 的描述符集合布局（由 Pipeline 持有）----
+	outLayouts.clear();
+	outLayouts.reserve(setCount);
+	for (uint32_t i = 0; i < setCount; ++i) {
+		std::vector<VkDescriptorSetLayoutBinding> vkBindings;
+		vkBindings.reserve(bySet[i].size());
+		std::vector<DescriptorBinding> groupDescs; // DescriptorSetLayout 侧仅持声明（stageFlags 已烙进 Vk 对象）
+		groupDescs.reserve(bySet[i].size());
+		for (const auto& b : bySet[i]) {
+			VkDescriptorSetLayoutBinding vb{};
+			vb.binding = b.desc->binding;
+			vb.descriptorType = ToVkDescriptorType(b.desc->type);
+			vb.descriptorCount = b.desc->arrayCount;
+			vb.stageFlags = b.stages; // 反射累积：实际使用该槽位的 stage 并集
+			vkBindings.push_back(vb);
+			groupDescs.push_back(*b.desc);
+		}
+
+		VkDescriptorSetLayoutCreateInfo layoutCI{};
+		layoutCI.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+		layoutCI.bindingCount = static_cast<uint32_t>(vkBindings.size());
+		layoutCI.pBindings = vkBindings.empty() ? nullptr : vkBindings.data();
+
+		VkDescriptorSetLayout rawLayout = VK_NULL_HANDLE;
+		if (vkCreateDescriptorSetLayout(m_device, &layoutCI, nullptr, &rawLayout) != VK_SUCCESS) {
+			std::cerr << "[RHI] vkCreateDescriptorSetLayout 失败（set " << i << "）\n";
+			outLayouts.clear(); // 已建布局随 unique_ptr 释放
+			return false;
+		}
+		outLayouts.push_back(std::unique_ptr<DescriptorSetLayout>(
+			new DescriptorSetLayout(m_device, rawLayout, std::move(groupDescs))));
+	}
+
+	// ---- 管线布局（push constant：全部 stage 共享、offset 0；desc 未声明则无 range）----
+	VkPushConstantRange pushRange{};
+	pushRange.stageFlags = pushStages;
+	pushRange.size = pushConstantSize;
+
+	VkPipelineLayoutCreateInfo layoutCI{};
+	layoutCI.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+	layoutCI.setLayoutCount = static_cast<uint32_t>(outLayouts.size());
+	// Pipeline 持有 unique_ptr，不暴露批量句柄：临时收集一次供 vkCreatePipelineLayout 使用
+	std::vector<VkDescriptorSetLayout> rawLayouts(outLayouts.size());
+	for (size_t i = 0; i < outLayouts.size(); ++i) rawLayouts[i] = outLayouts[i]->NativeHandle();
+	layoutCI.pSetLayouts = rawLayouts.empty() ? nullptr : rawLayouts.data();
+	layoutCI.pushConstantRangeCount = (pushConstantSize > 0) ? 1u : 0u;
+	layoutCI.pPushConstantRanges = (pushConstantSize > 0) ? &pushRange : nullptr;
+
+	VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
+	if (vkCreatePipelineLayout(m_device, &layoutCI, nullptr, &pipelineLayout) != VK_SUCCESS) {
+		std::cerr << "[RHI] vkCreatePipelineLayout 失败\n";
+		outLayouts.clear();
+		return false;
+	}
+
+	outLayout = pipelineLayout;
+	return true;
 }
 
 // dynamic rendering 下的图形管线：多态渲染无需 VkRenderPass，附件格式经 VkPipelineRenderingCreateInfo 声明
@@ -1563,77 +1657,11 @@ std::unique_ptr<Pipeline> Device::CreatePipeline(const GraphicsPipelineDesc& des
 	VkShaderStageFlags allStages = 0;
 	for (const auto& s : desc.shaders) allStages |= ToVkStage(s.stage);
 
-	// ---- 按 set 分组（组内 binding 升序，保证布局可预测）；携带 stageFlags 供建布局 ----
-	uint32_t setCount = 0;
-	for (const auto& b : merged) setCount = std::max(setCount, b.set + 1);
-
-	struct GroupedBinding { DescriptorBinding desc; VkShaderStageFlags stages; };
-	std::vector<std::vector<GroupedBinding>> bySet(setCount);
-	for (size_t i = 0; i < merged.size(); ++i) bySet[merged[i].set].push_back({ merged[i], mergedStages[i] });
-	for (auto& group : bySet) {
-		std::sort(group.begin(), group.end(),
-			[](const GroupedBinding& a, const GroupedBinding& c) { return a.desc.binding < c.desc.binding; });
-	}
-
-	// ---- 各 set 的描述符集合布局（由 Pipeline 持有）----
+	// ---- 描述符集合布局 + 管线布局（与计算管线共用同一构建路径）----
 	std::vector<std::unique_ptr<DescriptorSetLayout>> layouts;
-	std::vector<VkDescriptorSetLayout> rawLayouts;
-	layouts.reserve(setCount);
-	rawLayouts.reserve(setCount);
-	for (uint32_t i = 0; i < setCount; ++i) {
-		std::vector<VkDescriptorSetLayoutBinding> vkBindings;
-		vkBindings.reserve(bySet[i].size());
-		std::vector<DescriptorBinding> groupDescs; // DescriptorSetLayout 侧仅持声明（stageFlags 已烙进 Vk 对象）
-		groupDescs.reserve(bySet[i].size());
-		for (const auto& b : bySet[i]) {
-			VkDescriptorSetLayoutBinding vb{};
-			vb.binding = b.desc.binding;
-			vb.descriptorType = ToVkDescriptorType(b.desc.type);
-			vb.descriptorCount = b.desc.arrayCount;
-			vb.stageFlags = b.stages; // 反射累积：实际使用该槽位的 stage 并集
-			vkBindings.push_back(vb);
-			groupDescs.push_back(b.desc);
-		}
-
-		VkDescriptorSetLayoutCreateInfo layoutCI{};
-		layoutCI.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-		layoutCI.bindingCount = static_cast<uint32_t>(vkBindings.size());
-		layoutCI.pBindings = vkBindings.empty() ? nullptr : vkBindings.data();
-
-		VkDescriptorSetLayout raw = VK_NULL_HANDLE;
-		if (vkCreateDescriptorSetLayout(m_device, &layoutCI, nullptr, &raw) != VK_SUCCESS) {
-			std::cerr << "[RHI] vkCreateDescriptorSetLayout 失败（set " << i << "）\n";
-			return nullptr;
-		}
-		rawLayouts.push_back(raw);
-		layouts.push_back(std::unique_ptr<DescriptorSetLayout>(
-			new DescriptorSetLayout(m_device, raw, std::move(groupDescs))));
-	}
-
-	// ---- 管线布局（push constant：全部 stage 共享、offset 0；desc 未声明则无 range）----
-	VkPushConstantRange pushRange{};
-	if (desc.pushConstantSize > 0) {
-		if (desc.pushConstantSize % 4 != 0 || desc.pushConstantSize > 128) {
-			std::cerr << "[RHI] pushConstantSize 须 4 字节对齐且 <= 128: " << desc.pushConstantSize << "\n";
-			return nullptr;
-		}
-		pushRange.stageFlags = allStages;
-		pushRange.offset = 0;
-		pushRange.size = desc.pushConstantSize;
-	}
-
-	VkPipelineLayoutCreateInfo layoutCI{};
-	layoutCI.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-	layoutCI.setLayoutCount = static_cast<uint32_t>(rawLayouts.size());
-	layoutCI.pSetLayouts = rawLayouts.empty() ? nullptr : rawLayouts.data();
-	layoutCI.pushConstantRangeCount = (desc.pushConstantSize > 0) ? 1u : 0u;
-	layoutCI.pPushConstantRanges = (desc.pushConstantSize > 0) ? &pushRange : nullptr;
-
 	VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
-	if (vkCreatePipelineLayout(m_device, &layoutCI, nullptr, &pipelineLayout) != VK_SUCCESS) {
-		std::cerr << "[RHI] vkCreatePipelineLayout 失败\n";
+	if (!BuildSetLayouts(merged, mergedStages, desc.pushConstantSize, allStages, layouts, pipelineLayout))
 		return nullptr;
-	}
 
 	// ---- shader 模块（复用已读的 SPIR-V code；入口固定 main）----
 	auto createModule = [&](const std::vector<uint32_t>& code, VkShaderModule& out) {
@@ -1777,7 +1805,74 @@ std::unique_ptr<Pipeline> Device::CreatePipeline(const GraphicsPipelineDesc& des
 	}
 
 	return std::unique_ptr<Pipeline>(new Pipeline(m_device, pipeline, pipelineLayout,
-		desc.pushConstantSize, std::move(layouts)));
+		desc.pushConstantSize, allStages, VK_PIPELINE_BIND_POINT_GRAPHICS, std::move(layouts)));
+}
+
+// 计算管线：单 Compute 阶段；描述符布局同样由该 SPIR-V 反射得出，
+// 因此计算侧的 descriptor set 分配 / 写入与图形侧走同一套路径
+std::unique_ptr<Pipeline> Device::CreateComputePipeline(const ComputePipelineDesc& desc)
+{
+	if (desc.shader.stage != ShaderStage::Compute) {
+		std::cerr << "[RHI] 计算管线须声明 Compute 阶段（收到 "
+			<< ShaderStageName(desc.shader.stage) << "）\n";
+		return nullptr;
+	}
+
+	const std::vector<uint32_t> code = ReadSpirv(desc.shader.spirvPath);
+	if (code.empty()) {
+		std::cerr << "[RHI] 读取 SPIR-V 失败: " << desc.shader.spirvPath << "\n";
+		return nullptr;
+	}
+
+	// ---- 反射描述符布局（单 stage，无需跨 stage 合并）----
+	std::vector<DescriptorBinding> bindings;
+	if (!ReflectDescriptorBindings(code, ShaderStageName(desc.shader.stage), bindings))
+		return nullptr;
+	std::vector<VkShaderStageFlags> stages(bindings.size(), VK_SHADER_STAGE_COMPUTE_BIT);
+
+	std::vector<std::unique_ptr<DescriptorSetLayout>> layouts;
+	VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
+	if (!BuildSetLayouts(bindings, stages, desc.pushConstantSize, VK_SHADER_STAGE_COMPUTE_BIT,
+		layouts, pipelineLayout))
+		return nullptr;
+
+	// ---- shader 模块与计算管线 ----
+	VkShaderModuleCreateInfo moduleCI{};
+	moduleCI.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+	moduleCI.codeSize = code.size() * sizeof(uint32_t);
+	moduleCI.pCode = code.data();
+
+	VkShaderModule module = VK_NULL_HANDLE;
+	if (vkCreateShaderModule(m_device, &moduleCI, nullptr, &module) != VK_SUCCESS) {
+		std::cerr << "[RHI] vkCreateShaderModule 失败\n";
+		vkDestroyPipelineLayout(m_device, pipelineLayout, nullptr);
+		return nullptr;
+	}
+
+	VkComputePipelineCreateInfo pipelineCI{};
+	pipelineCI.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+	pipelineCI.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+	pipelineCI.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+	pipelineCI.stage.module = module;
+	pipelineCI.stage.pName = "main";
+	pipelineCI.layout = pipelineLayout;
+	pipelineCI.basePipelineHandle = VK_NULL_HANDLE;
+	pipelineCI.basePipelineIndex = -1; // 零初始化会给 0，须显式写 -1
+
+	VkPipeline pipeline = VK_NULL_HANDLE;
+	const VkResult result = vkCreateComputePipelines(m_device, m_pipelineCache, 1, &pipelineCI, nullptr, &pipeline);
+
+	vkDestroyShaderModule(m_device, module, nullptr);
+
+	if (result != VK_SUCCESS) {
+		std::cerr << "[RHI] vkCreateComputePipelines 失败: " << result << "\n";
+		vkDestroyPipelineLayout(m_device, pipelineLayout, nullptr);
+		return nullptr;
+	}
+
+	return std::unique_ptr<Pipeline>(new Pipeline(m_device, pipeline, pipelineLayout,
+		desc.pushConstantSize, VK_SHADER_STAGE_COMPUTE_BIT, VK_PIPELINE_BIND_POINT_COMPUTE,
+		std::move(layouts)));
 }
 
 #pragma endregion
@@ -2015,17 +2110,20 @@ void CommandList::EndRendering()
 void CommandList::BindPipeline(const Pipeline& pipeline)
 {
 	if (m_commandBuffer == VK_NULL_HANDLE) return;
-	vkCmdBindPipeline(m_commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.NativeHandle());
-	// 记录布局与 push constant 声明，供后续 BindDescriptorSet / PushConstants 使用
+	// 图形 / 计算共用入口：绑定点取自管线自身，后续描述符绑定与 push constant 沿用该点
+	vkCmdBindPipeline(m_commandBuffer, pipeline.NativeBindPoint(), pipeline.NativeHandle());
+	// 记录布局与声明，供后续 BindDescriptorSet / PushConstants 使用
 	m_pipelineLayout = pipeline.NativeLayout();
 	m_pushConstantSize = pipeline.PushConstantSize();
+	m_bindPoint = pipeline.NativeBindPoint();
+	m_stageFlags = pipeline.NativeStageFlags();
 }
 
 void CommandList::BindDescriptorSet(uint32_t setIndex, const DescriptorSet& set)
 {
 	if (m_commandBuffer == VK_NULL_HANDLE || m_pipelineLayout == VK_NULL_HANDLE) return;
 	VkDescriptorSet raw = set.NativeHandle();
-	vkCmdBindDescriptorSets(m_commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout,
+	vkCmdBindDescriptorSets(m_commandBuffer, m_bindPoint, m_pipelineLayout,
 		setIndex, 1, &raw, 0, nullptr);
 }
 
@@ -2037,8 +2135,7 @@ void CommandList::PushConstants(const void* data, uint32_t size)
 			<< "，传入 " << size << "）\n";
 		return;
 	}
-	vkCmdPushConstants(m_commandBuffer, m_pipelineLayout,
-		VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, size, data);
+	vkCmdPushConstants(m_commandBuffer, m_pipelineLayout, m_stageFlags, 0, size, data);
 }
 
 void CommandList::SetViewport(const Viewport& viewport)
@@ -2076,6 +2173,18 @@ void CommandList::DrawIndexed(uint32_t indexCount, uint32_t firstIndex, int32_t 
 {
 	if (m_commandBuffer == VK_NULL_HANDLE) return;
 	vkCmdDrawIndexed(m_commandBuffer, indexCount, 1, firstIndex, vertexOffset, 0);
+}
+
+void CommandList::Dispatch(uint32_t groupCountX, uint32_t groupCountY, uint32_t groupCountZ)
+{
+	if (m_commandBuffer == VK_NULL_HANDLE) return;
+	if (groupCountX == 0 || groupCountY == 0 || groupCountZ == 0) {
+		// 任一维为 0 时派发无意义；Vulkan 也要求非零（VUID 00225）
+		std::cerr << "[RHI] Dispatch 工作组数须非零（" << groupCountX << ","
+			<< groupCountY << "," << groupCountZ << "）\n";
+		return;
+	}
+	vkCmdDispatch(m_commandBuffer, groupCountX, groupCountY, groupCountZ);
 }
 
 void CommandList::CopyBufferToImage(const Buffer& src, Image& dst, ImageLayout dstLayout)
