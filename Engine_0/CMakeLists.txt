@@ -36,6 +36,9 @@ endif()
 # spv_reflect 默认引用仓库内 spirv-headers 子目录；改用 Vulkan SDK 自带的 SPIRV-Headers
 target_compile_definitions (Engine_0 PRIVATE SPIRV_REFLECT_USE_SYSTEM_SPIRV_H)
 
+# 资源目录（测试贴图等）：运行时按绝对路径读取，避免依赖工作目录
+target_compile_definitions (Engine_0 PRIVATE ENGINE_ASSET_DIR="${CMAKE_CURRENT_SOURCE_DIR}/assets")
+
 target_link_libraries(Engine_0 PUBLIC
 	Vulkan::Vulkan
 	glfw
@@ -47,9 +50,12 @@ set(ENGINE_SHADER_DIR "${CMAKE_BINARY_DIR}/shaders")
 set(ENGINE_SHADER_SOURCES
 	"${CMAKE_CURRENT_SOURCE_DIR}/shaders/fullscreen.vert"
 	"${CMAKE_CURRENT_SOURCE_DIR}/shaders/textured.frag"
+	"${CMAKE_CURRENT_SOURCE_DIR}/shaders/texture.frag"
 	"${CMAKE_CURRENT_SOURCE_DIR}/shaders/ubo.frag"
 	"${CMAKE_CURRENT_SOURCE_DIR}/shaders/solid.frag"
-	"${CMAKE_CURRENT_SOURCE_DIR}/shaders/blur.comp")
+	"${CMAKE_CURRENT_SOURCE_DIR}/shaders/blur.comp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/shaders/mesh.vert"
+	"${CMAKE_CURRENT_SOURCE_DIR}/shaders/mesh.frag")
 
 if (Vulkan_GLSLC_EXECUTABLE)
 	set(ENGINE_GLSLC "${Vulkan_GLSLC_EXECUTABLE}")

@@ -10,9 +10,20 @@ std::unique_ptr<Pass> Pass::AutoAllocator(PassTopology&& topo, Type newType, Pas
 		RenderGraph::HandleError(RenderGraph::ErrorCode::PassTypeDescMismatch);
 		break;
 	case Pass::Compute:
-		if (!std::holds_alternative<std::monostate>(desc))
-			RenderGraph::HandleError(RenderGraph::ErrorCode::PassTypeDescMismatch);
-		return std::make_unique<ComputePass>(std::move(topo));
+		if (auto* d = std::get_if<ComputePassDesc>(&desc))
+			return std::make_unique<ComputePass>(std::move(topo), std::move(*d));
+		RenderGraph::HandleError(RenderGraph::ErrorCode::PassTypeDescMismatch);
+		break;
+	case Pass::Host:
+		if (auto* d = std::get_if<HostPassDesc>(&desc))
+			return std::make_unique<HostPass>(std::move(topo), std::move(*d));
+		RenderGraph::HandleError(RenderGraph::ErrorCode::PassTypeDescMismatch);
+		break;
+	case Pass::Transfer:
+		if (auto* d = std::get_if<TransferPassDesc>(&desc))
+			return std::make_unique<TransferPass>(std::move(topo), std::move(*d));
+		RenderGraph::HandleError(RenderGraph::ErrorCode::PassTypeDescMismatch);
+		break;
 	default:
 		RenderGraph::HandleError(RenderGraph::ErrorCode::PassTypeUnspecified);
 		break;
@@ -34,8 +45,17 @@ Image::Image(ResourceTopology&& topo, const rhi::Image* external, ImageSubresour
 	mDesc.viewType = d.viewType;
 }
 
+// Borrow 路径：不创建底层 buffer，描述信息从外部句柄回填
+Buffer::Buffer(ResourceTopology&& topo, const rhi::Buffer* external)
+	: Resource(std::move(topo)), mExternal(external) {
+	const rhi::BufferCreateInfo& d = external->Desc();
+	mDesc.size = d.size;
+	mDesc.usage = d.usage;
+	mDesc.hostVisible = d.hostVisible;
+}
+
 std::unique_ptr<Resource> Resource::AutoAllocator(ResourceTopology&& topo, Type type, ResourceDesc desc,
-	ImageSubresource view, const rhi::Image* external) {
+	ImageSubresource view, const rhi::Image* external, const rhi::Buffer* externalBuffer) {
 	switch (type) {
 	case Resource::Image:
 		// 借用优先：外部句柄存在时不创建、不拥有，desc 可为 monostate
@@ -43,6 +63,13 @@ std::unique_ptr<Resource> Resource::AutoAllocator(ResourceTopology&& topo, Type 
 			return std::make_unique<dEngine::Image>(std::move(topo), external, view);
 		if (auto* d = std::get_if<ImageDesc>(&desc))
 			return std::make_unique<dEngine::Image>(std::move(topo), std::move(*d), view);
+		RenderGraph::HandleError(RenderGraph::ErrorCode::ResourceTypeDescMismatch);
+		break;
+	case Resource::Buffer:
+		if (externalBuffer != nullptr)
+			return std::make_unique<dEngine::Buffer>(std::move(topo), externalBuffer);
+		if (auto* d = std::get_if<BufferDesc>(&desc))
+			return std::make_unique<dEngine::Buffer>(std::move(topo), std::move(*d));
 		RenderGraph::HandleError(RenderGraph::ErrorCode::ResourceTypeDescMismatch);
 		break;
 	default:

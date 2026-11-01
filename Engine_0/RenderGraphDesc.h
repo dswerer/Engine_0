@@ -5,6 +5,7 @@
 #include <optional>
 #include <variant>
 #include <array>
+#include <functional>
 #include <cstdint>
 
 // 渲染图的数据描述层：资源/Pass 的 Desc、绑定结构与相关枚举。
@@ -21,6 +22,12 @@ namespace dEngine {
 	using rhi::kMaxColorAttachments;
 	using rhi::CompareOp;
 	using rhi::CullMode;
+	using rhi::BufferUsage;
+	using rhi::IndexType;
+	using rhi::PrimitiveTopology;
+	using rhi::VertexFormat;
+	using rhi::VertexInputBinding;
+	using rhi::VertexAttribute;
 	using rhi::ShaderStageDesc;
 
 #pragma region ImageDesc // 图像描述
@@ -38,14 +45,34 @@ namespace dEngine {
 
 #pragma endregion
 
+#pragma region BufferDesc // 缓冲描述
+
+	// 图侧 Buffer 节点：创建位由描述显式给出。
+	// 图像能从 shader 绑定派生 usage，是因为 Usage 里已有采样/存储语义；
+	// 缓冲目前没有顶点/索引/统一缓冲的用法枚举，等 DrawBinding 落地后再改为按边派生
+	struct BufferDesc {
+		uint64_t    size = 0;
+		BufferUsage usage = BufferUsage::None; // 显式创建位（Vertex/Index/Uniform/Storage/Transfer*）
+		bool        hostVisible = false;      // 决定 VMA 内存类型
+	};
+
+#pragma endregion
+
 #pragma region Common // 公共内容
 
-	// 逐次访问的用途（非资源属性）。Buffer 相关 usage 等 Buffer 落地时再补；
+	// 逐次访问的用途（非资源属性）。Buffer 的 shader 通道用 UniformRead / StorageRead / StorageWrite；
+	// 顶点/索引流是固定功能输入，也不进描述符布局，但其读语义仍需记录在拓扑读边里
+	// （VertexInputRead / IndexRead），供 barrier compiler 映射 VERTEX_INPUT / INDEX_READ。
 	// 注意与 RHI 的创建能力位 ImageUsage/BufferUsage 是正交的两根轴（后者在 rhi 命名空间）。
 	enum class Usage {
 		Auto,
 		ColorAttachment, DepthStencilAttachment, ResolveSrc, ResolveDst,
-		SampledRead, StorageRead, StorageWrite
+		SampledRead, StorageRead, StorageWrite,
+		UniformRead,
+		VertexInputRead, IndexRead,
+		TransferRead, TransferWrite,  // 拷贝通道：buffer 作源读 / image 作目的写
+		HostWrite,                    // Host 节点的 CPU 写（映射 HOST 阶段，仅 Buffer）
+		PresentSrc                    // 呈现收尾（布局转 PresentSrc）
 	};
 
 	// 依赖边的 use 记录：资源 × 用途（barrier compiler 的输入粒度）。
@@ -81,7 +108,10 @@ namespace dEngine {
 	struct ShaderBinding {
 		std::string             resourceName;
 		std::optional<uint32_t> resourceId;
-		Usage                   usage = Usage::Auto; // Auto: 推断为 SampledRead
+		Usage                   usage = Usage::Auto; // Auto: 图像推断 SampledRead，Buffer 推断 UniformRead
+		// Buffer 专用：描述符的窗口（0 长度 = 整个 buffer）。图像绑定忽略这两个字段
+		uint64_t                offset = 0;
+		uint64_t                range = 0;
 		// 反射回填（RealizePass 对账成功后写入；注册期不填）——与 resourceId 的两阶段模式同构
 		std::optional<uint32_t> set;
 		std::optional<uint32_t> binding;
@@ -94,6 +124,13 @@ namespace dEngine {
 	struct PipelineDesc {
 		std::vector<ShaderStageDesc> shaders; // 各阶段 SPIR-V 路径（离线 glslc 产出；组合合法性由 RHI 校验）
 
+		// 顶点输入布局（管线状态）：绑定/属性直接复用 RHI 的无后端词表版结构。
+		// 两向量均留空 = 缺省：按 Vertex 阶段反射派生单流交错布局（字段顺序须与 location 顺序一致）；
+		// shader 无用户输入时为空布局（gl_VertexIndex 路径）
+		PrimitiveTopology topology = PrimitiveTopology::TriangleList;
+		std::vector<VertexInputBinding> vertexBindings;
+		std::vector<VertexAttribute>    vertexAttributes;
+
 		// 固定功能（与 RHI 最小集对齐；实际深度开关还受有无深度附件约束，无深度时 RHI 自动关闭）
 		bool      depthTestEnable  = true;
 		bool      depthWriteEnable = true;
@@ -103,17 +140,77 @@ namespace dEngine {
 		uint32_t  pushConstantSize = 0;          // 0=无；全部 stage 共享、offset 固定 0
 	};
 
+	// 顶点流：声明「用哪个 Buffer 资源、从哪个偏移开始」，序号即管线的 binding index。
+	// stride/属性格式属于布局，在 PipelineDesc 的 vertexBindings/vertexAttributes 里
+	struct VertexStreamBinding {
+		std::string             resourceName; // 须是图中注册的 Buffer 节点
+		std::optional<uint32_t> resourceId;   // ProcessRegister 回填
+		uint64_t                offset = 0;
+	};
+
+	// 索引流：offset 与索引类型是录制参数（vkCmdBindIndexBuffer 的入参），不是管线状态
+	struct IndexStreamBinding {
+		std::string             resourceName;
+		std::optional<uint32_t> resourceId;   // ProcessRegister 回填
+		uint64_t                offset = 0;
+		IndexType               type = IndexType::UInt32;
+	};
+
+	// 绘制数量来源（执行参数，非声明）：注册期不写死，宿主每帧经 RenderPass::SetDraw 提供。
+	// Direct = 数值走 CPU；Indirect = 参数在 buffer 里（有索引流则走 indexed indirect）
+	struct DrawSource {
+		enum Kind { Direct, Indirect };
+		Kind        kind = Direct;
+		std::string indirectBuffer;    // Indirect：参数 Buffer 的图资源名
+		uint64_t    indirectOffset = 0;
+		uint32_t    count = 0;         // Direct：顶点数 / 索引数；Indirect：draw 条目数
+		uint32_t    first = 0;         // Direct：firstVertex / firstIndex
+		int32_t     vertexOffset = 0;  // Direct + 索引流
+		uint32_t    instanceCount = 1;
+	};
+
 	struct RenderPassDesc {
 		std::vector<AttachmentBinding> attachments;    // 顺序无语义，slot 显式
 		std::vector<ShaderBinding>     shaderBindings; // 与 attachments 平级
+		// 固定功能输入通道（非描述符绑定）：资源身份进拓扑读边，布局在 pipeline，数量在 DrawSource
+		std::vector<VertexStreamBinding> vertexStreams;
+		std::optional<IndexStreamBinding> indexStream;
 		ViewportDesc                   viewport {};
-		PipelineDesc                   pipeline {};    // 管线状态（shader/blend/depth/cull）
+		PipelineDesc                   pipeline {};    // 管线状态（shader/blend/depth/cull/vertex layout）
+	};
+
+	// 计算 Pass：单 compute shader + 工作组数；描述符布局同样由 SPIR-V 反射产出，
+	// shaderBindings 按「变量名 == 资源名」对账（与 RenderPassDesc 同约定）
+	struct ComputePassDesc {
+		std::vector<ShaderBinding> shaderBindings;
+		ShaderStageDesc            shader;
+		uint32_t                   pushConstantSize = 0;
+		uint32_t                   groupCountX = 1;
+		uint32_t                   groupCountY = 1;
+		uint32_t                   groupCountZ = 1;
+	};
+
+	// Host Pass：纯 CPU 回调（解码/上传等宿主机工作），不录任何命令。
+	// 它经 RegisterPass 的 write 集声明「往哪个 Buffer 写」，拓扑边记为 HostWrite；
+	// 回调是执行参数，可在 Realize 后经 HostPass::SetCallback 覆盖 desc 中的声明
+	struct HostPassDesc {
+		std::function<void()> callback;
+	};
+
+	// 传输 Pass：单次 CopyBufferToImage（buffer 整段 -> image 全层 mip0）。
+	// 两端即拓扑边：srcBuffer 进读边（TransferRead），dstImage 进写边（TransferWrite）
+	struct TransferPassDesc {
+		std::string             srcBuffer;
+		std::optional<uint32_t> srcBufferId; // ProcessRegister 回填
+		std::string             dstImage;
+		std::optional<uint32_t> dstImageId;  // ProcessRegister 回填
 	};
 
 #pragma endregion
 
 #pragma region DescAlias // 注册接口别名（Desc 变体）
-	using PassDesc = std::variant<std::monostate, RenderPassDesc>;
-	using ResourceDesc = std::variant<std::monostate, ImageDesc>;
+	using PassDesc = std::variant<std::monostate, RenderPassDesc, ComputePassDesc,
+		HostPassDesc, TransferPassDesc>;
+	using ResourceDesc = std::variant<std::monostate, ImageDesc, BufferDesc>;
 #pragma endregion
 }

@@ -61,7 +61,9 @@ namespace dEngine::rhi {
 		ComputeShader      = 1ull << 6,
 		Transfer           = 1ull << 7,
 		BottomOfPipe       = 1ull << 8,
-		AllCommands        = 1ull << 9
+		AllCommands        = 1ull << 9,
+		Host               = 1ull << 10, // 宿主机写/读（Host 节点的 CPU 回调）
+		VertexInput        = 1ull << 11  // 固定功能输入：顶点属性/索引读取
 	};
 	inline constexpr PipelineStage operator|(PipelineStage a, PipelineStage b) {
 		return static_cast<PipelineStage>(static_cast<uint64_t>(a) | static_cast<uint64_t>(b));
@@ -78,7 +80,10 @@ namespace dEngine::rhi {
 		TransferRead          = 1ull << 6,
 		TransferWrite         = 1ull << 7,
 		MemoryRead            = 1ull << 8,
-		MemoryWrite           = 1ull << 9
+		MemoryWrite           = 1ull << 9,
+		VertexAttributeRead   = 1ull << 10,
+		IndexRead             = 1ull << 11,
+		HostWrite             = 1ull << 12
 	};
 	inline constexpr Access operator|(Access a, Access b) {
 		return static_cast<Access>(static_cast<uint64_t>(a) | static_cast<uint64_t>(b));
@@ -120,7 +125,8 @@ namespace dEngine::rhi {
 		Uniform      = 1u << 2,
 		Storage      = 1u << 3,
 		TransferSrc  = 1u << 4,
-		TransferDst  = 1u << 5
+		TransferDst  = 1u << 5,
+		Indirect     = 1u << 6   // 间接绘制参数（Vulkan 要求 INDIRECT_BUFFER 用法位）
 	};
 	inline constexpr BufferUsage operator|(BufferUsage a, BufferUsage b) {
 		return static_cast<BufferUsage>(static_cast<uint32_t>(a) | static_cast<uint32_t>(b));
@@ -175,6 +181,27 @@ namespace dEngine::rhi {
 		uint32_t     arrayCount = 1;
 	};
 
+	// 图元拓扑（第一版最小集；其余拓扑随用随加）
+	enum class PrimitiveTopology { PointList, LineList, LineStrip, TriangleList, TriangleStrip };
+
+	// 顶点属性格式（第一版最小集：按 float 分量数；整型/归一化格式后续补）
+	enum class VertexFormat { Float, Float2, Float3, Float4 };
+
+	// 顶点缓冲绑定（VkVertexInputBindingDescription 的无后端词表版）：binding 序号由 pass 侧的流序号对应
+	struct VertexInputBinding {
+		uint32_t binding = 0;
+		uint32_t stride = 0;
+		bool     perInstance = false;
+	};
+
+	// 顶点属性（VkVertexInputAttributeDescription 的无后端词表版）
+	struct VertexAttribute {
+		uint32_t     location = 0;
+		uint32_t     binding = 0;
+		VertexFormat format = VertexFormat::Float3;
+		uint32_t     offset = 0;
+	};
+
 	struct GraphicsPipelineDesc {
 		// 着色器阶段集合（数组驱动，合法组合由 RHI 校验：Vertex 与 Task/Mesh 互斥、Tess 成对等）
 		std::vector<ShaderStageDesc> shaders;
@@ -185,6 +212,12 @@ namespace dEngine::rhi {
 		ImageFormat depthFormat = ImageFormat::None;   // None = 无深度
 
 		// 固定功能（第一版最小集）
+		PrimitiveTopology topology = PrimitiveTopology::TriangleList;
+		// 顶点输入布局。两向量均为空 = 缺省：由 RHI 反射 Vertex 阶段输入派生
+		// 「单流（binding 0）、交错排布」；shader 无用户输入时即无顶点缓冲（gl_VertexIndex 路径）。
+		// 任一非空 = 整条按显式声明直译（多流/per-instance/非 float 格式等）
+		std::vector<VertexInputBinding> vertexBindings;
+		std::vector<VertexAttribute>    vertexAttributes;
 		bool      depthTestEnable = true;
 		bool      depthWriteEnable = true;
 		CompareOp depthCompareOp = CompareOp::Less;

@@ -98,8 +98,9 @@ cset->Write(0, *sampledImage, rhi::ImageSubresource{ 0, 0 });        // sampler2
 cset->Write(1, *storageImage, rhi::ImageSubresource{ 0, 0 });        // image2D（STORAGE_IMAGE / General）
 ```
 
-- 图形与计算的集合布局、管线布局由同一个内部构建路径产出（`BuildSetLayouts`）：按 set 分组、组内 binding 升序、stageFlags 取实际使用并集、push constant 全 stage 共享。
+- 布局构建分两层，图形与计算共用：`ReflectAndMergeBindings`（前端：逐 stage 反射 + 按 `(set,binding)` 合并，撞槽须同名同类型同长度，stageFlags 取并集）→ `BuildSetLayouts`（后端：按 set 分组、组内 binding 升序、建 Vk 描述符布局与管线布局）。计算管线虽是单 stage，也走同一合并路径，规则只有一份实现。
 - `Pipeline::NativeBindPoint()` 区分 GRAPHICS / COMPUTE：`BindPipeline` 按其绑定点调用 `vkCmdBindPipeline`，后续 `BindDescriptorSet` / `PushConstants` 沿用同一绑定点与阶段集合，调用方无需显式传绑定点。
+- **图侧分工**：`ComputePassDesc`（shader + 工作组数）在 `RealizePass` 建管线，并沿同一反射对账路径分配/写入描述符集；`RecordPass`/`RecordGraph` 按 `submitSeq` 依次 `BindPipeline → BindDescriptorSet → Dispatch`。barrier 不注入节点，由调用方（或后续 compiler）在 `RecordGraph` 前后安排——节点只管“录什么”，不感知同步。
 
 ## 6. 命令录制（CommandList）
 

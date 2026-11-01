@@ -5,6 +5,9 @@
 #include "RenderGraphAbstracted.h"
 #include "RenderGraphNodes.h"
 #include "rhi/RHI.h"
+// stb_image：测试贴图上载。实现只在本 TU 展开（避免新增编译单元）
+#define STB_IMAGE_IMPLEMENTATION
+#include "external/stb_image/stb_image.h"
 // 取 Win32 原生句柄以创建 Vulkan 表面（GLFW 不建 GL 上下文）
 #define GLFW_EXPOSE_NATIVE_WIN32
 #include <GLFW/glfw3.h>
@@ -13,6 +16,7 @@
 #undef CreateSemaphore
 
 #include <iostream>
+#include <cstring>
 
 using namespace std;
 using namespace dEngine;
@@ -49,6 +53,11 @@ int main()
 		const std::string shaderDir = ENGINE_SHADER_DIR;
 #else
 		const std::string shaderDir;
+#endif
+#ifdef ENGINE_ASSET_DIR
+		const std::string assetDir = ENGINE_ASSET_DIR;
+#else
+		const std::string assetDir;
 #endif
 
 		// GBuffer 的 RenderPassDesc：一个颜色附件(slot0) + 一个深度附件
@@ -98,20 +107,38 @@ int main()
 			tonemapDesc.pipeline.cullMode = CullMode::None;
 		}
 
+		// Blur 的 ComputePassDesc：采样 Color、storage 写 Blurred（blur.comp 为 8x8 工作组）
+		ComputePassDesc blurDesc;
+		{
+			ShaderBinding in;
+			in.resourceName = "Color";
+			in.usage = Usage::SampledRead;
+			blurDesc.shaderBindings.push_back(in);
+
+			ShaderBinding out;
+			out.resourceName = "Blurred";
+			out.usage = Usage::StorageWrite;
+			blurDesc.shaderBindings.push_back(out);
+
+			blurDesc.shader = { rhi::ShaderStage::Compute, shaderDir + "/blur.comp.spv" };
+			blurDesc.groupCountX = 1920 / 8;
+			blurDesc.groupCountY = 1080 / 8;
+		}
+
 		// 示例图：GBuffer -> Blur -> ToneMap
 		graph.RegisterPass("GBuffer", {},               {"Color", "Depth"}, Pass::Render, gbufferDesc);
-		graph.RegisterPass("Blur",    {"Color"},        {"Blurred"},        Pass::Compute);
+		graph.RegisterPass("Blur",    {"Color"},        {"Blurred"},        Pass::Compute, blurDesc);
 		graph.RegisterPass("ToneMap", {"Blurred"},      {"Backbuffer"},     Pass::Render, tonemapDesc);
 
 		// 资源用 Pass 名声明写者/读者（单写者模型）
 		ImageDesc colorDesc;  colorDesc.width = 1920; colorDesc.height = 1080; colorDesc.format = ImageFormat::RGBA16F;
 		ImageDesc depthDesc;  depthDesc.width = 1920; depthDesc.height = 1080; depthDesc.format = ImageFormat::D32F;
-		ImageDesc blurDesc;   blurDesc.width = 1920;  blurDesc.height = 1080; blurDesc.format = ImageFormat::RGBA16F;
+		ImageDesc blurredDesc; blurredDesc.width = 1920; blurredDesc.height = 1080; blurredDesc.format = ImageFormat::RGBA16F;
 		ImageDesc backDesc;   backDesc.width = 1920;  backDesc.height = 1080; backDesc.format = ImageFormat::RGBA8;
 
 		graph.RegisterResource("Color",      {"Blur"},    "GBuffer", Resource::Image, colorDesc);
 		graph.RegisterResource("Depth",      {},          "GBuffer", Resource::Image, depthDesc);
-		graph.RegisterResource("Blurred",    {"ToneMap"}, "Blur",    Resource::Image, blurDesc);
+		graph.RegisterResource("Blurred",    {"ToneMap"}, "Blur",    Resource::Image, blurredDesc);
 		graph.RegisterResource("Backbuffer", {},          "ToneMap", Resource::Image, backDesc);
 
 		graph.ProcessRegister();
@@ -350,6 +377,347 @@ int main()
 				cout << "Compute dispatch ok: 8x8 groups -> storage image\n";
 			}
 
+			// 图侧计算冒烟：同一 blur.comp 改走 RenderGraph —— 两节点均借用外部 image
+			// （输入 "Color" = 上一段 blurTex，输出 "Blurred" = 外部自建、用法由外部负责），
+			// Pass 之前的 barrier 由 compiler 按使用链推导，RecordGraph 自动注入
+			rhi::ImageCreateInfo graphOutInfo;
+			graphOutInfo.width = 64; graphOutInfo.height = 64;
+			graphOutInfo.format = rhi::ImageFormat::RGBA16F;
+			graphOutInfo.usage = rhi::ImageUsage::Storage | rhi::ImageUsage::Sampled; // 借用节点自管用法
+			auto graphOut = device->CreateImage(graphOutInfo);
+			if (blurTex && graphOut) {
+				RenderGraph computeGraph(device.get());
+
+				ComputePassDesc graphBlur;
+				{
+					ShaderBinding in;
+					in.resourceName = "Color";
+					in.usage = Usage::SampledRead;
+					graphBlur.shaderBindings.push_back(in);
+
+					ShaderBinding out;
+					out.resourceName = "Blurred";
+					out.usage = Usage::StorageWrite;
+					graphBlur.shaderBindings.push_back(out);
+
+					graphBlur.shader = { rhi::ShaderStage::Compute, shaderDir + "/blur.comp.spv" };
+					graphBlur.groupCountX = 64 / 8;
+					graphBlur.groupCountY = 64 / 8;
+				}
+
+				computeGraph.RegisterPass("GraphBlur", { "Color", "Params" }, { "Blurred" }, Pass::Compute, graphBlur);
+				// 借用图声明首态：上一段派发后 Color 已在 ShaderReadOnly（链首因此无需转换）
+				computeGraph.RegisterResource("Color", { "GraphBlur" }, "", blurTex.get(), {},
+					rhi::ImageLayout::ShaderReadOnly);
+				computeGraph.RegisterResource("Blurred", {}, "GraphBlur", graphOut.get());
+
+				// Buffer 节点（Own）：图按 BufferDesc 自建，用法显式给出
+				BufferDesc paramDesc;
+				paramDesc.size = 256;
+				paramDesc.usage = rhi::BufferUsage::Uniform;
+				paramDesc.hostVisible = true;
+				computeGraph.RegisterResource("Params", { "GraphBlur" }, "", Resource::Buffer, paramDesc);
+
+				computeGraph.ProcessRegister();
+				computeGraph.GenerateSubmitSequence();
+				computeGraph.RealizeAll();
+
+				uint32_t realizedBuffers = 0;
+				for (uint32_t i = 0; computeGraph.GetResource(i) != nullptr; ++i) {
+					Resource* res = computeGraph.GetResource(i);
+					if (res->get_type() == Resource::Buffer && static_cast<Buffer*>(res)->get_rhi())
+						++realizedBuffers;
+				}
+				cout << "Graph buffer ok: " << realizedBuffers << " realized\n";
+
+				rhi::CommandList graphCmd = device->BeginCommandList();
+
+				// barrier（Color 保持 ShaderReadOnly / Blurred Undefined->General）由 compiler 注入
+				computeGraph.RecordGraph(graphCmd); // 按 submitSeq 绑定管线/描述符集并 Dispatch
+
+				// Blurred: General -> ShaderReadOnly（随后由图形管线采样）
+				rhi::ImageBarrier outToRead;
+				outToRead.image = graphOut.get();
+				outToRead.oldLayout = rhi::ImageLayout::General;
+				outToRead.newLayout = rhi::ImageLayout::ShaderReadOnly;
+				outToRead.srcStage = rhi::PipelineStage::ComputeShader;
+				outToRead.srcAccess = rhi::Access::ShaderWrite;
+				outToRead.dstStage = rhi::PipelineStage::FragmentShader;
+				outToRead.dstAccess = rhi::Access::ShaderRead;
+				graphCmd.Barrier({ &outToRead, 1 }, {});
+
+				rhi::SubmitInfo graphSubmit;
+				graphSubmit.commandLists = { &graphCmd, 1 };
+				device->Submit(graphSubmit);
+				device->WaitForFrame();
+				cout << "Graph compute ok: 1 compute pass -> borrowed storage image\n";
+			}
+
+			// 图侧 uniform buffer 绑定冒烟：ubo.frag 的变量名 "ubo" 与图资源按名对账，
+			// 资源类型×usage 推出 UniformBuffer，Realize 时按 offset/range 写入描述符
+			{
+				RenderGraph uboGraph(device.get());
+
+				RenderPassDesc tintDesc;
+				{
+					AttachmentBinding att;
+					att.resourceName = "Out";
+					att.slot = 0;
+					att.load = LoadOp::Clear;
+					att.clear.value = std::array<float, 4>{ 0.0f, 0.0f, 0.0f, 1.0f };
+					tintDesc.attachments.push_back(att);
+
+					ShaderBinding ub;
+					ub.resourceName = "ubo"; // 须与 ubo.frag 的 uniform 变量名一致
+					ub.usage = Usage::UniformRead;
+					tintDesc.shaderBindings.push_back(ub);
+
+					tintDesc.pipeline.shaders = {
+						{ rhi::ShaderStage::Vertex,   shaderDir + "/fullscreen.vert.spv" },
+						{ rhi::ShaderStage::Fragment, shaderDir + "/ubo.frag.spv" },
+					};
+					tintDesc.pipeline.cullMode = CullMode::None;
+				}
+
+				uboGraph.RegisterPass("Tint", { "ubo" }, { "Out" }, Pass::Render, tintDesc);
+
+				BufferDesc uboNode;
+				uboNode.size = 256;
+				uboNode.usage = rhi::BufferUsage::Uniform;
+				uboNode.hostVisible = true;
+				uboGraph.RegisterResource("ubo", { "Tint" }, "", Resource::Buffer, uboNode);
+
+				ImageDesc outNode;
+				outNode.width = 64; outNode.height = 64; outNode.format = ImageFormat::RGBA8;
+				uboGraph.RegisterResource("Out", {}, "Tint", Resource::Image, outNode);
+
+				uboGraph.ProcessRegister();
+				uboGraph.GenerateSubmitSequence();
+				uboGraph.RealizeAll();
+				cout << "Graph uniform binding ok: reflected UniformBuffer + descriptor write\n";
+			}
+
+			// 图侧渲染冒烟：顶点/索引流（VertexStreamBinding / IndexStreamBinding）+ DrawSource。
+			// 两个 Pass 各写一张目标图，分别走 Direct indexed 与 Indirect indexed 绘制：
+			// 资源身份在注册期按名声明，布局在 PipelineDesc，数量在录制前经 SetDraw 给出
+			{
+				// 顶点格式 (vec2 pos, vec3 color)，stride 20 —— 布局与 mesh.vert 的 location 对应
+				const float vertices[] = {
+					-0.6f, -0.6f, 1.0f, 0.0f, 0.0f,
+					 0.6f, -0.6f, 0.0f, 1.0f, 0.0f,
+					 0.6f,  0.6f, 1.0f, 1.0f, 0.0f,
+					-0.6f,  0.6f, 0.2f, 0.4f, 1.0f,
+				};
+				rhi::BufferCreateInfo vbInfo;
+				vbInfo.size = sizeof(vertices);
+				vbInfo.usage = rhi::BufferUsage::Vertex;
+				vbInfo.hostVisible = true;
+				auto vb = device->CreateBuffer(vbInfo);
+				if (vb) std::memcpy(vb->Map(), vertices, sizeof(vertices));
+
+				const uint32_t indices[] = { 0, 1, 2, 0, 2, 3 };
+				rhi::BufferCreateInfo ibInfo;
+				ibInfo.size = sizeof(indices);
+				ibInfo.usage = rhi::BufferUsage::Index;
+				ibInfo.hostVisible = true;
+				auto ib = device->CreateBuffer(ibInfo);
+				if (ib) std::memcpy(ib->Map(), indices, sizeof(indices));
+
+				// 间接绘制参数（VkDrawIndexedIndirectCommand：indexCount/instanceCount/firstIndex/vertexOffset/firstInstance）
+				VkDrawIndexedIndirectCommand drawCmd{};
+				drawCmd.indexCount = 6;
+				drawCmd.instanceCount = 1;
+				rhi::BufferCreateInfo argsInfo;
+				argsInfo.size = sizeof(drawCmd);
+				argsInfo.usage = rhi::BufferUsage::Indirect;
+				argsInfo.hostVisible = true;
+				auto args = device->CreateBuffer(argsInfo);
+				if (args) std::memcpy(args->Map(), &drawCmd, sizeof(drawCmd));
+
+				rhi::ImageCreateInfo outInfo;
+				outInfo.width = 64; outInfo.height = 64;
+				outInfo.format = rhi::ImageFormat::RGBA8;
+				outInfo.usage = rhi::ImageUsage::ColorAttachment | rhi::ImageUsage::Sampled;
+				auto outA = device->CreateImage(outInfo);
+				auto outB = device->CreateImage(outInfo);
+
+				if (vb && ib && args && outA && outB) {
+					RenderGraph drawGraph(device.get());
+
+					RenderPassDesc meshPass;
+					{
+						AttachmentBinding att;
+						att.resourceName = "OutA"; // 间接 Pass 复制后仅改目标名
+						att.slot = 0;
+						att.load = LoadOp::Clear;
+						att.clear.value = std::array<float, 4>{ 0.05f, 0.05f, 0.08f, 1.0f };
+						meshPass.attachments.push_back(att);
+
+						meshPass.pipeline.shaders = {
+							{ rhi::ShaderStage::Vertex,   shaderDir + "/mesh.vert.spv" },
+							{ rhi::ShaderStage::Fragment, shaderDir + "/mesh.frag.spv" },
+						};
+						meshPass.pipeline.topology = PrimitiveTopology::TriangleList;
+						// 顶点布局留空：由 RHI 反射 mesh.vert 的 location 0(vec2)/1(vec3) 派生
+						// 单流交错布局（stride 20、offset 0/8），与上面的顶点数据排布一致
+						meshPass.pipeline.depthTestEnable = false; // 无深度附件
+						meshPass.pipeline.cullMode = CullMode::None;
+
+						meshPass.vertexStreams.push_back(VertexStreamBinding{ "Vertices" });
+						meshPass.indexStream = IndexStreamBinding{ "Indices", {}, 0, IndexType::UInt32 };
+					}
+					RenderPassDesc indirectPass = meshPass;
+					indirectPass.attachments[0].resourceName = "OutB";
+
+					drawGraph.RegisterPass("DrawDirect",   { "Vertices", "Indices" }, { "OutA" }, Pass::Render, meshPass);
+					drawGraph.RegisterPass("DrawIndirect", { "Vertices", "Indices" }, { "OutB" }, Pass::Render, indirectPass);
+
+					// 借用外部创建的顶点/索引/参数缓冲与目标图（用法与生命周期由外部负责）
+					drawGraph.RegisterResource("Vertices", { "DrawDirect", "DrawIndirect" }, "", vb.get());
+					drawGraph.RegisterResource("Indices",  { "DrawDirect", "DrawIndirect" }, "", ib.get());
+					drawGraph.RegisterResource("DrawArgs", { "DrawIndirect" }, "", args.get());
+					drawGraph.RegisterResource("OutA", {}, "DrawDirect",   outA.get());
+					drawGraph.RegisterResource("OutB", {}, "DrawIndirect", outB.get());
+
+					drawGraph.ProcessRegister();
+					drawGraph.GenerateSubmitSequence();
+					drawGraph.RealizeAll();
+
+					// 绘制数量是执行参数：录制前按节点名设置（Direct 走数值，Indirect 走参数 buffer）
+					for (uint32_t i = 0; drawGraph.GetPass(i) != nullptr; ++i) {
+						Pass* p = drawGraph.GetPass(i);
+						if (p->get_type() != Pass::Render) continue;
+						auto* rp = static_cast<RenderPass*>(p);
+						if (p->get_name() == "DrawDirect") {
+							DrawSource draw;
+							draw.kind = DrawSource::Direct;
+							draw.count = 6;  // 索引数
+							draw.vertexOffset = 0;
+							draw.instanceCount = 1;
+							rp->SetDraw(draw);
+						}
+						else if (p->get_name() == "DrawIndirect") {
+							DrawSource draw;
+							draw.kind = DrawSource::Indirect;
+							draw.indirectBuffer = "DrawArgs";
+							draw.indirectOffset = 0;
+							draw.count = 1;  // 参数条目数
+							rp->SetDraw(draw);
+						}
+					}
+
+					rhi::CommandList drawCmdList = device->BeginCommandList();
+
+					// 目标图的首态转换（Undefined -> ColorAttachment）由 compiler 在各自 Pass 前注入
+					drawGraph.RecordGraph(drawCmdList); // 两个渲染 Pass：BeginRendering/绑定/绘制/EndRendering
+
+					rhi::SubmitInfo drawSubmit;
+					drawSubmit.commandLists = { &drawCmdList, 1 };
+					device->Submit(drawSubmit);
+					device->WaitForFrame();
+					cout << "Graph render ok: direct-indexed + indirect-indexed draws\n";
+				}
+			}
+
+			// 纹理加载冒烟：assets/skyview.jpg -> Host(CPU 解码写 staging) -> Transfer(拷入图像) -> 采样绘制。
+			// 三者都是图节点；barrier 由 compiler 按使用链自动推导（含 HOST -> TRANSFER 的内存依赖）
+			{
+				int texW = 0, texH = 0, texChannels = 0;
+				const std::string texturePath = assetDir + "/skyview.jpg";
+				stbi_uc* pixels = stbi_load(texturePath.c_str(), &texW, &texH, &texChannels, STBI_rgb_alpha);
+				if (pixels == nullptr) {
+					cerr << "纹理加载失败: " << texturePath << "\n";
+				}
+				else {
+					const uint64_t stagingBytes = static_cast<uint64_t>(texW) * texH * 4;
+
+					RenderGraph texGraph(device.get());
+
+					// Host 节点：只声明写 staging；回调在录制时执行（Realize 后拿到句柄再装配）
+					texGraph.RegisterPass("UploadHost", {}, { "Staging" }, Pass::Host, HostPassDesc{});
+
+					TransferPassDesc uploadDesc;
+					uploadDesc.srcBuffer = "Staging";
+					uploadDesc.dstImage = "Texture";
+					texGraph.RegisterPass("Upload", { "Staging" }, { "Texture" }, Pass::Transfer, uploadDesc);
+
+					RenderPassDesc sampleDesc;
+					{
+						AttachmentBinding att;
+						att.resourceName = "Out";
+						att.slot = 0;
+						att.load = LoadOp::Clear;
+						att.clear.value = std::array<float, 4>{ 0.0f, 0.0f, 0.0f, 1.0f };
+						sampleDesc.attachments.push_back(att);
+
+						ShaderBinding texBinding;
+						texBinding.resourceName = "Texture"; // 与 texture.frag 的变量名一致（按名对账）
+						sampleDesc.shaderBindings.push_back(texBinding);
+
+						sampleDesc.pipeline.shaders = {
+							{ rhi::ShaderStage::Vertex,   shaderDir + "/fullscreen.vert.spv" },
+							{ rhi::ShaderStage::Fragment, shaderDir + "/texture.frag.spv" },
+						};
+						sampleDesc.pipeline.cullMode = CullMode::None;
+					}
+					texGraph.RegisterPass("Sample", { "Texture" }, { "Out" }, Pass::Render, sampleDesc);
+
+					BufferDesc stagingDesc;
+					stagingDesc.size = stagingBytes;
+					stagingDesc.usage = BufferUsage::TransferSrc; // CopyBufferToImage 的源
+					stagingDesc.hostVisible = true;
+					texGraph.RegisterResource("Staging", { "Upload" }, "UploadHost", Resource::Buffer, stagingDesc);
+
+					ImageDesc texNodeDesc;
+					texNodeDesc.width = static_cast<uint32_t>(texW);
+					texNodeDesc.height = static_cast<uint32_t>(texH);
+					texNodeDesc.format = ImageFormat::RGBA8;
+					texGraph.RegisterResource("Texture", { "Sample" }, "Upload", Resource::Image, texNodeDesc);
+
+					ImageDesc outNodeDesc;
+					outNodeDesc.width = 64; outNodeDesc.height = 64;
+					outNodeDesc.format = ImageFormat::RGBA8;
+					texGraph.RegisterResource("Out", {}, "Sample", Resource::Image, outNodeDesc);
+
+					texGraph.ProcessRegister();
+					texGraph.GenerateSubmitSequence();
+					texGraph.RealizeAll();
+
+					// Realize 后取 staging 句柄与 Host 节点：装配 CPU 侧上传回调（执行参数）
+					rhi::Buffer* staging = nullptr; // Map 非 const：宿主机写得用可写句柄
+					HostPass* uploadHost = nullptr;
+					for (uint32_t i = 0; texGraph.GetResource(i) != nullptr; ++i) {
+						Resource* res = texGraph.GetResource(i);
+						if (res->get_type() == Resource::Buffer && res->get_name() == "Staging")
+							staging = const_cast<rhi::Buffer*>(static_cast<Buffer*>(res)->get_rhi());
+					}
+					for (uint32_t i = 0; texGraph.GetPass(i) != nullptr; ++i) {
+						Pass* p = texGraph.GetPass(i);
+						if (p->get_type() == Pass::Host)
+							uploadHost = static_cast<HostPass*>(p);
+					}
+
+					if (staging != nullptr && uploadHost != nullptr) {
+						uploadHost->SetCallback([staging, pixels, stagingBytes]() {
+							std::memcpy(staging->Map(), pixels, static_cast<size_t>(stagingBytes));
+						});
+
+						rhi::CommandList texCmd = device->BeginCommandList();
+						texGraph.RecordGraph(texCmd); // Host 回调 + HOST/TRANSFER barrier + 拷贝 + 采样绘制
+						rhi::SubmitInfo texSubmit;
+						texSubmit.commandLists = { &texCmd, 1 };
+						device->Submit(texSubmit);
+						device->WaitForFrame();
+						cout << "Texture upload ok: " << texturePath << " " << texW << "x" << texH
+						     << " ch=" << texChannels << " -> Host -> Transfer -> Sample\n";
+					}
+					else {
+						cerr << "纹理冒烟失败: staging 或 Host 节点未就绪\n";
+					}
+					stbi_image_free(pixels);
+				}
+			}
+
 			rhi::GraphicsPipelineDesc pso;
 			pso.shaders = {
 				{ rhi::ShaderStage::Vertex,   shaderDir + "/fullscreen.vert.spv" },
@@ -364,8 +732,8 @@ int main()
 			auto pipeline2 = device->CreatePipeline(pso);
 			auto set2 = (pipeline2 && pipeline2->SetLayout(0))
 				? device->AllocateDescriptorSet(*pipeline2->SetLayout(0)) : nullptr;
-			if (blurTex && pipeline2 && set2) {
-				set2->Write(0, *blurTex, rhi::ImageSubresource{ 0, 0 }); // 采样计算产物
+			if (graphOut && pipeline2 && set2) {
+				set2->Write(0, *graphOut, rhi::ImageSubresource{ 0, 0 }); // 采样图侧计算产物
 
 				uint32_t presented = 0;
 				for (uint32_t attempts = 0; attempts < 8 && presented < 3; ++attempts) {

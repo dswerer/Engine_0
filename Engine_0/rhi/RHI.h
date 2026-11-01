@@ -106,6 +106,13 @@ namespace dEngine::rhi {
 
 #pragma region Descriptor // 描述符布局 / 集合（预编译路径）
 
+	// 合并后的描述符槽位：声明本体 + 该槽位的 stageFlags 并集。
+	// 反射/合并产物与布局构建之间用整条记录传递，不做平行数组（后端侧类型，不进入 Desc 层）
+	struct MergedDescriptor {
+		DescriptorBinding binding;
+		VkShaderStageFlags stages = 0;
+	};
+
 	// 由 Pipeline 反射产出；持有 VkDescriptorSetLayout，生命周期随 Pipeline
 	class DescriptorSetLayout {
 	public:
@@ -243,10 +250,16 @@ namespace dEngine::rhi {
 		void SetViewport(const Viewport& viewport);
 
 		// 顶点/索引与绘制
-		void BindVertexBuffer(const Buffer& buffer, uint64_t offset = 0);
+		// firstBinding：多流顶点缓冲的起始绑定点（与 Pipeline 的 VertexInputBinding.binding 对应）
+		void BindVertexBuffer(const Buffer& buffer, uint64_t offset = 0, uint32_t firstBinding = 0);
 		void BindIndexBuffer(const Buffer& buffer, uint64_t offset, IndexType type);
-		void Draw(uint32_t vertexCount, uint32_t firstVertex = 0);
-		void DrawIndexed(uint32_t indexCount, uint32_t firstIndex = 0, int32_t vertexOffset = 0);
+		void Draw(uint32_t vertexCount, uint32_t firstVertex = 0, uint32_t instanceCount = 1);
+		void DrawIndexed(uint32_t indexCount, uint32_t firstIndex = 0, int32_t vertexOffset = 0,
+			uint32_t instanceCount = 1);
+		// 间接绘制：参数（VkDrawIndirectCommand / VkDrawIndexedIndirectCommand）从 buffer 读取，
+		// drawCount 为条目数（参数在 GPU 侧，CPU 不可见）
+		void DrawIndirect(const Buffer& args, uint64_t offset = 0, uint32_t drawCount = 1);
+		void DrawIndexedIndirect(const Buffer& args, uint64_t offset = 0, uint32_t drawCount = 1);
 
 		// 计算派发（工作组数非像素尺寸：通常为 ceil(宽/局部宽), ceil(高/局部高), 1）
 		void Dispatch(uint32_t groupCountX, uint32_t groupCountY = 1, uint32_t groupCountZ = 1);
@@ -426,10 +439,9 @@ namespace dEngine::rhi {
 		uint32_t    ApiVersion() const;
 
 	private:
-		// 反射槽位表 -> 各 set 布局 + pipeline layout（图形 / 计算共用）。
-		// bindings 与 stages 同下标：stages[i] 为该槽位的 stageFlags 并集；失败时已建对象就地清理
-		bool BuildSetLayouts(const std::vector<DescriptorBinding>& bindings,
-			const std::vector<VkShaderStageFlags>& stages, uint32_t pushConstantSize,
+		// 合并槽位表 -> 各 set 布局 + pipeline layout（图形 / 计算共用）。
+		// 每条记录自带 stageFlags；失败时已建对象就地清理
+		bool BuildSetLayouts(std::vector<MergedDescriptor> slots, uint32_t pushConstantSize,
 			VkShaderStageFlags pushStages,
 			std::vector<std::unique_ptr<DescriptorSetLayout>>& outLayouts, VkPipelineLayout& outLayout);
 

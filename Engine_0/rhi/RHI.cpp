@@ -218,6 +218,7 @@ namespace {
 		if (u & static_cast<uint32_t>(BufferUsage::Storage))     flags |= VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
 		if (u & static_cast<uint32_t>(BufferUsage::TransferSrc)) flags |= VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
 		if (u & static_cast<uint32_t>(BufferUsage::TransferDst)) flags |= VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+		if (u & static_cast<uint32_t>(BufferUsage::Indirect))    flags |= VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
 		return flags;
 	}
 
@@ -305,6 +306,8 @@ namespace {
 			case PipelineStage::ComputeShader:      return VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
 			case PipelineStage::Transfer:           return VK_PIPELINE_STAGE_2_TRANSFER_BIT;
 			case PipelineStage::AllCommands:        return VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+			case PipelineStage::Host:               return VK_PIPELINE_STAGE_2_HOST_BIT;
+			case PipelineStage::VertexInput:        return VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT;
 			case PipelineStage::TopOfPipe:
 			case PipelineStage::BottomOfPipe:
 			case PipelineStage::None:
@@ -325,6 +328,9 @@ namespace {
 		if (a & static_cast<uint64_t>(Access::TransferWrite))        flags |= VK_ACCESS_2_TRANSFER_WRITE_BIT;
 		if (a & static_cast<uint64_t>(Access::MemoryRead))           flags |= VK_ACCESS_2_MEMORY_READ_BIT;
 		if (a & static_cast<uint64_t>(Access::MemoryWrite))          flags |= VK_ACCESS_2_MEMORY_WRITE_BIT;
+		if (a & static_cast<uint64_t>(Access::VertexAttributeRead))  flags |= VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT;
+		if (a & static_cast<uint64_t>(Access::IndexRead))            flags |= VK_ACCESS_2_INDEX_READ_BIT;
+		if (a & static_cast<uint64_t>(Access::HostWrite))            flags |= VK_ACCESS_2_HOST_WRITE_BIT;
 		return flags;
 	}
 
@@ -377,6 +383,27 @@ namespace {
 			case ShaderStage::Mesh:        return VK_SHADER_STAGE_MESH_BIT_EXT;
 			case ShaderStage::Compute:     return VK_SHADER_STAGE_COMPUTE_BIT;
 			default:                       return VK_SHADER_STAGE_VERTEX_BIT;
+		}
+	}
+
+	// 图元拓扑与顶点属性格式 -> Vulkan（第一版最小集）
+	VkPrimitiveTopology ToVkTopology(PrimitiveTopology t) {
+		switch (t) {
+			case PrimitiveTopology::PointList:     return VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
+			case PrimitiveTopology::LineList:      return VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
+			case PrimitiveTopology::LineStrip:     return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
+			case PrimitiveTopology::TriangleStrip: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+			default:                               return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+		}
+	}
+
+	VkFormat ToVkVertexFormat(VertexFormat f) {
+		switch (f) {
+			case VertexFormat::Float:   return VK_FORMAT_R32_SFLOAT;
+			case VertexFormat::Float2:  return VK_FORMAT_R32G32_SFLOAT;
+			case VertexFormat::Float3:  return VK_FORMAT_R32G32B32_SFLOAT;
+			case VertexFormat::Float4:  return VK_FORMAT_R32G32B32A32_SFLOAT;
+			default:                    return VK_FORMAT_R32G32B32_SFLOAT;
 		}
 	}
 
@@ -450,6 +477,17 @@ namespace {
 		}
 	}
 
+	// SpvReflectFormat -> 顶点属性格式（仅 float 1~4 分量；整型/双精度等暂不支持）
+	bool ToVertexFormat(SpvReflectFormat f, VertexFormat& out, uint32_t& byteSize) {
+		switch (f) {
+			case SPV_REFLECT_FORMAT_R32_SFLOAT:          out = VertexFormat::Float;  byteSize = 4;  return true;
+			case SPV_REFLECT_FORMAT_R32G32_SFLOAT:       out = VertexFormat::Float2; byteSize = 8;  return true;
+			case SPV_REFLECT_FORMAT_R32G32B32_SFLOAT:    out = VertexFormat::Float3; byteSize = 12; return true;
+			case SPV_REFLECT_FORMAT_R32G32B32A32_SFLOAT: out = VertexFormat::Float4; byteSize = 16; return true;
+			default:                                                                               return false;
+		}
+	}
+
 	// SPIR-V 反射：枚举本 stage 的全部描述符绑定（顶层变量名/set/binding/类型/数组长度）。
 	// 描述符布局的唯一事实来源——CreatePipeline 不再接受手工 bindings 声明
 	bool ReflectDescriptorBindings(const std::vector<uint32_t>& code, const char* stageLabel,
@@ -517,6 +555,121 @@ namespace {
 		}
 
 		spvReflectDestroyShaderModule(&module);
+		return true;
+	}
+
+	// 顶点输入布局的缺省派生：Vertex 阶段的非 builtin 输入按 location 升序 →
+	// 单流（binding 0）、交错排布（offset 顺序累加，stride = 总字节数）。
+	// 矩阵/数组/非 float 格式显式拒绝（自动布局表达不了），避免静默错位
+	bool DeriveVertexLayout(const std::vector<uint32_t>& code,
+		std::vector<VkVertexInputBindingDescription>& outBindings,
+		std::vector<VkVertexInputAttributeDescription>& outAttributes)
+	{
+		SpvReflectShaderModule module{};
+		if (spvReflectCreateShaderModule(code.size() * sizeof(uint32_t), code.data(), &module)
+			!= SPV_REFLECT_RESULT_SUCCESS) {
+			std::cerr << "[RHI] 顶点输入反射失败\n";
+			return false;
+		}
+
+		auto fail = [&module](const char* msg, const SpvReflectInterfaceVariable* v) {
+			std::cerr << "[RHI] " << msg << (v && v->name ? v->name : "?")
+				<< "（自动顶点布局不支持，请在 PipelineDesc 显式声明 vertexBindings/vertexAttributes）\n";
+			spvReflectDestroyShaderModule(&module);
+			return false;
+		};
+
+		uint32_t count = 0;
+		std::vector<SpvReflectInterfaceVariable*> vars;
+		if (spvReflectEnumerateInputVariables(&module, &count, nullptr) == SPV_REFLECT_RESULT_SUCCESS
+			&& count > 0) {
+			vars.resize(count);
+			if (spvReflectEnumerateInputVariables(&module, &count, vars.data())
+				!= SPV_REFLECT_RESULT_SUCCESS) {
+				std::cerr << "[RHI] 枚举顶点输入变量失败\n";
+				spvReflectDestroyShaderModule(&module);
+				return false;
+			}
+		}
+
+		// location 升序 = 交错顺序：顶点结构体字段顺序须与 layout(location) 顺序一致
+		std::sort(vars.begin(), vars.end(),
+			[](const SpvReflectInterfaceVariable* a, const SpvReflectInterfaceVariable* b) {
+				return a->location < b->location;
+			});
+
+		uint32_t stride = 0;
+		for (const auto* v : vars) {
+			if (v->built_in >= 0) continue; // gl_VertexIndex 等内建变量不是顶点属性
+			if (v->array.dims_count > 0
+				|| (v->type_description && (v->type_description->type_flags & SPV_REFLECT_TYPE_FLAG_MATRIX)))
+				return fail("顶点输入为矩阵/数组: ", v);
+			VertexFormat format;
+			uint32_t bytes = 0;
+			if (!ToVertexFormat(v->format, format, bytes))
+				return fail("顶点输入格式暂不支持（仅 float 1~4 分量）: ", v);
+			VkVertexInputAttributeDescription att{};
+			att.location = v->location;
+			att.binding = 0;
+			att.format = ToVkVertexFormat(format);
+			att.offset = stride;
+			stride += bytes;
+			outAttributes.push_back(att);
+		}
+
+		spvReflectDestroyShaderModule(&module);
+		if (outAttributes.empty())
+			return true; // shader 无用户输入：保持无顶点缓冲（gl_VertexIndex 路径）
+		VkVertexInputBindingDescription binding{};
+		binding.binding = 0;
+		binding.stride = stride;
+		binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+		outBindings.push_back(binding);
+		return true;
+	}
+
+	// 一份 stage 与其编译产物（一读两用：反射 + vkCreateShaderModule）
+	struct StageCode {
+		ShaderStage stage;
+		const std::vector<uint32_t>* code;
+	};
+
+	// 反射 + 合并：逐 stage 反射描述符绑定，按 (set,binding) 合并成带 stageFlags 的槽位记录。
+	// 撞槽的共用槽位须同名同类型同长度（Vulkan 布局兼容性 + 「变量名==资源名」对账约定），
+	// stageFlags 按槽位取并集。图形（N stage）与计算（1 stage）共用同一合并规则
+	bool ReflectAndMergeBindings(const std::vector<StageCode>& stages,
+		std::vector<MergedDescriptor>& outSlots,
+		VkShaderStageFlags& outAllStages)
+	{
+		outSlots.clear();
+		outAllStages = 0;
+
+		for (const auto& sc : stages) {
+			std::vector<DescriptorBinding> stageBindings;
+			if (!ReflectDescriptorBindings(*sc.code, ShaderStageName(sc.stage), stageBindings))
+				return false;
+			const VkShaderStageFlags stageFlag = ToVkStage(sc.stage);
+			outAllStages |= stageFlag; // 供 push constant 的 stage 集合使用
+
+			for (auto& b : stageBindings) {
+				bool slotFound = false;
+				for (auto& slot : outSlots) {
+					if (slot.binding.set == b.set && slot.binding.binding == b.binding) {
+						if (slot.binding.type != b.type || slot.binding.arrayCount != b.arrayCount
+							|| slot.binding.name != b.name) {
+							std::cerr << "[RHI] 跨 stage 反射到失配的共用槽位: set" << b.set
+								<< " binding" << b.binding << "（" << slot.binding.name << " vs " << b.name << "）\n";
+							return false;
+						}
+						slot.stages |= stageFlag; // 共用槽位：stageFlags 取并集
+						slotFound = true;
+						break;
+					}
+				}
+				if (!slotFound)
+					outSlots.push_back({ std::move(b), stageFlag });
+			}
+		}
 		return true;
 	}
 
@@ -1509,8 +1662,7 @@ const DescriptorSetLayout* Pipeline::SetLayout(uint32_t setIndex) const
 // 反射槽位表 -> 各 set 布局 + 管线布局。图形 / 计算管线共用：
 // 两者只有阶段集合与 vkCreate*Pipelines 入口不同，描述符布局一律由反射得出。
 // 失败时已创建的布局就地释放（unique_ptr / 手工销毁），不留给调用方
-bool Device::BuildSetLayouts(const std::vector<DescriptorBinding>& bindings,
-	const std::vector<VkShaderStageFlags>& stages, uint32_t pushConstantSize,
+bool Device::BuildSetLayouts(std::vector<MergedDescriptor> slots, uint32_t pushConstantSize,
 	VkShaderStageFlags pushStages,
 	std::vector<std::unique_ptr<DescriptorSetLayout>>& outLayouts, VkPipelineLayout& outLayout)
 {
@@ -1522,15 +1674,14 @@ bool Device::BuildSetLayouts(const std::vector<DescriptorBinding>& bindings,
 
 	// ---- 按 set 分组（组内 binding 升序，保证布局可预测）----
 	uint32_t setCount = 0;
-	for (const auto& b : bindings) setCount = std::max(setCount, b.set + 1);
+	for (const auto& s : slots) setCount = std::max(setCount, s.binding.set + 1);
 
-	struct GroupedBinding { const DescriptorBinding* desc; VkShaderStageFlags stages; };
-	std::vector<std::vector<GroupedBinding>> bySet(setCount);
-	for (size_t i = 0; i < bindings.size(); ++i)
-		bySet[bindings[i].set].push_back({ &bindings[i], stages[i] });
+	std::vector<std::vector<MergedDescriptor>> bySet(setCount);
+	for (auto& s : slots)
+		bySet[s.binding.set].push_back(std::move(s));
 	for (auto& group : bySet) {
 		std::sort(group.begin(), group.end(),
-			[](const GroupedBinding& a, const GroupedBinding& c) { return a.desc->binding < c.desc->binding; });
+			[](const MergedDescriptor& a, const MergedDescriptor& c) { return a.binding.binding < c.binding.binding; });
 	}
 
 	// ---- 各 set 的描述符集合布局（由 Pipeline 持有）----
@@ -1541,14 +1692,14 @@ bool Device::BuildSetLayouts(const std::vector<DescriptorBinding>& bindings,
 		vkBindings.reserve(bySet[i].size());
 		std::vector<DescriptorBinding> groupDescs; // DescriptorSetLayout 侧仅持声明（stageFlags 已烙进 Vk 对象）
 		groupDescs.reserve(bySet[i].size());
-		for (const auto& b : bySet[i]) {
+		for (auto& s : bySet[i]) {
 			VkDescriptorSetLayoutBinding vb{};
-			vb.binding = b.desc->binding;
-			vb.descriptorType = ToVkDescriptorType(b.desc->type);
-			vb.descriptorCount = b.desc->arrayCount;
-			vb.stageFlags = b.stages; // 反射累积：实际使用该槽位的 stage 并集
+			vb.binding = s.binding.binding;
+			vb.descriptorType = ToVkDescriptorType(s.binding.type);
+			vb.descriptorCount = s.binding.arrayCount;
+			vb.stageFlags = s.stages; // 反射累积：实际使用该槽位的 stage 并集
 			vkBindings.push_back(vb);
-			groupDescs.push_back(*b.desc);
+			groupDescs.push_back(std::move(s.binding));
 		}
 
 		VkDescriptorSetLayoutCreateInfo layoutCI{};
@@ -1623,44 +1774,21 @@ std::unique_ptr<Pipeline> Device::CreatePipeline(const GraphicsPipelineDesc& des
 		}
 	}
 
-	// ---- 反射描述符布局：逐 stage 枚举后按 (set,binding) 合并 ----
-	// 撞槽的跨 stage 共用槽位须同名同类型同长度（Vulkan 布局兼容性 + 「变量名==资源名」对账约定），
-	// 并按槽位累积 stageFlags（替代此前 ALL_GRAPHICS 的粗放值）
-	std::vector<DescriptorBinding>  merged;
-	std::vector<VkShaderStageFlags> mergedStages; // 与 merged 同下标：该槽位的 stage 并集
-	for (size_t i = 0; i < desc.shaders.size(); ++i) {
-		std::vector<DescriptorBinding> stageBindings;
-		if (!ReflectDescriptorBindings(codes[i], ShaderStageName(desc.shaders[i].stage), stageBindings))
-			return nullptr;
-		const VkShaderStageFlags stageFlag = ToVkStage(desc.shaders[i].stage);
-		for (auto& b : stageBindings) {
-			bool slotFound = false;
-			for (size_t j = 0; j < merged.size(); ++j) {
-				if (merged[j].set == b.set && merged[j].binding == b.binding) {
-					if (merged[j].type != b.type || merged[j].arrayCount != b.arrayCount || merged[j].name != b.name) {
-						std::cerr << "[RHI] 跨 stage 反射到失配的共用槽位: set" << b.set
-							<< " binding" << b.binding << "（" << merged[j].name << " vs " << b.name << "）\n";
-						return nullptr;
-					}
-					mergedStages[j] |= stageFlag; // 共用槽位：stageFlags 取并集
-					slotFound = true;
-					break;
-				}
-			}
-			if (!slotFound) {
-				merged.push_back(std::move(b));
-				mergedStages.push_back(stageFlag);
-			}
-		}
-	}
-	// push constant 的 stage 集合：desc 级声明（非反射），覆盖全部 stage
-	VkShaderStageFlags allStages = 0;
-	for (const auto& s : desc.shaders) allStages |= ToVkStage(s.stage);
+	// ---- 反射 + 合并：逐 stage 枚举后按 (set,binding) 合并（前端，与计算共用）----
+	std::vector<StageCode> stageCodes;
+	stageCodes.reserve(desc.shaders.size());
+	for (size_t i = 0; i < desc.shaders.size(); ++i)
+		stageCodes.push_back({ desc.shaders[i].stage, &codes[i] });
+
+	std::vector<MergedDescriptor> merged; // 每条记录 = 槽位声明 + 其 stageFlags 并集
+	VkShaderStageFlags allStages = 0;     // push constant 的 stage 集合（desc 级声明，非反射）
+	if (!ReflectAndMergeBindings(stageCodes, merged, allStages))
+		return nullptr;
 
 	// ---- 描述符集合布局 + 管线布局（与计算管线共用同一构建路径）----
 	std::vector<std::unique_ptr<DescriptorSetLayout>> layouts;
 	VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
-	if (!BuildSetLayouts(merged, mergedStages, desc.pushConstantSize, allStages, layouts, pipelineLayout))
+	if (!BuildSetLayouts(merged, desc.pushConstantSize, allStages, layouts, pipelineLayout))
 		return nullptr;
 
 	// ---- shader 模块（复用已读的 SPIR-V code；入口固定 main）----
@@ -1695,13 +1823,51 @@ std::unique_ptr<Pipeline> Device::CreatePipeline(const GraphicsPipelineDesc& des
 	}
 
 	// ---- 固定功能状态 ----
-	// 顶点输入留空：顶点数据由 shader 内建 gl_VertexIndex 生成（无顶点缓冲）
+	// 顶点输入：声明为空 = 走缺省——从 Vertex 阶段反射派生「单流、交错排布」布局；
+	// shader 无用户输入时派生结果为空，即沿用 gl_VertexIndex 生成顶点（全屏三角形）。
+	// 任一向量非空 = 整条按显式声明直译（多流/per-instance/非 float 格式等场景）
+	std::vector<VkVertexInputBindingDescription> vkBindings;
+	std::vector<VkVertexInputAttributeDescription> vkAttributes;
+	if (desc.vertexBindings.empty() && desc.vertexAttributes.empty()) {
+		const std::vector<uint32_t>* vertexCode = nullptr;
+		for (size_t i = 0; i < desc.shaders.size(); ++i)
+			if (desc.shaders[i].stage == ShaderStage::Vertex) vertexCode = &codes[i];
+		if (vertexCode && !DeriveVertexLayout(*vertexCode, vkBindings, vkAttributes)) {
+			for (VkShaderModule m : modules) vkDestroyShaderModule(m_device, m, nullptr);
+			vkDestroyPipelineLayout(m_device, pipelineLayout, nullptr);
+			return nullptr;
+		}
+	}
+	else {
+		vkBindings.reserve(desc.vertexBindings.size());
+		for (const auto& b : desc.vertexBindings) {
+			VkVertexInputBindingDescription vk{};
+			vk.binding = b.binding;
+			vk.stride = b.stride;
+			vk.inputRate = b.perInstance ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX;
+			vkBindings.push_back(vk);
+		}
+		vkAttributes.reserve(desc.vertexAttributes.size());
+		for (const auto& a : desc.vertexAttributes) {
+			VkVertexInputAttributeDescription vk{};
+			vk.location = a.location;
+			vk.binding = a.binding;
+			vk.format = ToVkVertexFormat(a.format);
+			vk.offset = a.offset;
+			vkAttributes.push_back(vk);
+		}
+	}
+
 	VkPipelineVertexInputStateCreateInfo vertexInput{};
 	vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+	vertexInput.vertexBindingDescriptionCount = static_cast<uint32_t>(vkBindings.size());
+	vertexInput.pVertexBindingDescriptions = vkBindings.data();
+	vertexInput.vertexAttributeDescriptionCount = static_cast<uint32_t>(vkAttributes.size());
+	vertexInput.pVertexAttributeDescriptions = vkAttributes.data();
 
 	VkPipelineInputAssemblyStateCreateInfo inputAssembly{};
 	inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-	inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+	inputAssembly.topology = ToVkTopology(desc.topology);
 
 	// viewport/scissor 走动态态（CommandList::SetViewport 设置）；结构中的 count 仍须 >= 1
 	VkPipelineViewportStateCreateInfo viewportState{};
@@ -1824,16 +1990,15 @@ std::unique_ptr<Pipeline> Device::CreateComputePipeline(const ComputePipelineDes
 		return nullptr;
 	}
 
-	// ---- 反射描述符布局（单 stage，无需跨 stage 合并）----
-	std::vector<DescriptorBinding> bindings;
-	if (!ReflectDescriptorBindings(code, ShaderStageName(desc.shader.stage), bindings))
+	// ---- 反射 + 合并（单 stage 也走同一路径：共用槽位校验与 stageFlags 归一化只有一份实现）----
+	std::vector<MergedDescriptor> slots;
+	VkShaderStageFlags allStages = 0;
+	if (!ReflectAndMergeBindings({ { ShaderStage::Compute, &code } }, slots, allStages))
 		return nullptr;
-	std::vector<VkShaderStageFlags> stages(bindings.size(), VK_SHADER_STAGE_COMPUTE_BIT);
 
 	std::vector<std::unique_ptr<DescriptorSetLayout>> layouts;
 	VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
-	if (!BuildSetLayouts(bindings, stages, desc.pushConstantSize, VK_SHADER_STAGE_COMPUTE_BIT,
-		layouts, pipelineLayout))
+	if (!BuildSetLayouts(slots, desc.pushConstantSize, allStages, layouts, pipelineLayout))
 		return nullptr;
 
 	// ---- shader 模块与计算管线 ----
@@ -2149,12 +2314,12 @@ void CommandList::SetViewport(const Viewport& viewport)
 	vkCmdSetScissor(m_commandBuffer, 0, 1, &scissor);
 }
 
-void CommandList::BindVertexBuffer(const Buffer& buffer, uint64_t offset)
+void CommandList::BindVertexBuffer(const Buffer& buffer, uint64_t offset, uint32_t firstBinding)
 {
 	if (m_commandBuffer == VK_NULL_HANDLE) return;
 	VkBuffer raw = buffer.NativeHandle();
 	VkDeviceSize off = offset;
-	vkCmdBindVertexBuffers(m_commandBuffer, 0, 1, &raw, &off);
+	vkCmdBindVertexBuffers(m_commandBuffer, firstBinding, 1, &raw, &off);
 }
 
 void CommandList::BindIndexBuffer(const Buffer& buffer, uint64_t offset, IndexType type)
@@ -2163,16 +2328,29 @@ void CommandList::BindIndexBuffer(const Buffer& buffer, uint64_t offset, IndexTy
 	vkCmdBindIndexBuffer(m_commandBuffer, buffer.NativeHandle(), offset, ToVkIndexType(type));
 }
 
-void CommandList::Draw(uint32_t vertexCount, uint32_t firstVertex)
+void CommandList::Draw(uint32_t vertexCount, uint32_t firstVertex, uint32_t instanceCount)
 {
 	if (m_commandBuffer == VK_NULL_HANDLE) return;
-	vkCmdDraw(m_commandBuffer, vertexCount, 1, firstVertex, 0);
+	vkCmdDraw(m_commandBuffer, vertexCount, instanceCount, firstVertex, 0);
 }
 
-void CommandList::DrawIndexed(uint32_t indexCount, uint32_t firstIndex, int32_t vertexOffset)
+void CommandList::DrawIndexed(uint32_t indexCount, uint32_t firstIndex, int32_t vertexOffset,
+	uint32_t instanceCount)
 {
 	if (m_commandBuffer == VK_NULL_HANDLE) return;
-	vkCmdDrawIndexed(m_commandBuffer, indexCount, 1, firstIndex, vertexOffset, 0);
+	vkCmdDrawIndexed(m_commandBuffer, indexCount, instanceCount, firstIndex, vertexOffset, 0);
+}
+
+void CommandList::DrawIndirect(const Buffer& args, uint64_t offset, uint32_t drawCount)
+{
+	if (m_commandBuffer == VK_NULL_HANDLE) return;
+	vkCmdDrawIndirect(m_commandBuffer, args.NativeHandle(), offset, drawCount, 0);
+}
+
+void CommandList::DrawIndexedIndirect(const Buffer& args, uint64_t offset, uint32_t drawCount)
+{
+	if (m_commandBuffer == VK_NULL_HANDLE) return;
+	vkCmdDrawIndexedIndirect(m_commandBuffer, args.NativeHandle(), offset, drawCount, 0);
 }
 
 void CommandList::Dispatch(uint32_t groupCountX, uint32_t groupCountY, uint32_t groupCountZ)
@@ -2192,12 +2370,13 @@ void CommandList::CopyBufferToImage(const Buffer& src, Image& dst, ImageLayout d
 	if (m_commandBuffer == VK_NULL_HANDLE) return;
 	const ImageCreateInfo& desc = dst.Desc();
 
-	// 单 region 覆盖全层（接口未暴露逐 region 拷贝；仅 mip0，逐 mip 待接口扩展）
+	// 单 region 覆盖全层（接口未暴露逐 region 拷贝；仅 mip0，逐 mip 待接口扩展）。
+	// 层数取图像实际数组层数：VK_REMAINING_ARRAY_LAYERS 需 maintenance5 特性，未启用时非法
 	VkBufferImageCopy region{};
 	region.imageSubresource.aspectMask = ToVkAspect(dst.NativeFormat());
 	region.imageSubresource.mipLevel = 0;
 	region.imageSubresource.baseArrayLayer = 0;
-	region.imageSubresource.layerCount = VK_REMAINING_ARRAY_LAYERS;
+	region.imageSubresource.layerCount = desc.arrayLayers == 0 ? 1 : desc.arrayLayers;
 	region.imageExtent = { desc.width, desc.height, desc.depth };
 	vkCmdCopyBufferToImage(m_commandBuffer, src.NativeHandle(), dst.NativeHandle(),
 		ToVkImageLayout(dstLayout), 1, &region);
