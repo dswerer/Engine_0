@@ -11,6 +11,9 @@
 // 渲染图的数据描述层：资源/Pass 的 Desc、绑定结构与相关枚举。
 namespace dEngine {
 
+	// Host 段的执行上下文（定义在 RenderGraphAbstracted.h）：回调在此类型上做 GPU 侧同步
+	class HostContext;
+
 	// 导出 RHI 公共词表
 	using rhi::ImageFormat;
 	using rhi::ImageViewType;
@@ -41,6 +44,9 @@ namespace dEngine {
 		uint32_t      samples = 1;
 		ImageFormat   format = ImageFormat::None;
 		ImageViewType viewType = ImageViewType::Dim2D;
+		// 跨帧存活：图把帧首同步闭环成「上帧末次使用 -> 本帧首次使用」，
+		// 不再每帧从 initialLayout 重新起步（否则会丢弃上帧内容）；仅帧内资源保持 false
+		bool          crossFrame = false;
 	};
 
 #pragma endregion
@@ -54,6 +60,8 @@ namespace dEngine {
 		uint64_t    size = 0;
 		BufferUsage usage = BufferUsage::None; // 显式创建位（Vertex/Index/Uniform/Storage/Transfer*）
 		bool        hostVisible = false;      // 决定 VMA 内存类型
+		// 跨帧存活：帧首按「上帧末次访问 -> 本帧首次访问」补内存依赖（无布局语义）
+		bool        crossFrame = false;
 	};
 
 #pragma endregion
@@ -70,8 +78,10 @@ namespace dEngine {
 		SampledRead, StorageRead, StorageWrite,
 		UniformRead,
 		VertexInputRead, IndexRead,
-		TransferRead, TransferWrite,  // 拷贝通道：buffer 作源读 / image 作目的写
+		IndirectRead,                 // 间接参数缓冲读取（dispatch indirect；映射 DRAW_INDIRECT 阶段）
+		TransferRead, TransferWrite,  // 拷贝通道：源读 / 目的写（Buffer 或 Image）
 		HostWrite,                    // Host 节点的 CPU 写（映射 HOST 阶段，仅 Buffer）
+		HostRead,                     // Host 节点的 CPU 读（映射 HOST 阶段 + HOST_READ，仅 Buffer）
 		PresentSrc                    // 呈现收尾（布局转 PresentSrc）
 	};
 
@@ -188,29 +198,61 @@ namespace dEngine {
 		uint32_t                   groupCountX = 1;
 		uint32_t                   groupCountY = 1;
 		uint32_t                   groupCountZ = 1;
+		// 间接派发：indirectBuffer 非空时工作组数从该 Buffer 读取（忽略上面三个数值）。
+		// 参数 Buffer 须登记在本 pass 的读集（拓扑边 usage=IndirectRead），barrier 才会把它排到正确位置
+		std::string                indirectBuffer;
+		std::optional<uint32_t>    indirectBufferId; // ProcessRegister 回填
+		uint64_t                   indirectOffset = 0;
 	};
 
 	// Host Pass：纯 CPU 回调（解码/上传等宿主机工作），不录任何命令。
 	// 它经 RegisterPass 的 write 集声明「往哪个 Buffer 写」，拓扑边记为 HostWrite；
-	// 回调是执行参数，可在 Realize 后经 HostPass::SetCallback 覆盖 desc 中的声明
+	// 回调是执行参数，可在 Realize 后经 HostPass::SetCallback 覆盖 desc 中的声明。
+	// 回调参数是同步上下文：业务代码前 WaitForGpu()、业务代码后 SignalGpu()
 	struct HostPassDesc {
-		std::function<void()> callback;
+		std::function<void(HostContext&)> callback;
 	};
 
-	// 传输 Pass：单次 CopyBufferToImage（buffer 整段 -> image 全层 mip0）。
-	// 两端即拓扑边：srcBuffer 进读边（TransferRead），dstImage 进写边（TransferWrite）
+	// 传输 Pass：单次拷贝。方向决定两端资源类型：
+	//   BufferToImage：Buffer -> Image（上传；源读 TransferRead、目的写 TransferWrite）
+	//   ImageToBuffer：Image -> Buffer（回读；目的 Buffer 须 hostVisible + TransferDst）
+	//   BufferToBuffer：Buffer -> Buffer（中转/压实）
+	//   ImageToImage：Image -> Image（同格式；blit=false 为等尺寸拷贝，true 为可缩放 blit）
+	// 两端即拓扑边：source 进读边、dest 进写边；图像侧布局由 compiler 按 TransferRead/Write 推导
+	enum class TransferKind {
+		BufferToImage,
+		ImageToBuffer,
+		BufferToBuffer,
+		ImageToImage
+	};
+
 	struct TransferPassDesc {
-		std::string             srcBuffer;
-		std::optional<uint32_t> srcBufferId; // ProcessRegister 回填
-		std::string             dstImage;
-		std::optional<uint32_t> dstImageId;  // ProcessRegister 回填
+		TransferKind            kind = TransferKind::BufferToImage;
+		std::string             sourceName;
+		std::optional<uint32_t> sourceId; // ProcessRegister 回填
+		std::string             destName;
+		std::optional<uint32_t> destId;   // ProcessRegister 回填
+		// Buffer 侧窗口：0 表示整段。BufferToImage 用 srcOffset；ImageToBuffer 用 dstOffset；
+		// BufferToBuffer 两者都用；byteSize 仅 BufferToBuffer 使用（0 = 取两者较小值）
+		uint64_t                srcOffset = 0;
+		uint64_t                dstOffset = 0;
+		uint64_t                byteSize = 0;
+		// ImageToImage 专用：false = vkCmdCopyImage（尺寸须一致），true = vkCmdBlitImage（可缩放）
+		bool                    blit = false;
+		bool                    linearFilter = true; // blit 过滤：true=线性（需格式支持），false=最近邻
+	};
+
+	// Present Pass：呈现收尾。读边声明 presentable image（映射为 Usage::PresentSrc），
+	// barrier compiler 据此产出 ColorAttachment -> PresentSrc 的布局转换；不录任何绘制命令。
+	// 交换链的 acquire 等待与渲染完成信号由 SubmitGraph 的 FrameSync 挂到本节点所在的批
+	struct PresentPassDesc {
 	};
 
 #pragma endregion
 
 #pragma region DescAlias // 注册接口别名（Desc 变体）
 	using PassDesc = std::variant<std::monostate, RenderPassDesc, ComputePassDesc,
-		HostPassDesc, TransferPassDesc>;
+		HostPassDesc, TransferPassDesc, PresentPassDesc>;
 	using ResourceDesc = std::variant<std::monostate, ImageDesc, BufferDesc>;
 #pragma endregion
 }

@@ -63,7 +63,8 @@ namespace dEngine::rhi {
 		BottomOfPipe       = 1ull << 8,
 		AllCommands        = 1ull << 9,
 		Host               = 1ull << 10, // 宿主机写/读（Host 节点的 CPU 回调）
-		VertexInput        = 1ull << 11  // 固定功能输入：顶点属性/索引读取
+		VertexInput        = 1ull << 11, // 固定功能输入：顶点属性/索引读取
+		DrawIndirect       = 1ull << 12  // 间接参数读取（draw indirect / dispatch indirect）
 	};
 	inline constexpr PipelineStage operator|(PipelineStage a, PipelineStage b) {
 		return static_cast<PipelineStage>(static_cast<uint64_t>(a) | static_cast<uint64_t>(b));
@@ -83,7 +84,9 @@ namespace dEngine::rhi {
 		MemoryWrite           = 1ull << 9,
 		VertexAttributeRead   = 1ull << 10,
 		IndexRead             = 1ull << 11,
-		HostWrite             = 1ull << 12
+		HostWrite             = 1ull << 12,
+		HostRead              = 1ull << 13,
+		IndirectCommandRead   = 1ull << 14
 	};
 	inline constexpr Access operator|(Access a, Access b) {
 		return static_cast<Access>(static_cast<uint64_t>(a) | static_cast<uint64_t>(b));

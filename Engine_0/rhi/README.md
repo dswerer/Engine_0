@@ -129,22 +129,27 @@ device->Submit(info);                              // 自动 vkEndCommandBuffer�
 
 | 原语 | 方向 | 生产者 | 消费者 |
 |---|---|---|---|
-| FrameSlot 内部 fence | GPU → CPU | `vkQueueSubmit2` 完成 | `DrainPending`（wait + reset），槽复用前提 |
+| FrameSlot 内部 fence（每提交一个，池化） | GPU → CPU | `vkQueueSubmit2` 完成 | `DrainPending`（一次等全部 + reset 归还池），槽复用前提 |
 | 外部 Fence | GPU → CPU | Submit（`signalFence`） | RHI 回收时 wait；**Reset 交使用者** |
 | acquire 信号量（每帧槽一个） | 呈现引擎 → GPU | `vkAcquireNextImageKHR` | Submit 的 `waits`（经 `Frame::ready`） |
 | renderDone 信号量（**每 image 一个**） | GPU → 呈现引擎 | Submit 的 `signals`（经 `Frame::presentReady`） | `vkQueuePresentKHR` |
+| Timeline 语义量（`CreateTimelineSemaphore`） | CPU → GPU | 主机 `vkSignalSemaphore`（CPU 写入完成） | Submit 的 `waits`（按 `value`，不阻塞提交线程） |
+| 同一 Timeline | GPU → CPU | Submit 的 `signals`（按 `value`） | 主机 `Semaphore::Wait(value)` / 后续提交的 `waits` |
+| 每队列 GPU timeline（`QueueTimeline(cls)`） | GPU → CPU | `Submit` 自动追加一个 signal 并**返回**该值 | 主机 `QueueTimeline(cls)->Wait(返回的值)`，不必等整帧 |
 | Pipeline Barrier | 提交内部 | `CommandList::Barrier` | GPU 执行流的执行/内存依赖 |
+
+binary 语义量的 `value` 必须为 0（`SemaphoreWait/Signal` 默认值即 0）；timeline 的值单调递增、**帧间不重置**（重置需要等 GPU，反而引入额外同步）。
 
 renderDone 按 image 索引的原因：同一 image 被重新 acquire 前，其上次 present 必已完成，此刻复用才安全（规避单一信号量在 present 消费前被下一帧再次 signal 的 VUID 03868）。
 
 ### 7.2 FrameSlot 回收状态机
 
-每槽持有：每队列族一个 command pool + 内部 unsignaled fence + 在飞记录（`pendingFence`）+ 在录 buffer 集合。
+每槽持有：每队列族一个 command pool + 内部 fence 池 + 在飞提交记录（每次 Submit 一条）+ 在录 buffer 集合。
 
 - **pending 为空绝不 wait**——"Begin 后不 Submit"、"漏调 WaitForFrame"均只退化为串行执行，不会死锁；
 - 外部 fence 也记入 pending（否则回收时 free 在飞 buffer 违反 VUID 00041）；wait 后仅对内部 fence reset；
-- 帧内多次 Submit（含跨队列）经内部 fence 串行化（保守但正确）；
-- 回收 = `DrainPending` + 按池 free 在录 buffer（零累积）。
+- 帧内可多次 `BeginCommandList` / `Submit`（含跨队列）：每次内部提交取一个独立 fence，提交时**不等待**任何在飞提交，多队列批因此可真正并行；
+- 回收 = `DrainPending`（一次等全部在飞 fence，内部 fence reset 后归还池）+ 按池 free 在录 buffer（零累积）。
 
 ### 7.3 一帧的完整时序
 

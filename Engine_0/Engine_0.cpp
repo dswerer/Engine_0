@@ -211,7 +211,8 @@ int main()
 			const uint32_t tf = device->QueueFamily(rhi::QueueClass::Transfer);
 			cout << "Queues: graphics=f" << gf << " compute=f" << cf
 			     << (cf != gf ? "(dedicated)" : "(fallback)")
-			     << " transfer=f" << tf << (tf != gf ? "(dedicated)" : "(fallback)") << "\n";
+			     << " transfer=f" << tf << (tf != gf ? "(dedicated)" : "(fallback)")
+			     << " timeline=" << (device->TimelineSemaphoresSupported() ? "yes" : "no") << "\n";
 
 			if (auto sem = device->CreateSemaphore()) {
 				rhi::CommandList computeList = device->BeginCommandList(rhi::QueueClass::AsyncCompute);
@@ -230,6 +231,39 @@ int main()
 				device->Submit(gfxSubmit);
 				device->WaitForFrame();
 				cout << "Multi-queue ok: compute(f" << cf << ") -> graphics(f" << gf << ") via semaphore\n";
+			}
+
+			// timeline 语义量冒烟：GPU 先等主机推进的值（主机 signal 发生在两次提交之后，证明提交不被阻塞），
+			// 再由该队列把值继续推进给计算队列
+			if (auto timeline = device->CreateTimelineSemaphore()) {
+				rhi::CommandList gfxWaitsHost = device->BeginCommandList();
+				rhi::SemaphoreWait hostWait{ timeline.get(), rhi::PipelineStage::AllCommands, 1 };
+				rhi::SemaphoreSignal gpuSignal{ timeline.get(), rhi::PipelineStage::AllCommands, 2 };
+				rhi::SubmitInfo gfxSubmit;
+				gfxSubmit.commandLists = { &gfxWaitsHost, 1 };
+				gfxSubmit.waits = { &hostWait, 1 };
+				gfxSubmit.signals = { &gpuSignal, 1 };
+				device->Submit(gfxSubmit); // 值仍是 0：GPU 侧挂起，CPU 立即返回
+
+				rhi::CommandList computeWaitsGpu = device->BeginCommandList(rhi::QueueClass::AsyncCompute);
+				rhi::SemaphoreWait gpuWait{ timeline.get(), rhi::PipelineStage::AllCommands, 2 };
+				rhi::SubmitInfo computeSubmit;
+				computeSubmit.queue = rhi::QueueClass::AsyncCompute;
+				computeSubmit.commandLists = { &computeWaitsGpu, 1 };
+				computeSubmit.waits = { &gpuWait, 1 };
+				const std::uint64_t computeValue = device->Submit(computeSubmit); // 该队列 timeline 上的自动分配值
+
+				const bool signaled = timeline->Signal(1); // 主机写完成 → 图形批开跑 → 推进到 2 → 计算批开跑
+
+				// GPU→Host：不等整帧，只等计算批在它自己队列 timeline 上推进到的值
+				rhi::Semaphore* computeTimeline = device->QueueTimeline(rhi::QueueClass::AsyncCompute);
+				const bool gpuWaited = computeTimeline != nullptr && computeTimeline->Wait(computeValue);
+				device->WaitForFrame();
+				cout << "Timeline ok: host signal 1 -> graphics -> compute"
+				     << ", gpu wait(" << computeValue << ")=" << (gpuWaited ? "ok" : "fail")
+				     << ", final value=" << timeline->Value()
+				     << ", host wait(2)=" << (timeline->Wait(2) ? "ok" : "timeout")
+				     << (signaled ? "" : " (host signal failed)") << "\n";
 			}
 		}
 
@@ -537,7 +571,9 @@ int main()
 				rhi::ImageCreateInfo outInfo;
 				outInfo.width = 64; outInfo.height = 64;
 				outInfo.format = rhi::ImageFormat::RGBA8;
-				outInfo.usage = rhi::ImageUsage::ColorAttachment | rhi::ImageUsage::Sampled;
+				// TransferSrc：留出 GPU->Host 回读通道（CopyImageToBuffer 要求源带该创建位）
+				outInfo.usage = rhi::ImageUsage::ColorAttachment | rhi::ImageUsage::Sampled
+					| rhi::ImageUsage::TransferSrc;
 				auto outA = device->CreateImage(outInfo);
 				auto outB = device->CreateImage(outInfo);
 
@@ -616,6 +652,65 @@ int main()
 					device->Submit(drawSubmit);
 					device->WaitForFrame();
 					cout << "Graph render ok: direct-indexed + indirect-indexed draws\n";
+
+					// GPU->Host 回读冒烟：OutA 渲染产物（ColorAttachment）-> Transfer 拷到 host-visible buffer
+					// -> Host 节点校验像素。验证链首布局转换、TransferSrc/Src 布局链、生产批批尾 HOST_READ barrier
+					{
+						RenderGraph readbackGraph(device.get());
+
+						TransferPassDesc backDesc;
+						backDesc.kind = TransferKind::ImageToBuffer;
+						backDesc.sourceName = "Frame";
+						backDesc.destName = "Pixels";
+						readbackGraph.RegisterPass("Back", { "Frame" }, { "Pixels" }, Pass::Transfer,
+							backDesc, rhi::QueueClass::Transfer);
+						readbackGraph.RegisterPass("Consume", { "Pixels" }, {}, Pass::Host, HostPassDesc{});
+
+						// OutA 刚被 drawGraph 写过，停在 ColorAttachment（图外传入的既有布局）
+						readbackGraph.RegisterResource("Frame", { "Back" }, "", outA.get(), {},
+							rhi::ImageLayout::ColorAttachment);
+
+						BufferDesc pixelsDesc;
+						pixelsDesc.size = 64 * 64 * 4;
+						pixelsDesc.usage = BufferUsage::TransferDst; // 回读目的
+						pixelsDesc.hostVisible = true;
+						readbackGraph.RegisterResource("Pixels", { "Consume" }, "Back", Resource::Buffer, pixelsDesc);
+
+						readbackGraph.ProcessRegister();
+						readbackGraph.GenerateSubmitSequence();
+						readbackGraph.RealizeAll();
+
+						HostPass* consume = nullptr;
+						for (uint32_t i = 0; readbackGraph.GetPass(i) != nullptr; ++i) {
+							Pass* p = readbackGraph.GetPass(i);
+							if (p->get_type() == Pass::Host) consume = static_cast<HostPass*>(p);
+						}
+
+						unsigned char first[4] = {};
+						if (consume != nullptr) {
+							consume->SetCallback([&first](HostContext& ctx) {
+								ctx.WaitForGpu(); // 等 Transfer 批完成 + 自动 Invalidate
+								const rhi::Buffer* source = ctx.ReadBuffer("Pixels");
+								if (source != nullptr && source->Map() != nullptr)
+									std::memcpy(first, source->Map(), sizeof(first));
+								ctx.SignalGpu();
+							});
+							readbackGraph.SubmitGraph();
+							readbackGraph.WaitHostPasses();
+							device->WaitForFrame();
+
+							// 目标图 clear 色 0.05/0.05/0.08/1.0 经 UNORM8 量化；(0,0) 在 quad 之外，应是纯 clear 色
+							auto closeTo = [](unsigned char v, int expect) {
+								const int d = int(v) - expect;
+								return d >= -2 && d <= 2;
+							};
+							const bool ok = closeTo(first[0], 13) && closeTo(first[1], 13) && closeTo(first[2], 20)
+								&& first[3] == 255;
+							cout << "GPU->Host readback " << (ok ? "ok" : "FAILED") << ": rgba8="
+							     << int(first[0]) << "," << int(first[1]) << ","
+							     << int(first[2]) << "," << int(first[3]) << "\n";
+						}
+					}
 				}
 			}
 
@@ -637,9 +732,10 @@ int main()
 					texGraph.RegisterPass("UploadHost", {}, { "Staging" }, Pass::Host, HostPassDesc{});
 
 					TransferPassDesc uploadDesc;
-					uploadDesc.srcBuffer = "Staging";
-					uploadDesc.dstImage = "Texture";
-					texGraph.RegisterPass("Upload", { "Staging" }, { "Texture" }, Pass::Transfer, uploadDesc);
+					uploadDesc.kind = TransferKind::BufferToImage;
+					uploadDesc.sourceName = "Staging";
+					uploadDesc.destName = "Texture";
+					texGraph.RegisterPass("Upload", { "Staging" }, { "Texture" }, Pass::Transfer, uploadDesc, rhi::QueueClass::Transfer);
 
 					RenderPassDesc sampleDesc;
 					{
@@ -662,11 +758,14 @@ int main()
 					}
 					texGraph.RegisterPass("Sample", { "Texture" }, { "Out" }, Pass::Render, sampleDesc);
 
+					// 尾部 Host 段：GPU→Host 验证（等 Staging 的最后一次使用——Upload 拷贝完成后再回调）
+					texGraph.RegisterPass("VerifyHost", { "Staging" }, {}, Pass::Host, HostPassDesc{});
+
 					BufferDesc stagingDesc;
 					stagingDesc.size = stagingBytes;
 					stagingDesc.usage = BufferUsage::TransferSrc; // CopyBufferToImage 的源
 					stagingDesc.hostVisible = true;
-					texGraph.RegisterResource("Staging", { "Upload" }, "UploadHost", Resource::Buffer, stagingDesc);
+					texGraph.RegisterResource("Staging", { "Upload", "VerifyHost" }, "UploadHost", Resource::Buffer, stagingDesc);
 
 					ImageDesc texNodeDesc;
 					texNodeDesc.width = static_cast<uint32_t>(texW);
@@ -686,6 +785,7 @@ int main()
 					// Realize 后取 staging 句柄与 Host 节点：装配 CPU 侧上传回调（执行参数）
 					rhi::Buffer* staging = nullptr; // Map 非 const：宿主机写得用可写句柄
 					HostPass* uploadHost = nullptr;
+					HostPass* verifyHost = nullptr;
 					for (uint32_t i = 0; texGraph.GetResource(i) != nullptr; ++i) {
 						Resource* res = texGraph.GetResource(i);
 						if (res->get_type() == Resource::Buffer && res->get_name() == "Staging")
@@ -693,23 +793,45 @@ int main()
 					}
 					for (uint32_t i = 0; texGraph.GetPass(i) != nullptr; ++i) {
 						Pass* p = texGraph.GetPass(i);
-						if (p->get_type() == Pass::Host)
-							uploadHost = static_cast<HostPass*>(p);
+						if (p->get_type() != Pass::Host)
+							continue;
+						if (p->get_name() == "UploadHost") uploadHost = static_cast<HostPass*>(p);
+						else if (p->get_name() == "VerifyHost") verifyHost = static_cast<HostPass*>(p);
 					}
 
-					if (staging != nullptr && uploadHost != nullptr) {
-						uploadHost->SetCallback([staging, pixels, stagingBytes]() {
-							std::memcpy(staging->Map(), pixels, static_cast<size_t>(stagingBytes));
+					if (staging != nullptr && uploadHost != nullptr && verifyHost != nullptr) {
+						// 回调在独立线程执行：业务代码夹在 WaitForGpu() / SignalGpu() 之间
+						uploadHost->SetCallback([pixels, stagingBytes](HostContext& ctx) {
+							ctx.WaitForGpu();   // 上游 GPU 段完成前不得覆写 staging（本例无上游）
+							// 句柄按图资源名取：Staging 在本段写集里，拿到的是可写句柄
+							rhi::Buffer* target = ctx.WriteBuffer("Staging");
+							if (target != nullptr)
+								std::memcpy(target->Map(), pixels, static_cast<size_t>(stagingBytes));
+							ctx.SignalGpu();    // 先 Flush 再推进主机 timeline：Transfer 批在 GPU 侧等这个值
+						});
+						verifyHost->SetCallback([](HostContext& ctx) {
+							// GPU→Host：等 Transfer 批在它自己的队列 timeline 上完成，随后自动 Invalidate
+							ctx.WaitForGpu();
+							// 读集给只读句柄：未声明返回 nullptr，const 挡住误写
+							const rhi::Buffer* source = ctx.ReadBuffer("Staging");
+							if (source != nullptr && source->Map() != nullptr) {
+								const unsigned char* bytes = static_cast<const unsigned char*>(source->Map());
+								(void)bytes[0]; // 读一次首字节，确认只读句柄路径可用
+							}
+							ctx.SignalGpu();
 						});
 
-						rhi::CommandList texCmd = device->BeginCommandList();
-						texGraph.RecordGraph(texCmd); // Host 回调 + HOST/TRANSFER barrier + 拷贝 + 采样绘制
-						rhi::SubmitInfo texSubmit;
-						texSubmit.commandLists = { &texCmd, 1 };
-						device->Submit(texSubmit);
+						// 按提交计划整图提交：Host 段在 worker 线程跑，消费批在 GPU 侧 wait 主机值；
+						// 跨队列依赖用 syncPoint 串 semaphore（批尾 release / 消费批 acquire）
+						texGraph.SubmitGraph();
+						texGraph.WaitHostPasses(); // 回调线程收口后再回收本帧
 						device->WaitForFrame();
+
+						const RenderGraph::SubmitPlan& plan = texGraph.GetSubmitPlan();
 						cout << "Texture upload ok: " << texturePath << " " << texW << "x" << texH
-						     << " ch=" << texChannels << " -> Host -> Transfer -> Sample\n";
+						     << " ch=" << texChannels << " -> Host -> Transfer -> Sample (host verify)"
+						     << " (" << plan.batches.size() << " batches, "
+						     << plan.syncPoints.size() << " sync points)\n";
 					}
 					else {
 						cerr << "纹理冒烟失败: staging 或 Host 节点未就绪\n";
@@ -718,81 +840,351 @@ int main()
 				}
 			}
 
-			rhi::GraphicsPipelineDesc pso;
-			pso.shaders = {
-				{ rhi::ShaderStage::Vertex,   shaderDir + "/fullscreen.vert.spv" },
-				{ rhi::ShaderStage::Fragment, shaderDir + "/textured.frag.spv" },
-			};
-			pso.colorFormats[0] = swapchain2->Format(); // 与 backbuffer 视图格式一致
-			pso.colorAttachmentCount = 1;
-			pso.depthFormat = rhi::ImageFormat::None;
-			pso.cullMode = rhi::CullMode::None;
-			// 描述符布局由 RHI 反射得出（无需手填 bindings）
+			// Host 图像 + ImageToImage + DispatchIndirect 冒烟：
+			//   FillHost(CPU)：写 Color 图与 Args 参数缓冲 -> Blur(间接派发) -> Blit(64->32) -> Copy(等尺寸)
+			//   -> VerifyHost(CPU)：读回 Small 图。Host 与 GPU 之间的图像搬运由图中转 staging 自动完成
+			{
+				RenderGraph featureGraph(device.get());
 
-			auto pipeline2 = device->CreatePipeline(pso);
-			auto set2 = (pipeline2 && pipeline2->SetLayout(0))
-				? device->AllocateDescriptorSet(*pipeline2->SetLayout(0)) : nullptr;
-			if (graphOut && pipeline2 && set2) {
-				set2->Write(0, *graphOut, rhi::ImageSubresource{ 0, 0 }); // 采样图侧计算产物
+				constexpr uint32_t kSrcSize = 64;
+				constexpr uint32_t kSmallSize = 32;
+
+				featureGraph.RegisterPass("FillHost", {}, { "Color", "Args" }, Pass::Host, HostPassDesc{});
+
+				ComputePassDesc blurDesc;
+				{
+					ShaderBinding colorBinding;
+					colorBinding.resourceName = "Color"; // blur.comp 的 sampler2D Color
+					ShaderBinding blurredBinding;
+					blurredBinding.resourceName = "Blurred"; // blur.comp 的 image2D Blurred
+					blurredBinding.usage = Usage::StorageWrite;
+					blurDesc.shaderBindings = { colorBinding, blurredBinding };
+					blurDesc.shader = { rhi::ShaderStage::Compute, shaderDir + "/blur.comp.spv" };
+					// 工作组数由 Args 决定（DispatchIndirect）；Args 已登记在读集 -> IndirectRead 拓扑边
+					blurDesc.indirectBuffer = "Args";
+				}
+				featureGraph.RegisterPass("Blur", { "Color", "Args" }, { "Blurred" }, Pass::Compute, blurDesc);
+
+				TransferPassDesc blitDesc;
+				blitDesc.kind = TransferKind::ImageToImage;
+				blitDesc.sourceName = "Blurred";
+				blitDesc.destName = "Small";
+				blitDesc.blit = true;          // 64x64 -> 32x32 缩放
+				blitDesc.linearFilter = false; // 最近邻：常量色缩放后仍是同一值
+				featureGraph.RegisterPass("Blit", { "Blurred" }, { "Small" }, Pass::Transfer, blitDesc);
+
+				TransferPassDesc copyDesc;
+				copyDesc.kind = TransferKind::ImageToImage;
+				copyDesc.sourceName = "Small";
+				copyDesc.destName = "Copied";
+				copyDesc.blit = false;         // 等尺寸 vkCmdCopyImage
+				featureGraph.RegisterPass("Copy", { "Small" }, { "Copied" }, Pass::Transfer, copyDesc);
+
+				featureGraph.RegisterPass("VerifyHost", { "Copied" }, {}, Pass::Host, HostPassDesc{});
+
+				ImageDesc colorDesc;
+				colorDesc.width = kSrcSize; colorDesc.height = kSrcSize;
+				colorDesc.format = ImageFormat::RGBA16F;
+				featureGraph.RegisterResource("Color", { "Blur" }, "FillHost", Resource::Image, colorDesc);
+
+				ImageDesc blurredDesc;
+				blurredDesc.width = kSrcSize; blurredDesc.height = kSrcSize;
+				blurredDesc.format = ImageFormat::RGBA16F;
+				featureGraph.RegisterResource("Blurred", { "Blit" }, "Blur", Resource::Image, blurredDesc);
+
+				ImageDesc smallDesc;
+				smallDesc.width = kSmallSize; smallDesc.height = kSmallSize;
+				smallDesc.format = ImageFormat::RGBA16F;
+				featureGraph.RegisterResource("Small", { "Copy" }, "Blit", Resource::Image, smallDesc);
+
+				ImageDesc copiedDesc;
+				copiedDesc.width = kSmallSize; copiedDesc.height = kSmallSize;
+				copiedDesc.format = ImageFormat::RGBA16F;
+				featureGraph.RegisterResource("Copied", { "VerifyHost" }, "Copy", Resource::Image, copiedDesc);
+
+				BufferDesc argsDesc;
+				argsDesc.size = 3 * sizeof(uint32_t); // VkDispatchIndirectCommand {x,y,z}
+				argsDesc.usage = BufferUsage::Indirect;
+				argsDesc.hostVisible = true;
+				featureGraph.RegisterResource("Args", { "Blur" }, "FillHost", Resource::Buffer, argsDesc);
+
+				featureGraph.ProcessRegister();
+				featureGraph.GenerateSubmitSequence();
+				featureGraph.RealizeAll();
+
+				HostPass* fillHost = nullptr;
+				HostPass* verifyHost = nullptr;
+				for (uint32_t i = 0; featureGraph.GetPass(i) != nullptr; ++i) {
+					Pass* p = featureGraph.GetPass(i);
+					if (p->get_type() != Pass::Host) continue;
+					if (p->get_name() == "FillHost") fillHost = static_cast<HostPass*>(p);
+					else if (p->get_name() == "VerifyHost") verifyHost = static_cast<HostPass*>(p);
+				}
+
+				bool featureOk = false;
+				if (fillHost != nullptr && verifyHost != nullptr) {
+					fillHost->SetCallback([](HostContext& ctx) {
+						ctx.WaitForGpu();
+						// 图像写入：图中转 staging，CPU 只拿到映射指针（RGBA16F 紧打包）
+						if (void* color = ctx.WriteImage("Color")) {
+							const uint64_t count = uint64_t(kSrcSize) * kSrcSize;
+							struct Half4 { uint16_t r, g, b, a; };
+							Half4* px = static_cast<Half4*>(color);
+							for (uint64_t i = 0; i < count; ++i)
+								px[i] = Half4{ 0x3400u, 0x3800u, 0x3C00u, 0x3C00u }; // 0.25/0.5/0.75/1.0
+						}
+						// 间接派发参数：8x8 工作组覆盖 64x64
+						if (rhi::Buffer* args = ctx.WriteBuffer("Args")) {
+							uint32_t* cmd = static_cast<uint32_t*>(args->Map());
+							cmd[0] = kSrcSize / 8;
+							cmd[1] = kSrcSize / 8;
+							cmd[2] = 1;
+						}
+						ctx.SignalGpu();
+					});
+					verifyHost->SetCallback([&featureOk](HostContext& ctx) {
+						ctx.WaitForGpu();
+						const unsigned short* px = static_cast<const unsigned short*>(ctx.ReadImage("Copied"));
+						if (px != nullptr) {
+							// 直接按半精度位模式核对：0x3400/0x3800/0x3C00 经 blit+copy 不应改变
+							featureOk = px[0] == 0x3400u && px[1] == 0x3800u && px[2] == 0x3C00u && px[3] == 0x3C00u;
+						}
+						ctx.SignalGpu();
+					});
+
+					featureGraph.SubmitGraph();
+					featureGraph.WaitHostPasses();
+					device->WaitForFrame();
+
+					const RenderGraph::SubmitPlan& plan = featureGraph.GetSubmitPlan();
+					cout << "Host image / ImageToImage / DispatchIndirect " << (featureOk ? "ok" : "FAILED")
+					     << ": WriteImage -> Blur(indirect " << kSrcSize / 8 << "x" << kSrcSize / 8
+					     << ") -> Blit(" << kSrcSize << "->" << kSmallSize << ") -> Copy -> ReadImage"
+					     << " (" << plan.batches.size() << " batches)\n";
+				}
+				else {
+					cerr << "特性冒烟失败: Host 节点未就绪\n";
+				}
+			}
+
+			// 手动分桶内存别名冒烟：
+			//   1) 同构且批级寿命不重叠 -> 组通过，成员共享同一 rhi 句柄（仅代表真实创建）
+			//   2) 描述不兼容 -> 整组降级为非别名，打印原因后继续运行（不退出进程）
+			{
+				RenderGraph aliasGraph(device.get());
+
+				BufferDesc aliasSrcDesc;
+				aliasSrcDesc.size = 16;
+				aliasSrcDesc.usage = rhi::BufferUsage::TransferSrc;
+				aliasSrcDesc.hostVisible = true;
+
+				ImageDesc aliasImageDesc;
+				aliasImageDesc.width = 64; aliasImageDesc.height = 64;
+				aliasImageDesc.format = ImageFormat::RGBA8;
+
+				// 两个拷贝 Pass 走不同队列：批划分把它们落在不同批，块内成员寿命不重叠
+				TransferPassDesc toA;
+				toA.kind = TransferKind::BufferToImage;
+				toA.sourceName = "SrcA";
+				toA.destName = "AliasA";
+				aliasGraph.RegisterPass("UseA", { "SrcA" }, { "AliasA" }, Pass::Transfer,
+					toA, rhi::QueueClass::Transfer);
+
+				TransferPassDesc toB = toA;
+				toB.sourceName = "SrcB";
+				toB.destName = "AliasB";
+				aliasGraph.RegisterPass("UseB", { "SrcB" }, { "AliasB" }, Pass::Transfer,
+					toB, rhi::QueueClass::AsyncCompute);
+
+				aliasGraph.RegisterResource("SrcA", { "UseA" }, "", Resource::Buffer, aliasSrcDesc);
+				aliasGraph.RegisterResource("AliasA", {}, "UseA", Resource::Image, aliasImageDesc);
+				aliasGraph.RegisterResource("SrcB", { "UseB" }, "", Resource::Buffer, aliasSrcDesc);
+				aliasGraph.RegisterResource("AliasB", {}, "UseB", Resource::Image, aliasImageDesc);
+
+				aliasGraph.ProcessRegister();
+				aliasGraph.GenerateSubmitSequence();
+				aliasGraph.AliasResources({ "AliasA", "AliasB" });
+				aliasGraph.RealizeAll();
+
+				const rhi::Image* aliasA = nullptr;
+				const rhi::Image* aliasB = nullptr;
+				for (uint32_t i = 0; aliasGraph.GetResource(i) != nullptr; ++i) {
+					Resource* res = aliasGraph.GetResource(i);
+					if (res->get_name() == "AliasA") aliasA = static_cast<Image*>(res)->get_rhi();
+					else if (res->get_name() == "AliasB") aliasB = static_cast<Image*>(res)->get_rhi();
+				}
+				cout << "Alias shared handle: "
+					<< (aliasA != nullptr && aliasA == aliasB ? "ok" : "FAILED")
+					<< " (" << aliasGraph.GetSubmitPlan().batches.size() << " batches)\n";
+			}
+			{
+				// 描述不兼容（尺寸不同）：整组降级，两个节点各自创建句柄
+				RenderGraph rejectGraph(device.get());
+
+				BufferDesc srcDesc;
+				srcDesc.size = 16;
+				srcDesc.usage = rhi::BufferUsage::TransferSrc;
+				srcDesc.hostVisible = true;
+
+				ImageDesc smallDesc;
+				smallDesc.width = 32; smallDesc.height = 32; smallDesc.format = ImageFormat::RGBA8;
+				ImageDesc largeDesc;
+				largeDesc.width = 64; largeDesc.height = 64; largeDesc.format = ImageFormat::RGBA8;
+
+				TransferPassDesc toSmall;
+				toSmall.kind = TransferKind::BufferToImage;
+				toSmall.sourceName = "SrcSmall";
+				toSmall.destName = "Small";
+				rejectGraph.RegisterPass("UseSmall", { "SrcSmall" }, { "Small" }, Pass::Transfer, toSmall);
+
+				TransferPassDesc toLarge = toSmall;
+				toLarge.sourceName = "SrcLarge";
+				toLarge.destName = "Large";
+				rejectGraph.RegisterPass("UseLarge", { "SrcLarge" }, { "Large" }, Pass::Transfer, toLarge);
+
+				rejectGraph.RegisterResource("SrcSmall", { "UseSmall" }, "", Resource::Buffer, srcDesc);
+				rejectGraph.RegisterResource("Small", {}, "UseSmall", Resource::Image, smallDesc);
+				rejectGraph.RegisterResource("SrcLarge", { "UseLarge" }, "", Resource::Buffer, srcDesc);
+				rejectGraph.RegisterResource("Large", {}, "UseLarge", Resource::Image, largeDesc);
+
+				rejectGraph.ProcessRegister();
+				rejectGraph.GenerateSubmitSequence();
+				rejectGraph.AliasResources({ "Small", "Large" });
+				rejectGraph.RealizeAll();
+
+				const rhi::Image* smallImg = nullptr;
+				const rhi::Image* largeImg = nullptr;
+				for (uint32_t i = 0; rejectGraph.GetResource(i) != nullptr; ++i) {
+					Resource* res = rejectGraph.GetResource(i);
+					if (res->get_name() == "Small") smallImg = static_cast<Image*>(res)->get_rhi();
+					else if (res->get_name() == "Large") largeImg = static_cast<Image*>(res)->get_rhi();
+				}
+				cout << "Alias degraded handles: "
+					<< (smallImg != nullptr && largeImg != nullptr && smallImg != largeImg
+						? "ok (independent)" : "FAILED") << "\n";
+			}
+
+			// 跨帧资源冒烟：Own 图像标记 crossFrame，连续提交两帧。
+			// 首帧从 Undefined 起步；第二帧改走「上帧末次使用 -> 本帧首用」闭环，不再重置布局/内容
+			{
+				RenderGraph persistGraph(device.get());
+
+				BufferDesc stagingDesc;
+				stagingDesc.size = 64 * 64 * 4; // 与 Persist 整图拷贝的大小一致
+				stagingDesc.usage = rhi::BufferUsage::TransferSrc;
+				stagingDesc.hostVisible = true;
+				stagingDesc.crossFrame = true; // 跨帧缓冲：帧首按上帧末次访问闭环
+
+				ImageDesc persistDesc;
+				persistDesc.width = 64; persistDesc.height = 64;
+				persistDesc.format = ImageFormat::RGBA8;
+				persistDesc.crossFrame = true;
+
+				persistGraph.RegisterPass("Fill", {}, { "Staging" }, Pass::Host, HostPassDesc{});
+				TransferPassDesc upload;
+				upload.kind = TransferKind::BufferToImage;
+				upload.sourceName = "Staging";
+				upload.destName = "Persist";
+				persistGraph.RegisterPass("Upload", { "Staging" }, { "Persist" }, Pass::Transfer,
+					upload, rhi::QueueClass::Transfer);
+
+				persistGraph.RegisterResource("Staging", { "Upload" }, "Fill", Resource::Buffer, stagingDesc);
+				persistGraph.RegisterResource("Persist", {}, "Upload", Resource::Image, persistDesc);
+
+				persistGraph.ProcessRegister();
+				persistGraph.GenerateSubmitSequence();
+				persistGraph.RealizeAll();
+
+				for (uint32_t i = 0; persistGraph.GetPass(i) != nullptr; ++i) {
+					Pass* p = persistGraph.GetPass(i);
+					if (p->get_type() == Pass::Host) {
+						static_cast<HostPass*>(p)->SetCallback([](HostContext& ctx) {
+							ctx.WaitForGpu();
+							rhi::Buffer* staging = ctx.WriteBuffer("Staging");
+							if (staging != nullptr && staging->Map() != nullptr)
+								std::memset(staging->Map(), 0x3C, 64 * 64 * 4);
+							ctx.SignalGpu();
+						});
+					}
+				}
+
+				persistGraph.SubmitGraph(); // 首帧：初态 -> 首次使用
+				persistGraph.WaitHostPasses();
+				device->WaitForFrame();
+				persistGraph.SubmitGraph(); // 稳态帧：上帧末次使用 -> 本帧首次使用
+				persistGraph.WaitHostPasses();
+				device->WaitForFrame();
+				cout << "Cross-frame resubmit ok: 2 frames\n";
+			}
+
+			// 帧循环：Composite 采样图侧计算产物渲染到交换链 backbuffer，Present 节点完成布局收尾。
+			// Backbuffer 是图借用资源（不拥有），每帧 Acquire 后按指针换绑；
+			// acquire 等待与渲染完成信号由 SubmitGraph 的 FrameSync 挂到 Present 所在批
+			if (graphOut) {
+				std::optional<RenderGraph> frameGraph; // 首帧拿到 backbuffer 后再惰性建图
 
 				uint32_t presented = 0;
 				for (uint32_t attempts = 0; attempts < 8 && presented < 3; ++attempts) {
 					rhi::Swapchain::Frame frame = swapchain2->AcquireNextImage();
 					if (!frame.acquired) continue; // 交换链重建窗口，跳过本帧重试
 
-					rhi::CommandList cmd = device->BeginCommandList();
+					if (!frameGraph) {
+						frameGraph.emplace(device.get());
 
-					// backbuffer：acquire 后按 Undefined 处理，转 ColorAttachment
-					rhi::ImageBarrier toRender;
-					toRender.image = frame.backbuffer;
-					toRender.oldLayout = rhi::ImageLayout::Undefined;
-					toRender.newLayout = rhi::ImageLayout::ColorAttachment;
-					toRender.dstStage = rhi::PipelineStage::ColorAttachmentOut;
-					toRender.dstAccess = rhi::Access::ColorAttachmentRead | rhi::Access::ColorAttachmentWrite;
-					cmd.Barrier({ &toRender, 1 }, {});
+						RenderPassDesc compositeDesc;
+						{
+							AttachmentBinding att;
+							att.resourceName = "Backbuffer";
+							att.slot = 0;
+							att.load = LoadOp::Clear;
+							att.clear.value = std::array<float, 4>{ 0.10f, 0.20f, 0.35f, 1.0f };
+							compositeDesc.attachments.push_back(att);
 
-					rhi::RenderingAttachment color;
-					color.image = frame.backbuffer;
-					color.layout = rhi::ImageLayout::ColorAttachment;
-					color.load = rhi::LoadOp::Clear;
-					color.store = rhi::StoreOp::Store;
-					color.clear.value = std::array<float, 4>{ 0.10f, 0.20f, 0.35f, 1.0f };
+							ShaderBinding sampled;
+							sampled.resourceName = "Blurred"; // 与 textured.frag 的采样变量名一致
+							compositeDesc.shaderBindings.push_back(sampled);
 
-					rhi::RenderingInfo rendering;
-					rendering.colors = &color;
-					rendering.colorCount = 1;
-					rendering.renderArea.width = swapchain2->Width();
-					rendering.renderArea.height = swapchain2->Height();
-					cmd.BeginRendering(rendering);
-					cmd.BindPipeline(*pipeline2);
-					cmd.BindDescriptorSet(0, *set2);
-					cmd.SetViewport(rhi::Viewport{ 0.0f, 0.0f,
-						static_cast<float>(swapchain2->Width()),
-						static_cast<float>(swapchain2->Height()), 0.0f, 1.0f });
-					cmd.Draw(3); // 全屏三角形
-					cmd.EndRendering();
+							compositeDesc.pipeline.shaders = {
+								{ rhi::ShaderStage::Vertex,   shaderDir + "/fullscreen.vert.spv" },
+								{ rhi::ShaderStage::Fragment, shaderDir + "/textured.frag.spv" },
+							};
+							compositeDesc.pipeline.cullMode = CullMode::None;
+						}
 
-					// backbuffer：渲染完成转 PresentSrc
-					rhi::ImageBarrier toPresent;
-					toPresent.image = frame.backbuffer;
-					toPresent.oldLayout = rhi::ImageLayout::ColorAttachment;
-					toPresent.newLayout = rhi::ImageLayout::PresentSrc;
-					toPresent.srcStage = rhi::PipelineStage::ColorAttachmentOut;
-					toPresent.srcAccess = rhi::Access::ColorAttachmentWrite;
-					toPresent.dstStage = rhi::PipelineStage::AllCommands;
-					toPresent.dstAccess = rhi::Access::MemoryRead;
-					cmd.Barrier({ &toPresent, 1 }, {});
+						frameGraph->RegisterPass("Composite", { "Blurred" }, { "Backbuffer" }, Pass::Render, compositeDesc);
+						// Present 只声明读边：barrier compiler 产出 ColorAttachment -> PresentSrc
+						frameGraph->RegisterPass("Present", { "Backbuffer" }, {}, Pass::Present, PresentPassDesc{});
 
-					// waits 等 acquire 完成；signals 产出渲染完成信号量（Swapchain 按 image 管理）
-					rhi::SemaphoreWait wait{ frame.ready, rhi::PipelineStage::ColorAttachmentOut };
-					rhi::SemaphoreSignal signal{ frame.presentReady, rhi::PipelineStage::AllCommands };
-					rhi::SubmitInfo submit;
-					submit.commandLists = { &cmd, 1 };
-					submit.waits = { &wait, 1 };
-					submit.signals = { &signal, 1 };
-					device->Submit(submit);
+						// Backbuffer：借用交换链图像（首态 Undefined，内容废弃）；Blurred 借用图侧计算产物
+						frameGraph->RegisterResource("Backbuffer", { "Present" }, "Composite",
+							frame.backbuffer, {}, rhi::ImageLayout::Undefined);
+						frameGraph->RegisterResource("Blurred", { "Composite" }, "",
+							graphOut.get(), {}, rhi::ImageLayout::ShaderReadOnly);
 
-					swapchain2->Present(); // 内部等当帧 image 的渲染完成信号量
+						frameGraph->ProcessRegister();
+						frameGraph->GenerateSubmitSequence();
+						frameGraph->RealizeAll();
+
+						// 绘制数量是执行参数：全屏三角形（3 顶点）
+						for (uint32_t i = 0; frameGraph->GetPass(i) != nullptr; ++i) {
+							Pass* p = frameGraph->GetPass(i);
+							if (p->get_type() != Pass::Render) continue;
+							DrawSource draw;
+							draw.kind = DrawSource::Direct;
+							draw.count = 3;
+							draw.instanceCount = 1;
+							static_cast<RenderPass*>(p)->SetDraw(draw);
+						}
+					}
+					else {
+						// 交换链重建后 backbuffer 指针变化：换绑并按新链重编译屏障
+						frameGraph->RetargetBorrowedImage("Backbuffer", frame.backbuffer);
+					}
+
+					// 整图提交：acquire 等待 / present 信号挂在 Present 批，Present() 等该信号
+					frameGraph->SubmitGraph(RenderGraph::FrameSync{ frame.ready, frame.presentReady });
+					frameGraph->WaitHostPasses();
+					swapchain2->Present();
 					device->WaitForFrame();
 					++presented;
 				}

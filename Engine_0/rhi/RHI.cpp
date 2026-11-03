@@ -308,6 +308,7 @@ namespace {
 			case PipelineStage::AllCommands:        return VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
 			case PipelineStage::Host:               return VK_PIPELINE_STAGE_2_HOST_BIT;
 			case PipelineStage::VertexInput:        return VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT;
+			case PipelineStage::DrawIndirect:       return VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT;
 			case PipelineStage::TopOfPipe:
 			case PipelineStage::BottomOfPipe:
 			case PipelineStage::None:
@@ -331,6 +332,8 @@ namespace {
 		if (a & static_cast<uint64_t>(Access::VertexAttributeRead))  flags |= VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT;
 		if (a & static_cast<uint64_t>(Access::IndexRead))            flags |= VK_ACCESS_2_INDEX_READ_BIT;
 		if (a & static_cast<uint64_t>(Access::HostWrite))            flags |= VK_ACCESS_2_HOST_WRITE_BIT;
+		if (a & static_cast<uint64_t>(Access::HostRead))             flags |= VK_ACCESS_2_HOST_READ_BIT;
+		if (a & static_cast<uint64_t>(Access::IndirectCommandRead))  flags |= VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT;
 		return flags;
 	}
 
@@ -764,6 +767,25 @@ std::unique_ptr<Device> Device::Create(const DeviceDesc& desc)
 	device->m_deviceName = props.deviceName;
 	device->m_apiVersion = props.apiVersion;
 
+	// ---- 时间戳能力（性能诊断）：三类队列族都须 timestampValidBits > 0，跨队列比较还要求 ----
+	{
+		uint32_t familyCount = 0;
+		vkGetPhysicalDeviceQueueFamilyProperties(device->m_physicalDevice, &familyCount, nullptr);
+		std::vector<VkQueueFamilyProperties> familyProps(familyCount);
+		vkGetPhysicalDeviceQueueFamilyProperties(device->m_physicalDevice, &familyCount, familyProps.data());
+		auto validBits = [&familyProps](uint32_t family) {
+			return family < familyProps.size() ? familyProps[family].timestampValidBits : 0u;
+		};
+		const uint32_t timestampFamilies[3] = {
+			device->m_graphicsQueueFamily, device->m_computeQueueFamily, device->m_transferQueueFamily
+		};
+		device->m_timestampsSupported = validBits(timestampFamilies[0]) > 0
+			&& validBits(timestampFamilies[1]) > 0
+			&& validBits(timestampFamilies[2]) > 0;
+		device->m_timestampComparable = props.limits.timestampComputeAndGraphics == VK_TRUE;
+		device->m_timestampPeriod = props.limits.timestampPeriod;
+	}
+
 	// ---- 逻辑设备 + 队列（图形必选；呈现/compute/transfer 族去重后各建一条）（1.3 核心：dynamic rendering + synchronization2）----
 	std::vector<uint32_t> families;
 	auto pushFamily = [&families](uint32_t f) {
@@ -798,9 +820,23 @@ std::unique_ptr<Device> Device::Create(const DeviceDesc& desc)
 	features13.dynamicRendering = VK_TRUE;
 	features13.synchronization2 = VK_TRUE;
 
+	// timeline semaphore（Vulkan 1.2）：先查支持再启用；不支持时 CreateTimelineSemaphore 返回空
+	VkPhysicalDeviceVulkan12Features supported12{};
+	supported12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+	VkPhysicalDeviceFeatures2 supportedFeatures{};
+	supportedFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+	supportedFeatures.pNext = &supported12;
+	vkGetPhysicalDeviceFeatures2(device->m_physicalDevice, &supportedFeatures);
+	device->m_timelineSupported = supported12.timelineSemaphore == VK_TRUE;
+
+	VkPhysicalDeviceVulkan12Features features12{};
+	features12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+	features12.timelineSemaphore = supported12.timelineSemaphore;
+	features12.pNext = &features13;
+
 	VkPhysicalDeviceFeatures2 features2{};
 	features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-	features2.pNext = &features13;
+	features2.pNext = &features12;
 
 	VkDeviceCreateInfo deviceCI{};
 	deviceCI.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
@@ -820,6 +856,12 @@ std::unique_ptr<Device> Device::Create(const DeviceDesc& desc)
 	// compute/transfer 兜底与图形同族时同样取到同一队列句柄
 	vkGetDeviceQueue(device->m_device, device->m_computeQueueFamily, 0, &device->m_computeQueue);
 	vkGetDeviceQueue(device->m_device, device->m_transferQueueFamily, 0, &device->m_transferQueue);
+
+	// ---- 每队列一条 GPU timeline（GPU→Host 的等待端点）；值由 Submit 单调分配 ----
+	if (device->m_timelineSupported) {
+		for (uint32_t i = 0; i < 3; ++i)
+			device->m_queueTimelines[i] = device->CreateTimelineSemaphore(0);
+	}
 
 	// ---- VMA 分配器 ----
 	VmaVulkanFunctions vulkanFunctions{};
@@ -894,7 +936,7 @@ std::unique_ptr<Device> Device::Create(const DeviceDesc& desc)
 	device->m_frameSlots.reserve(slotCount);
 	for (uint32_t i = 0; i < slotCount; ++i) {
 		auto slot = std::unique_ptr<FrameSlot>(new FrameSlot(device->m_device, slotFamilies));
-		if (slot->m_pools.size() != slotFamilies.size() || slot->m_fence == VK_NULL_HANDLE) {
+		if (slot->m_pools.size() != slotFamilies.size()) {
 			std::cerr << "[RHI] 帧槽创建失败（slot " << i << "）\n";
 			return nullptr;
 		}
@@ -911,6 +953,9 @@ Device::~Device()
 	// 逆序清理（帧槽 / descriptor pool / 采样器 / 管线缓存须先于逻辑设备销毁；
 	// 帧槽虽是成员 vector，但若不在此显式清空，其析构将晚于 vkDestroyDevice）
 	m_frameSlots.clear();
+	// 队列 timeline 同属逻辑设备，须先于 vkDestroyDevice 释放（成员析构晚于本函数体）
+	for (auto& timeline : m_queueTimelines)
+		timeline.reset();
 	if (m_descriptorPool) {
 		vkDestroyDescriptorPool(m_device, m_descriptorPool, nullptr);
 		m_descriptorPool = VK_NULL_HANDLE;
@@ -1105,6 +1150,37 @@ void* Buffer::Map()
 	return m_mapped;
 }
 
+const void* Buffer::Map() const
+{
+	return m_mapped;
+}
+
+// 非一致内存的可见性出口：未映射（非 hostVisible）时没有可回写/失效的缓存，直接返回。
+// 范围按缓冲总长钳制；offset 越界视为无效请求。一致内存上这两个调用由驱动退化为 no-op
+void Buffer::Flush(std::uint64_t offset, std::uint64_t size) const
+{
+	if (m_allocator == nullptr || m_allocation == nullptr || m_mapped == nullptr)
+		return;
+	const std::uint64_t total = m_desc.size;
+	if (offset >= total)
+		return;
+	const std::uint64_t range = (size == 0 || size > total - offset) ? total - offset : size;
+	if (vmaFlushAllocation(m_allocator, m_allocation, offset, range) != VK_SUCCESS)
+		std::cerr << "[RHI] vmaFlushAllocation 失败\n";
+}
+
+void Buffer::Invalidate(std::uint64_t offset, std::uint64_t size) const
+{
+	if (m_allocator == nullptr || m_allocation == nullptr || m_mapped == nullptr)
+		return;
+	const std::uint64_t total = m_desc.size;
+	if (offset >= total)
+		return;
+	const std::uint64_t range = (size == 0 || size > total - offset) ? total - offset : size;
+	if (vmaInvalidateAllocation(m_allocator, m_allocation, offset, range) != VK_SUCCESS)
+		std::cerr << "[RHI] vmaInvalidateAllocation 失败\n";
+}
+
 VkBuffer                Buffer::NativeHandle() const { return m_buffer; }
 const BufferCreateInfo& Buffer::Desc() const { return m_desc; }
 
@@ -1112,8 +1188,8 @@ const BufferCreateInfo& Buffer::Desc() const { return m_desc; }
 
 #pragma region Sync // 同步原语
 
-Semaphore::Semaphore(VkDevice device, VkSemaphore semaphore)
-	: m_device(device), m_semaphore(semaphore) {}
+Semaphore::Semaphore(VkDevice device, VkSemaphore semaphore, bool timeline)
+	: m_device(device), m_semaphore(semaphore), m_timeline(timeline) {}
 
 Semaphore::~Semaphore()
 {
@@ -1124,6 +1200,48 @@ Semaphore::~Semaphore()
 }
 
 VkSemaphore Semaphore::NativeHandle() const { return m_semaphore; }
+
+bool Semaphore::Signal(std::uint64_t value)
+{
+	if (!m_timeline || m_semaphore == VK_NULL_HANDLE) return false;
+	VkSemaphoreSignalInfo signalInfo{};
+	signalInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO;
+	signalInfo.semaphore = m_semaphore;
+	signalInfo.value = value;
+	if (vkSignalSemaphore(m_device, &signalInfo) != VK_SUCCESS) {
+		std::cerr << "[RHI] vkSignalSemaphore 失败（value=" << value << "）\n";
+		return false;
+	}
+	return true;
+}
+
+bool Semaphore::Wait(std::uint64_t value, std::uint64_t timeoutNs) const
+{
+	if (!m_timeline || m_semaphore == VK_NULL_HANDLE) return false;
+	VkSemaphoreWaitInfo waitInfo{};
+	waitInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+	waitInfo.semaphoreCount = 1;
+	waitInfo.pSemaphores = &m_semaphore;
+	waitInfo.pValues = &value;
+	VkResult result = vkWaitSemaphores(m_device, &waitInfo, timeoutNs);
+	if (result == VK_TIMEOUT) return false;
+	if (result != VK_SUCCESS) {
+		std::cerr << "[RHI] vkWaitSemaphores 失败\n";
+		return false;
+	}
+	return true;
+}
+
+std::uint64_t Semaphore::Value() const
+{
+	if (!m_timeline || m_semaphore == VK_NULL_HANDLE) return 0;
+	std::uint64_t value = 0;
+	if (vkGetSemaphoreCounterValue(m_device, m_semaphore, &value) != VK_SUCCESS) {
+		std::cerr << "[RHI] vkGetSemaphoreCounterValue 失败\n";
+		return 0;
+	}
+	return value;
+}
 
 Fence::Fence(VkDevice device, VkFence fence)
 	: m_device(device), m_fence(fence) {}
@@ -1174,7 +1292,30 @@ std::unique_ptr<Semaphore> Device::CreateSemaphore()
 		std::cerr << "[RHI] vkCreateSemaphore 失败\n";
 		return nullptr;
 	}
-	return std::unique_ptr<Semaphore>(new Semaphore(m_device, semaphore));
+	return std::unique_ptr<Semaphore>(new Semaphore(m_device, semaphore, false));
+}
+
+std::unique_ptr<Semaphore> Device::CreateTimelineSemaphore(std::uint64_t initialValue)
+{
+	if (!m_timelineSupported) {
+		std::cerr << "[RHI] 设备不支持 timelineSemaphore\n";
+		return nullptr;
+	}
+	VkSemaphoreTypeCreateInfo typeCI{};
+	typeCI.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
+	typeCI.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+	typeCI.initialValue = initialValue;
+
+	VkSemaphoreCreateInfo semaphoreCI{};
+	semaphoreCI.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+	semaphoreCI.pNext = &typeCI;
+
+	VkSemaphore semaphore = VK_NULL_HANDLE;
+	if (vkCreateSemaphore(m_device, &semaphoreCI, nullptr, &semaphore) != VK_SUCCESS) {
+		std::cerr << "[RHI] vkCreateSemaphore（timeline）失败\n";
+		return nullptr;
+	}
+	return std::unique_ptr<Semaphore>(new Semaphore(m_device, semaphore, true));
 }
 
 #pragma endregion
@@ -2060,13 +2201,16 @@ FrameSlot::FrameSlot(VkDevice device, std::vector<uint32_t> queueFamilies)
 		m_pools.push_back(FamilyPool{ family, pool });
 	}
 	m_liveBuffers.resize(m_pools.size());
+	// 内部 fence 改为按需创建（见 AcquireFence）：一帧内每次提交一个，避免逐次 CPU 收账
 
-	VkFenceCreateInfo fenceCI{};
-	fenceCI.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-	// 内部节流 fence：unsignaled 创建（首帧 Submit 即首次信号，规避对已信号 fence 的二次信号）
-	if (vkCreateFence(m_device, &fenceCI, nullptr, &m_fence) != VK_SUCCESS) {
-		std::cerr << "[RHI] vkCreateFence（帧槽）失败\n";
-		return;
+	// 时间戳查询池：每槽一池、按批复用索引。队列族不支持时间戳时写入会被跳过（见 BeginCommandList）
+	VkQueryPoolCreateInfo queryCI{};
+	queryCI.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+	queryCI.queryType = VK_QUERY_TYPE_TIMESTAMP;
+	queryCI.queryCount = kTimestampQueries;
+	if (vkCreateQueryPool(m_device, &queryCI, nullptr, &m_timestampPool) != VK_SUCCESS) {
+		std::cerr << "[RHI] vkCreateQueryPool（时间戳）失败\n";
+		m_timestampPool = VK_NULL_HANDLE;
 	}
 }
 
@@ -2083,9 +2227,17 @@ FrameSlot::~FrameSlot()
 			}
 		}
 		m_liveBuffers.clear();
-		if (m_fence != VK_NULL_HANDLE) {
-			vkDestroyFence(m_device, m_fence, nullptr);
-			m_fence = VK_NULL_HANDLE;
+		for (VkFence fence : m_fencePool) {
+			if (fence != VK_NULL_HANDLE) {
+				vkDestroyFence(m_device, fence, nullptr);
+			}
+		}
+		m_fencePool.clear();
+		// 理论上 Recycle 已等过；这里只丢弃记录，句柄不归本槽所有
+		m_pending.clear();
+		if (m_timestampPool != VK_NULL_HANDLE) {
+			vkDestroyQueryPool(m_device, m_timestampPool, nullptr);
+			m_timestampPool = VK_NULL_HANDLE;
 		}
 		for (const FamilyPool& fp : m_pools) {
 			if (fp.pool != VK_NULL_HANDLE) {
@@ -2133,25 +2285,64 @@ VkCommandBuffer FrameSlot::Allocate(uint32_t queueFamily)
 	return buffer;
 }
 
-VkFence FrameSlot::InternalFence() const { return m_fence; }
-
-void FrameSlot::MarkPending(VkFence fence)
+VkFence FrameSlot::AcquireFence()
 {
-	m_pendingFence = fence;
+	// 池中 fence 都是「等待过并复位」的空闲态（unsignaled）；耗尽时新建
+	if (!m_fencePool.empty()) {
+		VkFence fence = m_fencePool.back();
+		m_fencePool.pop_back();
+		return fence;
+	}
+	VkFenceCreateInfo fenceCI{};
+	fenceCI.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+	VkFence fence = VK_NULL_HANDLE;
+	if (vkCreateFence(m_device, &fenceCI, nullptr, &fence) != VK_SUCCESS) {
+		std::cerr << "[RHI] vkCreateFence（帧槽）失败\n";
+		return VK_NULL_HANDLE;
+	}
+	return fence;
+}
+
+void FrameSlot::ReleaseFence(VkFence fence)
+{
+	// 仅用于提交失败路径：fence 从未挂到队列上，仍保持 unsignaled，可直接归还
+	if (fence != VK_NULL_HANDLE) {
+		m_fencePool.push_back(fence);
+	}
+}
+
+void FrameSlot::MarkPending(VkFence fence, bool owned)
+{
+	if (fence != VK_NULL_HANDLE) {
+		m_pending.push_back(PendingSubmit{ fence, owned });
+	}
 }
 
 void FrameSlot::DrainPending()
 {
 	// pending 为空绝不 wait：避免对无挂起命令的 unsignaled fence 死锁
-	if (m_pendingFence == VK_NULL_HANDLE) return;
-	if (vkWaitForFences(m_device, 1, &m_pendingFence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
+	if (m_pending.empty()) return;
+
+	// 一次等全部在飞提交：多队列下各批并行执行，这里只做帧末汇总
+	std::vector<VkFence> fences;
+	fences.reserve(m_pending.size());
+	for (const PendingSubmit& p : m_pending) {
+		if (p.fence != VK_NULL_HANDLE) fences.push_back(p.fence);
+	}
+	if (!fences.empty()
+		&& vkWaitForFences(m_device, static_cast<uint32_t>(fences.size()), fences.data(),
+			VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
 		std::cerr << "[RHI] 帧槽回收：vkWaitForFences 失败\n";
 	}
-	// 内部 fence 由本槽持有并复位；外部 fence 的复位交给使用者
-	if (m_pendingFence == m_fence) {
-		vkResetFences(m_device, 1, &m_pendingFence);
+
+	// 内部 fence 复位后归还池；外部 fence 只等待，复位交给使用者
+	for (const PendingSubmit& p : m_pending) {
+		if (p.owned && p.fence != VK_NULL_HANDLE) {
+			vkResetFences(m_device, 1, &p.fence);
+			m_fencePool.push_back(p.fence);
+		}
 	}
-	m_pendingFence = VK_NULL_HANDLE;
+	m_pending.clear();
 }
 
 void FrameSlot::Recycle()
@@ -2365,7 +2556,14 @@ void CommandList::Dispatch(uint32_t groupCountX, uint32_t groupCountY, uint32_t 
 	vkCmdDispatch(m_commandBuffer, groupCountX, groupCountY, groupCountZ);
 }
 
-void CommandList::CopyBufferToImage(const Buffer& src, Image& dst, ImageLayout dstLayout)
+void CommandList::DispatchIndirect(const Buffer& args, uint64_t offset)
+{
+	if (m_commandBuffer == VK_NULL_HANDLE) return;
+	// 参数为单个 VkDispatchIndirectCommand（groupCountXYZ），由缓冲内容决定
+	vkCmdDispatchIndirect(m_commandBuffer, args.NativeHandle(), offset);
+}
+
+void CommandList::CopyBufferToImage(const Buffer& src, Image& dst, ImageLayout dstLayout, uint64_t bufferOffset)
 {
 	if (m_commandBuffer == VK_NULL_HANDLE) return;
 	const ImageCreateInfo& desc = dst.Desc();
@@ -2373,6 +2571,7 @@ void CommandList::CopyBufferToImage(const Buffer& src, Image& dst, ImageLayout d
 	// 单 region 覆盖全层（接口未暴露逐 region 拷贝；仅 mip0，逐 mip 待接口扩展）。
 	// 层数取图像实际数组层数：VK_REMAINING_ARRAY_LAYERS 需 maintenance5 特性，未启用时非法
 	VkBufferImageCopy region{};
+	region.bufferOffset = bufferOffset;
 	region.imageSubresource.aspectMask = ToVkAspect(dst.NativeFormat());
 	region.imageSubresource.mipLevel = 0;
 	region.imageSubresource.baseArrayLayer = 0;
@@ -2380,6 +2579,85 @@ void CommandList::CopyBufferToImage(const Buffer& src, Image& dst, ImageLayout d
 	region.imageExtent = { desc.width, desc.height, desc.depth };
 	vkCmdCopyBufferToImage(m_commandBuffer, src.NativeHandle(), dst.NativeHandle(),
 		ToVkImageLayout(dstLayout), 1, &region);
+}
+
+void CommandList::CopyImageToBuffer(const Image& src, const Buffer& dst, ImageLayout srcLayout, uint64_t bufferOffset)
+{
+	if (m_commandBuffer == VK_NULL_HANDLE) return;
+	const ImageCreateInfo& desc = src.Desc();
+
+	// 与 CopyBufferToImage 对称：全层 mip0 紧打包回读；bufferOffset 是 destination 侧起点
+	VkBufferImageCopy region{};
+	region.bufferOffset = bufferOffset;
+	region.imageSubresource.aspectMask = ToVkAspect(src.NativeFormat());
+	region.imageSubresource.mipLevel = 0;
+	region.imageSubresource.baseArrayLayer = 0;
+	region.imageSubresource.layerCount = desc.arrayLayers == 0 ? 1 : desc.arrayLayers;
+	region.imageExtent = { desc.width, desc.height, desc.depth };
+	vkCmdCopyImageToBuffer(m_commandBuffer, src.NativeHandle(), ToVkImageLayout(srcLayout),
+		dst.NativeHandle(), 1, &region);
+}
+
+void CommandList::CopyBuffer(const Buffer& src, const Buffer& dst, uint64_t srcOffset,
+	uint64_t dstOffset, uint64_t size)
+{
+	if (m_commandBuffer == VK_NULL_HANDLE) return;
+	if (size == 0)
+		size = std::min(src.Desc().size, dst.Desc().size);
+	if (size == 0) return;
+
+	VkBufferCopy region{};
+	region.srcOffset = srcOffset;
+	region.dstOffset = dstOffset;
+	region.size = size;
+	vkCmdCopyBuffer(m_commandBuffer, src.NativeHandle(), dst.NativeHandle(), 1, &region);
+}
+
+void CommandList::CopyImage(const Image& src, Image& dst, ImageLayout srcLayout, ImageLayout dstLayout)
+{
+	if (m_commandBuffer == VK_NULL_HANDLE) return;
+	const ImageCreateInfo& s = src.Desc();
+	const ImageCreateInfo& d = dst.Desc();
+
+	// 单 region 覆盖全层 mip0：同格式同尺寸时走拷贝（缩放请用 BlitImage）
+	VkImageCopy region{};
+	region.srcSubresource.aspectMask = ToVkAspect(src.NativeFormat());
+	region.srcSubresource.mipLevel = 0;
+	region.srcSubresource.baseArrayLayer = 0;
+	region.srcSubresource.layerCount = s.arrayLayers == 0 ? 1 : s.arrayLayers;
+	region.dstSubresource.aspectMask = ToVkAspect(dst.NativeFormat());
+	region.dstSubresource.mipLevel = 0;
+	region.dstSubresource.baseArrayLayer = 0;
+	region.dstSubresource.layerCount = d.arrayLayers == 0 ? 1 : d.arrayLayers;
+	region.extent = { s.width, s.height, s.depth };
+	vkCmdCopyImage(m_commandBuffer, src.NativeHandle(), ToVkImageLayout(srcLayout),
+		dst.NativeHandle(), ToVkImageLayout(dstLayout), 1, &region);
+}
+
+void CommandList::BlitImage(const Image& src, Image& dst, ImageLayout srcLayout, ImageLayout dstLayout,
+	bool linearFilter)
+{
+	if (m_commandBuffer == VK_NULL_HANDLE) return;
+	const ImageCreateInfo& s = src.Desc();
+	const ImageCreateInfo& d = dst.Desc();
+
+	// 源/目的 extent 各按自身尺寸：目的小于源即下采样，反之放大
+	VkImageBlit region{};
+	region.srcSubresource.aspectMask = ToVkAspect(src.NativeFormat());
+	region.srcSubresource.mipLevel = 0;
+	region.srcSubresource.baseArrayLayer = 0;
+	region.srcSubresource.layerCount = s.arrayLayers == 0 ? 1 : s.arrayLayers;
+	region.srcOffsets[1] = { static_cast<int32_t>(s.width), static_cast<int32_t>(s.height),
+		static_cast<int32_t>(s.depth) };
+	region.dstSubresource.aspectMask = ToVkAspect(dst.NativeFormat());
+	region.dstSubresource.mipLevel = 0;
+	region.dstSubresource.baseArrayLayer = 0;
+	region.dstSubresource.layerCount = d.arrayLayers == 0 ? 1 : d.arrayLayers;
+	region.dstOffsets[1] = { static_cast<int32_t>(d.width), static_cast<int32_t>(d.height),
+		static_cast<int32_t>(d.depth) };
+	vkCmdBlitImage(m_commandBuffer, src.NativeHandle(), ToVkImageLayout(srcLayout),
+		dst.NativeHandle(), ToVkImageLayout(dstLayout), 1, &region,
+		linearFilter ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
 }
 
 void CommandList::ClearColor(Image& image, ImageSubresource view, const float rgba[4], ImageLayout layout)
@@ -2393,6 +2671,20 @@ void CommandList::ClearColor(Image& image, ImageSubresource view, const float rg
 	range.baseArrayLayer = view.layer;
 	range.layerCount = 1;
 	vkCmdClearColorImage(m_commandBuffer, image.NativeHandle(), ToVkImageLayout(layout), &color, 1, &range);
+}
+
+void CommandList::ResetTimestamps(uint32_t first, uint32_t count)
+{
+	if (m_commandBuffer == VK_NULL_HANDLE || m_timestampPool == VK_NULL_HANDLE || count == 0) return;
+	// 查询池按帧槽复用，重置与写入同一批：靠帧槽回收（已等在飞）保证旧查询不再被引用
+	vkCmdResetQueryPool(m_commandBuffer, m_timestampPool, first, count);
+}
+
+void CommandList::WriteTimestamp(uint32_t index)
+{
+	if (m_commandBuffer == VK_NULL_HANDLE || m_timestampPool == VK_NULL_HANDLE) return;
+	// ALL_COMMANDS：本批此前命令全部完成的时刻（批尾即整批结束，批首即队列开始执行本批）
+	vkCmdWriteTimestamp2(m_commandBuffer, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, m_timestampPool, index);
 }
 
 VkCommandBuffer CommandList::NativeHandle() const { return m_commandBuffer; }
@@ -2412,9 +2704,10 @@ CommandList Device::BeginCommandList(QueueClass queue)
 	else if (queue == QueueClass::Transfer) family = m_transferQueueFamily;
 
 	// 回收当期槽（等在飞提交完成 -> 释放旧命令缓冲）后分配新的
+	// 注意：回收只在 WaitForFrame 做一次；帧内可多次 Begin（不同队列各录一条）
 	FrameSlot& slot = *m_frameSlots[m_frameIndex];
-	slot.Recycle();
 	list.m_commandBuffer = slot.Allocate(family);
+	list.m_timestampPool = m_timestampsSupported ? slot.TimestampPool() : VK_NULL_HANDLE;
 	return list;
 }
 
@@ -2428,9 +2721,9 @@ uint32_t Device::QueueFamily(QueueClass cls) const
 	}
 }
 
-void Device::Submit(const SubmitInfo& info)
+std::uint64_t Device::Submit(const SubmitInfo& info)
 {
-	if (m_frameSlots.empty()) return;
+	if (m_frameSlots.empty()) return 0;
 	FrameSlot& slot = *m_frameSlots[m_frameIndex];
 
 	// 结束录制（BeginCommandList 自动 begin，Submit 自动 end）
@@ -2440,14 +2733,14 @@ void Device::Submit(const SubmitInfo& info)
 		if (list.m_commandBuffer == VK_NULL_HANDLE) continue;
 		if (vkEndCommandBuffer(list.m_commandBuffer) != VK_SUCCESS) {
 			std::cerr << "[RHI] vkEndCommandBuffer 失败\n";
-			return;
+			return 0;
 		}
 		VkCommandBufferSubmitInfo ci{};
 		ci.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
 		ci.commandBuffer = list.m_commandBuffer;
 		commandInfos.push_back(ci);
 	}
-	if (commandInfos.empty()) return;
+	if (commandInfos.empty()) return 0;
 
 	// 等待信号量（acquire / 跨队列）；stageMask 禁 0，None 折到 AllCommands
 	std::vector<VkSemaphoreSubmitInfo> waitInfos;
@@ -2459,11 +2752,12 @@ void Device::Submit(const SubmitInfo& info)
 		wi.semaphore = w.semaphore->NativeHandle();
 		wi.stageMask = (w.stage == PipelineStage::None)
 			? VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT : ToVkPipelineStage(w.stage);
+		wi.value = w.value; // binary 语义量必须为 0（结构体默认值即 0）
 		waitInfos.push_back(wi);
 	}
 
 	std::vector<VkSemaphoreSubmitInfo> signalInfos;
-	signalInfos.reserve(info.signals.size());
+	signalInfos.reserve(info.signals.size() + 1);
 	for (const auto& s : info.signals) {
 		if (!s.semaphore) continue;
 		VkSemaphoreSubmitInfo si{};
@@ -2471,17 +2765,32 @@ void Device::Submit(const SubmitInfo& info)
 		si.semaphore = s.semaphore->NativeHandle();
 		si.stageMask = (s.stage == PipelineStage::None)
 			? VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT : ToVkPipelineStage(s.stage);
+		si.value = s.value; // timeline：本批完成时把值推进到 s.value（须大于当前值）
 		signalInfos.push_back(si);
 	}
 
-	// fence：外部优先（回收时由 RHI 等待，Reset 复用交给使用者）；
-	// 内部 fence 时若本帧已有提交在飞则先收账（帧内多次 Submit 串行化，保证单次挂起）
+	// 队列 GPU timeline：每次提交自动推进一个值，主机侧可 QueueTimeline(queue)->Wait(value) 等这批完成
+	std::uint64_t timelineValue = 0;
+	const uint32_t queueIndex = static_cast<uint32_t>(info.queue);
+	if (m_queueTimelines[queueIndex]) {
+		timelineValue = ++m_queueTimelineValue[queueIndex];
+		VkSemaphoreSubmitInfo ti{};
+		ti.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+		ti.semaphore = m_queueTimelines[queueIndex]->NativeHandle();
+		ti.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+		ti.value = timelineValue;
+		signalInfos.push_back(ti);
+	}
+
+	// fence：外部优先（帧末由 RHI 等待，Reset 复用交给使用者）；
+	// 内部 fence 每次提交独立取一个，且不在提交时等待任何在飞提交 —— 多队列批才能并行
 	VkFence fence = VK_NULL_HANDLE;
+	bool ownedFence = false;
 	if (info.signalFence) {
 		fence = info.signalFence->m_fence;
 	} else {
-		fence = slot.InternalFence();
-		slot.DrainPending();
+		fence = slot.AcquireFence();
+		ownedFence = true;
 	}
 
 	// 目标队列：类别映射（选定期已兜底）；commandLists 须全部来自同族池
@@ -2500,9 +2809,24 @@ void Device::Submit(const SubmitInfo& info)
 
 	if (vkQueueSubmit2(targetQueue, 1, &submitInfo, fence) != VK_SUCCESS) {
 		std::cerr << "[RHI] vkQueueSubmit2 失败\n";
-		return;
+		if (ownedFence) slot.ReleaseFence(fence); // 未挂到队列，fence 仍是空闲态
+		if (timelineValue != 0) --m_queueTimelineValue[queueIndex]; // 撤回未生效的值分配
+		return 0;
 	}
-	slot.MarkPending(fence);
+	slot.MarkPending(fence, ownedFence);
+	return timelineValue;
+}
+
+Semaphore* Device::QueueTimeline(QueueClass cls) const
+{
+	const uint32_t index = static_cast<uint32_t>(cls);
+	return (index < 3) ? m_queueTimelines[index].get() : nullptr;
+}
+
+std::uint64_t Device::LastQueueTimelineValue(QueueClass cls) const
+{
+	const uint32_t index = static_cast<uint32_t>(cls);
+	return (index < 3) ? m_queueTimelineValue[index] : 0;
 }
 
 void Device::WaitForFrame()
@@ -2510,6 +2834,23 @@ void Device::WaitForFrame()
 	if (m_frameSlots.empty()) return;
 	m_frameSlots[m_frameIndex]->Recycle();
 	m_frameIndex = (m_frameIndex + 1) % static_cast<uint32_t>(m_frameSlots.size());
+}
+
+bool Device::ReadFrameTimestamps(uint32_t first, uint32_t count, std::uint64_t* out) const
+{
+	if (!m_timestampsSupported || m_frameSlots.empty() || out == nullptr || count == 0) return false;
+	if (first + count > FrameSlot::kTimestampQueries) return false;
+
+	// 刚被回收并已轮转的槽 = 刚结束那一帧（本帧的命令列表都记在它上面）
+	const uint32_t slotCount = static_cast<uint32_t>(m_frameSlots.size());
+	const uint32_t slotIndex = (m_frameIndex + slotCount - 1) % slotCount;
+	VkQueryPool pool = m_frameSlots[slotIndex]->TimestampPool();
+	if (pool == VK_NULL_HANDLE) return false;
+
+	// 该槽的 pending 已在 Recycle 中排空，故查询结果必然可用（WAIT 位只作兜底）
+	return vkGetQueryPoolResults(m_device, pool, first, count,
+		sizeof(std::uint64_t) * count, out, sizeof(std::uint64_t),
+		VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS;
 }
 
 void Device::WaitIdle()

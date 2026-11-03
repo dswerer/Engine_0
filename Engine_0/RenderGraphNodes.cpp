@@ -24,6 +24,11 @@ std::unique_ptr<Pass> Pass::AutoAllocator(PassTopology&& topo, Type newType, Pas
 			return std::make_unique<TransferPass>(std::move(topo), std::move(*d));
 		RenderGraph::HandleError(RenderGraph::ErrorCode::PassTypeDescMismatch);
 		break;
+	case Pass::Present:
+		if (auto* d = std::get_if<PresentPassDesc>(&desc))
+			return std::make_unique<PresentPass>(std::move(topo), std::move(*d));
+		RenderGraph::HandleError(RenderGraph::ErrorCode::PassTypeDescMismatch);
+		break;
 	default:
 		RenderGraph::HandleError(RenderGraph::ErrorCode::PassTypeUnspecified);
 		break;

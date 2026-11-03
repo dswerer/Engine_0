@@ -48,8 +48,9 @@ namespace dEngine {
 	};
 
 	// Host 节点：纯 CPU 回调（解码/上传等），不创建后端对象、不录命令。
-	// 写边在拓扑里记为 HostWrite，barrier compiler 据此产出 HOST -> GPU 阶段的内存依赖
-	// （回调在 RecordPass 时执行，早于提交，满足 srcStage=HOST 的语义）
+	// 写边在拓扑里记为 HostWrite，barrier compiler 据此产出 HOST -> GPU 阶段的内存依赖。
+	// 回调由 SubmitGraph 在独立线程执行（提交线程不阻塞），业务代码夹在
+	// HostContext::WaitForGpu() / SignalGpu() 之间
 	class HostPass : public Pass {
 	public:
 		HostPass(PassTopology&& topo, HostPassDesc desc)
@@ -58,13 +59,13 @@ namespace dEngine {
 		Pass::Type get_type() const override { return Pass::Type::Host; }
 		const HostPassDesc& get_desc() const { return mDesc; }
 		// 回调是执行参数（每帧可换）：设置后覆盖 desc 中的声明
-		void SetCallback(std::function<void()> callback) { mCallback = std::move(callback); }
-		const std::function<void()>& get_callback() const {
+		void SetCallback(std::function<void(HostContext&)> callback) { mCallback = std::move(callback); }
+		const std::function<void(HostContext&)>& get_callback() const {
 			return mCallback ? mCallback : mDesc.callback;
 		}
 	private:
 		HostPassDesc mDesc;
-		std::function<void()> mCallback;
+		std::function<void(HostContext&)> mCallback;
 	};
 
 	// 传输节点：单次 buffer -> image 拷贝（上传路径的 GPU 侧），无管线/描述符
@@ -77,6 +78,19 @@ namespace dEngine {
 		const TransferPassDesc& get_desc() const { return mDesc; }
 	private:
 		TransferPassDesc mDesc;
+	};
+
+	// 呈现节点：只承载布局转换（读 presentable image -> PresentSrc），无管线/描述符/命令。
+	// acquire 等待与渲染完成信号由 SubmitGraph 的 FrameSync 挂到本节点所在的批
+	class PresentPass : public Pass {
+	public:
+		PresentPass(PassTopology&& topo, PresentPassDesc desc)
+			: Pass(std::move(topo)), mDesc(std::move(desc)) {
+		}
+		Pass::Type get_type() const override { return Pass::Type::Present; }
+		const PresentPassDesc& get_desc() const { return mDesc; }
+	private:
+		PresentPassDesc mDesc;
 	};
 
 	// 图像资源节点：一个节点 = 一个「视图身份」（名称即身份，绑定与对账都按名称）。

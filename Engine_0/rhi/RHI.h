@@ -89,7 +89,15 @@ namespace dEngine::rhi {
 
 		VkBuffer                NativeHandle() const;
 		const BufferCreateInfo& Desc() const;
-		void*                   Map();   // 仅 hostVisible 可用，持久映射，不提供 Unmap
+		void*                   Map();        // 仅 hostVisible 可用，持久映射，不提供 Unmap
+		const void*             Map() const;  // 只读映射指针：写操作须用非 const 句柄
+
+		// 非一致（缺 HOST_COHERENT）主机可见内存的显式可见性操作；尺寸为 0 表示到缓冲末尾。
+		// Flush：主机写完之后、GPU 使用之前调用（把主机缓存回写到设备可见内存）；
+		// Invalidate：GPU 写完之后、主机读取之前调用（丢弃主机缓存，让设备写对主机可见）。
+		// 未映射（hostVisible == false）时为空操作；一致内存上由驱动退化为 no-op
+		void Flush(std::uint64_t offset = 0, std::uint64_t size = 0) const;
+		void Invalidate(std::uint64_t offset = 0, std::uint64_t size = 0) const;
 	private:
 		friend class Device;
 		Buffer(VmaAllocator_T* allocator, VkBuffer buffer, VmaAllocation_T* allocation,
@@ -220,13 +228,23 @@ namespace dEngine::rhi {
 		~Semaphore();
 
 		VkSemaphore NativeHandle() const;
+		bool IsTimeline() const { return m_timeline; }
+
+		// 仅 timeline 语义量有效（binary 调用一律返回 false / 0）：
+		// Signal = 主机侧推进（Host→GPU：GPU 侧用 SubmitInfo 的 wait value 等它）
+		// Wait   = 主机侧等待（GPU→Host：等某个提交把值推进到 value）
+		bool            Signal(std::uint64_t value);
+		bool            Wait(std::uint64_t value, std::uint64_t timeoutNs = ~0ull) const;
+		std::uint64_t   Value() const;
 	private:
 		friend class Device;
 		friend class Swapchain;
-		Semaphore(VkDevice device, VkSemaphore semaphore);
+		// timeline 语义量须按 VK_SEMAPHORE_TYPE_TIMELINE 创建，创建方在 Device 内
+		Semaphore(VkDevice device, VkSemaphore semaphore, bool timeline = false);
 
 		VkDevice    m_device = VK_NULL_HANDLE;
 		VkSemaphore m_semaphore = VK_NULL_HANDLE;
+		bool        m_timeline = false;
 	};
 
 #pragma endregion
@@ -263,15 +281,36 @@ namespace dEngine::rhi {
 
 		// 计算派发（工作组数非像素尺寸：通常为 ceil(宽/局部宽), ceil(高/局部高), 1）
 		void Dispatch(uint32_t groupCountX, uint32_t groupCountY = 1, uint32_t groupCountZ = 1);
+		// 间接派发：工作组数（VkDispatchIndirectCommand）从 buffer 读取，CPU 不可见
+		void DispatchIndirect(const Buffer& args, uint64_t offset = 0);
 
-		// 拷贝/清场（图外工具与上传路径用）
-		void CopyBufferToImage(const Buffer& src, Image& dst, ImageLayout dstLayout);
+		// 拷贝/清场（图外工具与上传/回读路径用）
+		// bufferOffset 为 buffer 侧起点（0 = 整段）；拷贝区域固定为图像全层 mip0（接口未暴露逐 region）
+		void CopyBufferToImage(const Buffer& src, Image& dst, ImageLayout dstLayout, uint64_t bufferOffset = 0);
+		// 反向回读：图像全层 mip0 -> buffer 指定偏移；srcLayout 须为 TransferSrc（或 General）
+		void CopyImageToBuffer(const Image& src, const Buffer& dst, ImageLayout srcLayout, uint64_t bufferOffset = 0);
+		// buffer -> buffer 整段/窗口拷贝；size == 0 时取两者较小值
+		void CopyBuffer(const Buffer& src, const Buffer& dst, uint64_t srcOffset = 0,
+			uint64_t dstOffset = 0, uint64_t size = 0);
+		// image -> image 拷贝：同格式、同尺寸，整图 mip0 全层；两端布局通常为 TransferSrc/TransferDst
+		void CopyImage(const Image& src, Image& dst, ImageLayout srcLayout, ImageLayout dstLayout);
+		// image -> image blit：同格式，可缩放（源/目的 extent 各按自身尺寸）；
+		// linearFilter=true 需格式支持 SAMPLED_IMAGE_FILTER_LINEAR，深度/整数格式请用最近邻
+		void BlitImage(const Image& src, Image& dst, ImageLayout srcLayout, ImageLayout dstLayout,
+			bool linearFilter = true);
 		void ClearColor(Image& image, ImageSubresource view, const float rgba[4], ImageLayout layout);
+
+		// GPU 时间戳（性能诊断）：在批首/批尾各打一个点，配合 Device::ReadFrameTimestamps 回读。
+		// ResetTimestamps 必须出现在同一批的 WriteTimestamp 之前；跨帧复用同一索引是安全的——
+		// 帧槽只有在该槽全部在飞提交完成后才回收，届时旧查询已不再被引用
+		void ResetTimestamps(uint32_t first, uint32_t count);
+		void WriteTimestamp(uint32_t index); // ALL_COMMANDS 阶段：本批此前命令全部完成的时刻
 
 		VkCommandBuffer NativeHandle() const;
 	private:
 		friend class Device; // BeginCommandList 构造并填句柄
 		VkCommandBuffer  m_commandBuffer = VK_NULL_HANDLE;
+		VkQueryPool      m_timestampPool = VK_NULL_HANDLE; // 所属帧槽的时间戳查询池（队列族不支持时为空）
 		VkPipelineLayout m_pipelineLayout = VK_NULL_HANDLE; // BindPipeline 记录，供描述符 / push constant 绑定用
 		uint32_t         m_pushConstantSize = 0;            // 当前管线声明的 push constant 大小（0=无）
 		VkPipelineBindPoint m_bindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS; // 当前管线绑定点（描述符绑定沿用）
@@ -282,8 +321,10 @@ namespace dEngine::rhi {
 
 #pragma region Submit // 提交与帧间同步
 
-	struct SemaphoreWait   { const Semaphore* semaphore = nullptr; PipelineStage stage = PipelineStage::None; };
-	struct SemaphoreSignal { const Semaphore* semaphore = nullptr; PipelineStage stage = PipelineStage::None; };
+	// 跨队列同步的两端点。binary 语义量 value 必须为 0；timeline 语义量按值匹配
+	// （signal 的 value 须大于当前值，wait 的 value 由提交在该处之后推进）
+	struct SemaphoreWait   { const Semaphore* semaphore = nullptr; PipelineStage stage = PipelineStage::None; std::uint64_t value = 0; };
+	struct SemaphoreSignal { const Semaphore* semaphore = nullptr; PipelineStage stage = PipelineStage::None; std::uint64_t value = 0; };
 
 	struct SubmitInfo {
 		std::span<const CommandList>     commandLists {};
@@ -297,11 +338,16 @@ namespace dEngine::rhi {
 
 #pragma region FrameSlot // 帧槽（命令录制与回收上下文）
 
-	// 单个帧槽：每队列族一个 command pool + 内部节流 fence + 在录 buffer 集合。
-	// 回收状态机约定：pending 为空绝不 wait —— "Begin 后不 Submit"、"漏调 WaitForFrame"
-	// 均只退化为串行执行，不会死锁；帧内多次 Submit（含跨队列）经内部 fence 逐次收账，同样串行（保守但正确）。
+	// 单个帧槽：每队列族一个 command pool + 内部 fence 池 + 在录 buffer 集合。
+	// 回收约定：帧内可任意多次 BeginCommandList / Submit（含跨队列），每次 Submit 取一个
+	// 独立 fence 记入在飞集合；回收只在 WaitForFrame（Recycle）时发生 —— 一次性等本槽全部
+	// 在飞提交，不做逐次 CPU 收账，因此多队列提交可真正并行。
+	// pending 为空绝不 wait："Begin 后不 Submit"、漏调 WaitForFrame 只退化为串行，不会死锁。
 	class FrameSlot {
 	public:
+		// 每帧槽时间戳查询容量（每批 2 个：批首/批尾）
+		static constexpr uint32_t kTimestampQueries = 32;
+
 		FrameSlot(const FrameSlot&) = delete;
 		FrameSlot& operator=(const FrameSlot&) = delete;
 		~FrameSlot();
@@ -311,10 +357,12 @@ namespace dEngine::rhi {
 		FrameSlot(VkDevice device, std::vector<uint32_t> queueFamilies); // 去重后的族列表（present 族不建池）
 
 		VkCommandBuffer Allocate(uint32_t queueFamily); // 按族查池，分配并 begin（ONE_TIME_SUBMIT），记入在录集合
-		VkFence         InternalFence() const;         // 内部节流 fence 句柄（创建时 unsignaled）
-		void            MarkPending(VkFence fence);    // 记录在飞提交（外部或内部 fence）
-		void            DrainPending();                // 仅等在飞提交完成并清账（不动在录 buffer）
+		VkFence         AcquireFence();                // 取一个空闲内部 fence（池耗尽则新建，均为 unsignaled）
+		void            ReleaseFence(VkFence fence);   // 未提交成功时原样归还池（仍为 unsignaled）
+		void            MarkPending(VkFence fence, bool owned); // 记录一次在飞提交（外部或内部 fence）
+		void            DrainPending();                // 等全部在飞提交完成并清账（不动在录 buffer）
 		void            Recycle();                     // DrainPending + 按池释放在录 buffer
+		VkQueryPool     TimestampPool() const { return m_timestampPool; } // 时间戳回读（Device 用）
 
 		// 每队列族一个命令池（命令缓冲只能提交到与其 pool 同族的队列）
 		struct FamilyPool {
@@ -322,11 +370,18 @@ namespace dEngine::rhi {
 			VkCommandPool pool = VK_NULL_HANDLE;
 		};
 
+		// 一次提交的在飞记录：owned=true 表示内部 fence（等待后由本槽复位归还）
+		struct PendingSubmit {
+			VkFence fence = VK_NULL_HANDLE;
+			bool    owned = false;
+		};
+
 		VkDevice                            m_device = VK_NULL_HANDLE;
-		std::vector<FamilyPool>             m_pools;       // 每族一池（数量 = 构造传入族数）
+		std::vector<FamilyPool>             m_pools;      // 每族一池（数量 = 构造传入族数）
 		std::vector<std::vector<VkCommandBuffer>> m_liveBuffers; // 与 m_pools 平行：每池的在录 buffer
-		VkFence                             m_fence = VK_NULL_HANDLE;         // 内部节流用
-		VkFence                             m_pendingFence = VK_NULL_HANDLE;  // 非空=该槽有在飞提交
+		std::vector<VkFence>                m_fencePool;  // 空闲内部 fence（等待并复位后归还）
+		std::vector<PendingSubmit>          m_pending;    // 本帧在飞提交（每 Submit 一条）
+		VkQueryPool                         m_timestampPool = VK_NULL_HANDLE; // 时间戳查询（每槽一池）
 	};
 
 #pragma endregion
@@ -420,19 +475,36 @@ namespace dEngine::rhi {
 		std::unique_ptr<Pipeline>      CreateComputePipeline(const ComputePipelineDesc& desc);
 		std::unique_ptr<DescriptorSet> AllocateDescriptorSet(const DescriptorSetLayout& layout);
 		std::unique_ptr<Fence>         CreateFence(bool signaled = false);
-		std::unique_ptr<Semaphore>     CreateSemaphore();
+		std::unique_ptr<Semaphore>     CreateSemaphore(); // binary（acquire/present 链、单次跨队列）
+		// timeline：可被主机 Signal（Host→GPU 唯一的非阻塞手段）；initialValue 由使用者给定
+		std::unique_ptr<Semaphore>     CreateTimelineSemaphore(std::uint64_t initialValue = 0);
+		bool                           TimelineSemaphoresSupported() const { return m_timelineSupported; }
 
 		// 帧上下文
 		std::unique_ptr<Swapchain> CreateSwapchain();
 		CommandList                BeginCommandList(QueueClass queue = QueueClass::Graphics); // 自当期帧对应族 pool 分配
 
 		// 提交与帧回收（frames-in-flight 上限，默认 2）
-		void Submit(const SubmitInfo& info);
+		// 提交到 info.queue。返回本次提交在该队列 GPU timeline 上的 signal 值（0 = 设备无 timeline）：
+		// 主机可 QueueTimeline(queue)->Wait(value) 等这一批完成（GPU→Host 的非阻塞等待）
+		std::uint64_t Submit(const SubmitInfo& info);
+
+		// 每队列一条 GPU timeline：值随该队列的提交顺序单调推进（队列内有序，不会与并行队列撞值），
+		// 由 Submit 自动分配并作为信号追加，无需使用者在 signals 里手填
+		Semaphore*    QueueTimeline(QueueClass cls) const;
+		std::uint64_t LastQueueTimelineValue(QueueClass cls) const;
 		void WaitForFrame();
 		void WaitIdle();   // 等待设备完全空闲（呈现仍在途时，销毁信号量/资源前调用）
 
 		// 某类队列的族索引（QFOT barrier 字段 / 诊断用；无专用队列时已兜底 graphics）
 		uint32_t QueueFamily(QueueClass cls) const;
+
+		// GPU 时间戳（性能诊断）：须在 WaitForFrame 之后立即调用——回读刚结束那一帧的查询区间，
+		// 输出为设备原始 tick（毫秒换算用 TimestampPeriodNs）。查询索引约定为批 b 的 [2b, 2b+1]
+		bool ReadFrameTimestamps(uint32_t first, uint32_t count, std::uint64_t* out) const;
+		bool TimestampsSupported() const { return m_timestampsSupported; }   // 各队列族 timestampValidBits > 0
+		bool TimestampsComparable() const { return m_timestampComparable; } // 跨队列同一时间基
+		double TimestampPeriodNs() const { return m_timestampPeriod; }      // ns / tick
 
 		// 诊断信息（日志 / 冒烟测试）
 		const char* DeviceName() const;
@@ -465,6 +537,14 @@ namespace dEngine::rhi {
 
 		std::vector<std::unique_ptr<FrameSlot>> m_frameSlots; // 帧槽（数量 = DeviceDesc::maxFramesInFlight）
 		uint32_t m_frameIndex = 0;                             // 当期帧槽索引
+
+		bool   m_timestampsSupported = false; // 三类队列族都支持 timestampValidBits > 0
+		bool   m_timestampComparable = false; // limits.timestampComputeAndGraphics（跨队列时间基可比）
+		double m_timestampPeriod = 0.0;       // limits.timestampPeriod（ns / tick）
+		bool   m_timelineSupported = false;   // timelineSemaphore 特性已开启（Create 时查询并启用）
+		// 每队列一条 GPU timeline（下标 = QueueClass），值为该队列已分配的最大 signal 值
+		std::unique_ptr<Semaphore> m_queueTimelines[3];
+		std::uint64_t              m_queueTimelineValue[3] = { 0, 0, 0 };
 
 		uint32_t m_windowWidth = 0, m_windowHeight = 0; // 无 currentExtent 时的回退尺寸（来自 DeviceDesc）
 
