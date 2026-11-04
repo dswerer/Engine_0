@@ -47,6 +47,7 @@ struct BoidsParams {
 	glm::vec4 boundsMin;
 	glm::vec4 boundsMax;
 	float boundaryStrength;
-	float _pad[3];
+	float minSpeed;     // 演示用最低巡游速度；0 = 完全按原工程
+	float _pad[2];
 };
 static_assert(sizeof(BoidsParams) == 64, "BoidsParams 必须与 std140 布局一致");

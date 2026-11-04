@@ -52,7 +52,8 @@ constexpr uint32_t kMaxFish = 1024;
 constexpr uint32_t kWorkGroupSize = 256;
 constexpr uint32_t kFishDataFloats = kMaxFish * 7;
 constexpr uint32_t kFishDataBytes = kFishDataFloats * sizeof(float);
-constexpr uint32_t kOutVelBytes = kMaxFish * sizeof(glm::vec3);
+// std430 中 vec3 数组的元素步长是 16 字节；这里按 vec4 分配，避免越界写入
+constexpr uint32_t kOutVelBytes = kMaxFish * sizeof(glm::vec4);
 constexpr uint32_t kShadowSize = 4096;
 constexpr uint32_t kLutSize = 256;
 constexpr uint32_t kSkyAmbientSize = 128;
@@ -63,6 +64,7 @@ const string kAssetDir = RETRIEVE_ASSET_DIR;
 struct Options {
 	bool     smoke = false;
 	uint32_t frames = 60;
+	float    boidsMinSpeed = 0.0f; // 0 = 完全按原工程；>0 为演示用最低巡游速度
 };
 
 struct AppInput {
@@ -475,7 +477,9 @@ bool BuildFrameGraph(RenderGraph& graph, const rhi::Buffer* vb, const rhi::Buffe
 	return true;
 }
 
-void InitBoids(RenderGraph& graph, uint32_t count, glm::vec3& firstPos) {
+void InitBoids(RenderGraph& graph, uint32_t count,
+	std::vector<glm::vec3>* initialPositions = nullptr,
+	std::vector<glm::vec3>* initialDirs = nullptr) {
 	Resource* res = FindResource(graph, "fishes");
 	if (res == nullptr || res->get_type() != Resource::Buffer) {
 		cerr << "fishes 资源缺失\n";
@@ -486,6 +490,14 @@ void InitBoids(RenderGraph& graph, uint32_t count, glm::vec3& firstPos) {
 		return;
 
 	float* data = static_cast<float*>(buf->Map());
+	if (initialPositions != nullptr) {
+		initialPositions->clear();
+		initialPositions->reserve(count);
+	}
+	if (initialDirs != nullptr) {
+		initialDirs->clear();
+		initialDirs->reserve(count);
+	}
 	for (uint32_t i = 0; i < count; ++i) {
 		float n = static_cast<float>(i);
 		uint32_t p = i * 3;
@@ -494,6 +506,8 @@ void InitBoids(RenderGraph& graph, uint32_t count, glm::vec3& firstPos) {
 		data[p + 0] = 10.0f * std::sin(n);
 		data[p + 1] = 10.0f * std::sin(n) + 10.0f;
 		data[p + 2] = 10.0f * std::sin(n + 10.0f);
+		if (initialPositions != nullptr)
+			initialPositions->emplace_back(data[p + 0], data[p + 1], data[p + 2]);
 
 		glm::vec3 dir(std::sin(n), 0.0f, std::cos(n));
 		if (glm::length(dir) > 1e-5f) dir = glm::normalize(dir);
@@ -501,8 +515,9 @@ void InitBoids(RenderGraph& graph, uint32_t count, glm::vec3& firstPos) {
 		data[d + 1] = dir.y;
 		data[d + 2] = dir.z;
 		data[v] = 0.1f;
+		if (initialDirs != nullptr)
+			initialDirs->push_back(dir);
 	}
-	firstPos = glm::vec3(data[0], data[1], data[2]);
 	buf->Flush();
 }
 
@@ -538,6 +553,10 @@ int main(int argc, char** argv) {
 					++i;
 				}
 			}
+		}
+		else if (std::strcmp(argv[i], "--boids-min-speed") == 0 && i + 1 < argc) {
+			options.boidsMinSpeed = static_cast<float>(std::atof(argv[i + 1]));
+			++i;
 		}
 	}
 
@@ -661,11 +680,12 @@ int main(int argc, char** argv) {
 			float dy = in->lastY - static_cast<float>(ypos);
 			in->lastX = static_cast<float>(xpos);
 			in->lastY = static_cast<float>(ypos);
-			in->camera->rotate(glm::radians(-0.1f * dx), glm::radians(-0.1f * dy));
+			// Vulkan 投影翻转了 Y：鼠标上移应抬头（pitch 增大），滚轮上滚应前进
+			in->camera->rotate(glm::radians(-0.1f * dx), glm::radians(0.1f * dy));
 		});
 		glfwSetScrollCallback(window, [](GLFWwindow* w, double, double yoffset) {
 			AppInput* in = static_cast<AppInput*>(glfwGetWindowUserPointer(w));
-			in->camera->moveForward(-0.5f * static_cast<float>(yoffset) * 10.0f);
+			in->camera->moveForward(0.5f * static_cast<float>(yoffset) * 10.0f);
 		});
 		glfwSetKeyCallback(window, [](GLFWwindow* w, int key, int, int action, int) {
 			AppInput* in = static_cast<AppInput*>(glfwGetWindowUserPointer(w));
@@ -685,7 +705,8 @@ int main(int argc, char** argv) {
 	bool captured = false;
 	std::vector<unsigned char> capturedPixels;
 
-	glm::vec3 initialFirstPos(0.0f);
+	std::vector<glm::vec3> initialPositions;
+	std::vector<glm::vec3> initialDirs;
 	uint32_t renderedFrames = 0;
 
 	while (true) {
@@ -731,7 +752,7 @@ int main(int argc, char** argv) {
 				rp->SetDraw(draw);
 			}
 
-			InitBoids(*graph, kFishCount, initialFirstPos);
+			InitBoids(*graph, kFishCount, &initialPositions, &initialDirs);
 			Resource* fishRes = FindResource(*graph, "fishes");
 			if (fishRes != nullptr) {
 				BarrierHostVisibility(*device,
@@ -803,6 +824,7 @@ int main(int argc, char** argv) {
 		boidsParams.boundsMin = glm::vec4(-30.0f, 10.0f, -30.0f, 0.0f);
 		boidsParams.boundsMax = glm::vec4(30.0f, 100.0f, 30.0f, 0.0f);
 		boidsParams.boundaryStrength = 0.3f;
+		boidsParams.minSpeed = options.boidsMinSpeed;
 
 		HostPass* update = static_cast<HostPass*>(FindPass(*graph, "UpdateFrame"));
 		update->SetCallback([frameUniforms, shadowUniforms, boidsParams](HostContext& ctx) {
@@ -863,9 +885,12 @@ int main(int argc, char** argv) {
 			stbi_write_png(outputPath.c_str(), static_cast<int>(kWidth), static_cast<int>(kHeight),
 				4, capturedPixels.data(), static_cast<int>(kWidth) * 4);
 
-			float moved = 0.0f;
+			uint32_t active = 0, inactive = 0, badDir = 0, badPos = 0;
+			uint32_t zeroVel = 0, sameAsInitDir = 0;
+			double sumMove = 0.0;
+			float minMove = 1e9f, maxMove = 0.0f;
 			Resource* fishRes = FindResource(*graph, "fishes");
-			if (fishRes != nullptr) {
+			if (fishRes != nullptr && initialPositions.size() == kFishCount) {
 				rhi::Buffer* fishBuf = const_cast<rhi::Buffer*>(static_cast<Buffer*>(fishRes)->get_rhi());
 				if (fishBuf != nullptr) {
 					BarrierHostVisibility(*device, *fishBuf,
@@ -874,11 +899,35 @@ int main(int argc, char** argv) {
 					device->WaitForFrame();
 					fishBuf->Invalidate();
 					float* data = static_cast<float*>(fishBuf->Map());
-					glm::vec3 pos(data[0], data[1], data[2]);
-					moved = glm::length(pos - initialFirstPos);
+					for (uint32_t i = 0; i < kFishCount; ++i) {
+						glm::vec3 pos(data[i * 3], data[i * 3 + 1], data[i * 3 + 2]);
+						float d = glm::length(pos - initialPositions[i]);
+						if (!(d >= 0.0f)) ++badPos;
+						if (d > 0.01f) ++active; else ++inactive;
+						sumMove += d;
+						minMove = std::min(minMove, d);
+						maxMove = std::max(maxMove, d);
+						uint32_t dirOff = kFishCount * 3 + i * 3;
+						glm::vec3 dir(data[dirOff], data[dirOff + 1], data[dirOff + 2]);
+						if (!(glm::length(dir) > 1e-6f))
+							++badDir;
+						float speedVal = data[kFishCount * 6 + i];
+						if (!(speedVal > 1e-6f))
+							++zeroVel;
+						if (initialDirs.size() == kFishCount
+							&& glm::length(dir - initialDirs[i]) < 1e-5f)
+							++sameAsInitDir;
+					}
 				}
 			}
-			cout << "Boids update ok: moved=" << moved << "\n";
+			double meanMove = initialPositions.size() == kFishCount
+				? sumMove / static_cast<double>(kFishCount) : 0.0;
+			cout << "Boids update ok: active=" << active << "/" << kFishCount
+			     << " inactive=" << inactive << " badDir=" << badDir
+			     << " badPos=" << badPos << " zeroVel=" << zeroVel
+			     << " sameAsInitDir=" << sameAsInitDir
+			     << " meanMove=" << meanMove << " minMove=" << minMove
+			     << " maxMove=" << maxMove << "\n";
 			cout << "Smoke image: min=" << minLuma << " max=" << maxLuma
 			     << " mean=" << meanLuma << "\n";
 			cout << "Retrieve smoke ok: wrote " << outputPath << "\n";

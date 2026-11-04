@@ -16,8 +16,9 @@ layout(std430, set = 0, binding = 9) buffer fishesBlock {
     float data[7168];
 } fishes;
 
+// std430 下 vec3 数组步长为 16 字节；这里显式用 vec4，CPU 侧也按 16*N 分配
 layout(std430, set = 0, binding = 10) buffer outvelBlock {
-    vec3 vels[1024];
+    vec4 vels[1024];
 } outvel;
 
 #define fishCount BoidsParams.fishCount
@@ -178,7 +179,7 @@ void main() {
     float v = fvel(id);
     v = sqrt(v) * 10;
 
-    vels[id] =
+    vels[id] = vec4(
         0.8f * fdir(id) * v +
         (
             depart() * 0.4f +
@@ -187,5 +188,5 @@ void main() {
             wind() * 0.1 + drag() * 0.01 +
             floating() * 0.3 +
             noise(id) * noiseStrength
-        );
+        ), 0.0);
 }

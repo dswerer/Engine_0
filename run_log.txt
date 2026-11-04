@@ -1,0 +1,54 @@
+﻿Device: NVIDIA GeForce RTX 5060 Laptop GPU (Vulkan 1.4)
+===== RenderGraph =====
+[Resources] count=4
+  #0 Color type=Image writer=GBuffer(#0) readers=[Blur(#1) ] crossFrame=false external=false desc=(RGBA16F 2D 1920x1080 depth=1 layers=1 mip=1 samples=1)
+  #1 Depth type=Image writer=GBuffer(#0) readers=[] crossFrame=false external=false desc=(D32F 2D 1920x1080 depth=1 layers=1 mip=1 samples=1)
+  #2 Blurred type=Image writer=Blur(#1) readers=[ToneMap(#2) ] crossFrame=false external=false desc=(RGBA16F 2D 1920x1080 depth=1 layers=1 mip=1 samples=1)
+  #3 Backbuffer type=Image writer=ToneMap(#2) readers=[] crossFrame=false external=false desc=(RGBA8 2D 1920x1080 depth=1 layers=1 mip=1 samples=1)
+[Passes] count=3
+  #0 GBuffer type=Render
+      reads =[]
+      writes=[Color(#0,ColorAttachment) Depth(#1,DepthStencilAttachment) ]
+      att  =[Color(#0 slot0,ColorAttachment,Clear/Store) Depth(#1 slot0,DepthStencilAttachment,Clear/Store) ]
+      bind =[]
+  #1 Blur type=Compute
+      reads =[Color(#0,SampledRead) ]
+      writes=[Blurred(#2,StorageWrite) ]
+  #2 ToneMap type=Render
+      reads =[Blurred(#2,SampledRead) ]
+      writes=[Backbuffer(#3,ColorAttachment) ]
+      att  =[Backbuffer(#3 slot0,ColorAttachment,Clear/Store) ]
+      bind =[set-.binding- Blurred(#2,SampledRead) ]
+[SubmitSequence] GBuffer(#0) -> Blur(#1) -> ToneMap(#2) -> END
+RenderGraph realize ok: 4 images, 2 pipelines
+Image ok: 1920x1080
+Buffer ok: 4096 bytes, mapped
+Swapchain ok: 1280x720
+Acquire #1: acquired=1 index=0 backbuffer=borrowed-ok
+Acquire #2 (resized): acquired=0 index=0
+Acquire #3: acquired=1 size=640x480
+Queues: graphics=f0 compute=f2(dedicated) transfer=f1(dedicated) timeline=yes
+Multi-queue ok: compute(f2) -> graphics(f0) via semaphore
+Timeline ok: host signal 1 -> graphics -> compute, gpu wait(2)=ok, final value=2, host wait(2)=ok
+Pipeline A ok: set0-bindings=1
+DescriptorSet A ok: sampled image
+Pipeline B ok: set0-bindings=1
+DescriptorSet B ok: uniform buffer
+Compute pipeline ok: set0-bindings=2
+Compute dispatch ok: 8x8 groups -> storage image
+Graph buffer ok: 1 realized
+Graph compute ok: 1 compute pass -> borrowed storage image
+Graph uniform binding ok: reflected UniformBuffer + descriptor write
+Graph render ok: direct-indexed + indirect-indexed draws
+GPU->Host readback ok: rgba8=13,13,20,255
+Texture upload ok: C:/Users/DSwer/source/repos/Engine_0/Engine_0/assets/skyview.jpg 900x403 ch=3 -> Host -> Transfer -> Sample (host verify) (2 batches, 1 sync points)
+Host image / ImageToImage / DispatchIndirect ok: WriteImage -> Blur(indirect 8x8) -> Blit(64->32) -> Copy -> ReadImage (2 batches)
+Alias group [AliasA,AliasB] ok (memory block #1)
+Alias shared handle: ok (2 batches)
+Engine_0.exe : Alias group [Small,Large] degraded: desc mismatch
+所在位置 行:15 字符: 1672
++ ... 0.exe -Recurse | Select-Object -First 1; & $exe.FullName 2>&1 | Tee-O ...
++                                              ~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (Alias group [Sm...: desc mismatch:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
