@@ -53,9 +53,18 @@ set(ENGINE_SHADER_SOURCES
 	"${CMAKE_CURRENT_SOURCE_DIR}/shaders/texture.frag"
 	"${CMAKE_CURRENT_SOURCE_DIR}/shaders/ubo.frag"
 	"${CMAKE_CURRENT_SOURCE_DIR}/shaders/solid.frag"
+	"${CMAKE_CURRENT_SOURCE_DIR}/shaders/static_texture.frag"
+	"${CMAKE_CURRENT_SOURCE_DIR}/shaders/dual_output.frag"
+	"${CMAKE_CURRENT_SOURCE_DIR}/shaders/mux_sample.frag"
+	"${CMAKE_CURRENT_SOURCE_DIR}/shaders/push_constant.frag"
 	"${CMAKE_CURRENT_SOURCE_DIR}/shaders/blur.comp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/shaders/mesh.vert"
-	"${CMAKE_CURRENT_SOURCE_DIR}/shaders/mesh.frag")
+	"${CMAKE_CURRENT_SOURCE_DIR}/shaders/mesh.frag"
+	"${CMAKE_CURRENT_SOURCE_DIR}/shaders/tess.vert"
+	"${CMAKE_CURRENT_SOURCE_DIR}/shaders/tess.tesc"
+	"${CMAKE_CURRENT_SOURCE_DIR}/shaders/tess.tese"
+	"${CMAKE_CURRENT_SOURCE_DIR}/shaders/tess.geom"
+	"${CMAKE_CURRENT_SOURCE_DIR}/shaders/tess.frag")
 
 if (Vulkan_GLSLC_EXECUTABLE)
 	set(ENGINE_GLSLC "${Vulkan_GLSLC_EXECUTABLE}")
@@ -83,5 +92,9 @@ if (ENGINE_GLSLC)
 else()
 	message(WARNING "未找到 glslc，跳过 shader 编译（管线冒烟将被跳过）")
 endif()
+
+# 示例：独立可执行目标
+add_subdirectory("examples/retrieve")
+add_subdirectory("examples/cube_reflection")
 
 # TODO: 如有需要，请添加测试并安装目标。

@@ -1,0 +1,102 @@
+#version 450
+
+layout(local_size_x = 4, local_size_y = 8, local_size_z = 1) in;
+
+layout(rgba16f, set = 0, binding = 11) uniform image2D TransmittanceLUT;
+
+layout(std140, set = 0, binding = 2) uniform AtmosphereParamsBlock {
+    float H_Rayleigh;
+    float H_Mie;
+    float g_Mie;
+    float PlanetRadius;
+    float AtmosphereRadius;
+    float H_Ozone;
+    float W_Ozone;
+    vec3 SunLuminance;
+    vec3 PlanetCenter;
+} AtmosphereParams;
+
+#define H_Rayleigh AtmosphereParams.H_Rayleigh
+#define H_Mie AtmosphereParams.H_Mie
+#define PlanetRadius AtmosphereParams.PlanetRadius
+#define AtmosphereRadius AtmosphereParams.AtmosphereRadius
+#define H_Ozone AtmosphereParams.H_Ozone
+#define W_Ozone AtmosphereParams.W_Ozone
+#define PlanetCenter AtmosphereParams.PlanetCenter
+
+vec3 RayleighCoeff(float h) {
+    const vec3 sigma0 = vec3(5.802, 13.558, 33.1) * 1e-6;
+    float rho_h = exp(-h / H_Rayleigh);
+    return sigma0 * rho_h;
+}
+
+vec3 MieCoeff(float h) {
+    const vec3 sigma0 = vec3(3.996) * 1e-6;
+    float rho_m = exp(-h / H_Mie);
+    return sigma0 * rho_m;
+}
+
+vec3 MieAbsorbtion_rgb(float h) {
+    const vec3 sigma0 = vec3(4.40) * 1e-6;
+    float rho_m = exp(-h / H_Mie);
+    return sigma0 * rho_m;
+}
+
+vec3 OzoneAbsorbtion_rgb(float h, float center, float width) {
+    const vec3 sigma0 = vec3(0.650, 1.881, 0.085) * 1e-5;
+    float rho_o = max(0., 1 - abs(h - center) / width);
+    return sigma0 * rho_o;
+}
+
+vec3 Transmittance(vec3 p1, vec3 p2) {
+    const int N_SAMPLE = 128;
+    float t = length(p2 - p1);
+    if (t < 1e-4) return vec3(1.0);
+    vec3 dir = (p2 - p1) / t;
+    float dt = t / float(N_SAMPLE);
+    vec3 sum = vec3(0.0);
+
+    vec3 p = p1 + (dir * dt) * 0.5;
+
+    for (int i = 0; i < N_SAMPLE; ++i) {
+        float h = length(p - PlanetCenter) - PlanetRadius;
+
+        vec3 scattering = RayleighCoeff(h) + MieCoeff(h);
+        vec3 absorption = MieAbsorbtion_rgb(h) + OzoneAbsorbtion_rgb(h, H_Ozone, W_Ozone);
+        vec3 extinction = scattering + absorption;
+
+        sum += extinction * dt;
+        p += dir * dt;
+    }
+    return exp(-sum);
+}
+
+vec2 uv2params(vec2 uv) {
+    float r = mix(PlanetRadius, AtmosphereRadius, uv.x);
+    float mu = mix(-1.0, 1.0, uv.y);
+    return vec2(r, mu);
+}
+
+void main() {
+    ivec2 size = imageSize(TransmittanceLUT);
+    if (gl_GlobalInvocationID.x >= uint(size.x) || gl_GlobalInvocationID.y >= uint(size.y))
+        return;
+
+    vec2 uv = vec2(gl_GlobalInvocationID.xy) / vec2(size);
+    vec2 params = uv2params(uv);
+    float r = params.x;
+    float mu = params.y;
+
+    float h = r - PlanetRadius;
+    vec3 p1 = vec3(0., h, 0.);
+
+    float sintheta = sqrt(max(0., 1. - mu * mu));
+    vec3 dir = vec3(sintheta, mu, 0.);
+
+    float r2 = r * r;
+    float disc = AtmosphereRadius * AtmosphereRadius - r2 * sintheta * sintheta;
+    float t = -r * mu + sqrt(max(disc, 0.));
+
+    vec3 p2 = p1 + dir * t;
+    imageStore(TransmittanceLUT, ivec2(gl_GlobalInvocationID.xy), vec4(Transmittance(p1, p2), 1.0));
+}

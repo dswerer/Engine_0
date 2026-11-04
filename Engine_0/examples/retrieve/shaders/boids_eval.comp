@@ -1,0 +1,191 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std140, set = 0, binding = 1) uniform BoidsParamsBlock {
+    int fishCount;
+    float time;
+    float noiseStrength;
+    float boundaryMargin;
+    vec4 boundsMin;
+    vec4 boundsMax;
+    float boundaryStrength;
+} BoidsParams;
+
+layout(std430, set = 0, binding = 9) buffer fishesBlock {
+    float data[7168];
+} fishes;
+
+layout(std430, set = 0, binding = 10) buffer outvelBlock {
+    vec3 vels[1024];
+} outvel;
+
+#define fishCount BoidsParams.fishCount
+#define time BoidsParams.time
+#define noiseStrength BoidsParams.noiseStrength
+#define boundaryMargin BoidsParams.boundaryMargin
+#define boundsMin BoidsParams.boundsMin
+#define boundsMax BoidsParams.boundsMax
+#define boundaryStrength BoidsParams.boundaryStrength
+#define data fishes.data
+#define vels outvel.vels
+
+vec3 fpos(int i) {
+    return vec3(data[i * 3], data[i * 3 + 1], data[i * 3 + 2]);
+}
+
+vec3 fdir(int i) {
+    int offset = fishCount * 3;
+    return vec3(data[i * 3 + offset], data[i * 3 + 1 + offset], data[i * 3 + 2 + offset]);
+}
+
+float fvel(int i) {
+    int offset = fishCount * 6;
+    return data[i + offset];
+}
+
+#define R_DEPART 4.f
+#define R_ALIGN 5.f
+#define R_COHESION 5.f
+
+vec3 mod289(vec3 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+vec4 mod289(vec4 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+vec4 permute(vec4 x) { return mod289(((x * 34.0) + 1.0) * x); }
+vec4 taylorInvSqrt(vec4 r) { return 1.79284291400159 - 0.85373472095314 * r; }
+
+float perlin3D(vec3 p) {
+    vec3 i0 = floor(p);
+    vec3 i1 = i0 + vec3(1.0);
+    vec3 f0 = p - i0;
+    vec3 f1 = f0 - vec3(1.0);
+    vec3 f = f0 * f0 * f0 * (f0 * (f0 * 6.0 - 15.0) + 10.0);
+
+    vec4 ix = vec4(i0.x, i1.x, i0.x, i1.x);
+    vec4 iy0 = vec4(i0.y, i0.y, i1.y, i1.y);
+    vec4 iy1 = vec4(i0.y, i0.y, i1.y, i1.y);
+    vec4 iz0 = vec4(i0.z, i0.z, i0.z, i0.z);
+    vec4 iz1 = vec4(i1.z, i1.z, i1.z, i1.z);
+
+    vec4 gx0 = ix + iy0;
+    vec4 gx1 = ix + iy1;
+    vec4 gz0 = iz0 * 0.5;
+    vec4 gz1 = iz1 * 0.5;
+
+    vec4 n0 = taylorInvSqrt(vec4(dot(gx0, gx0), dot(gx1, gx1), dot(gx0, gx0), dot(gx1, gx1)));
+    gx0 *= n0; gx1 *= n0;
+    n0 = taylorInvSqrt(vec4(dot(gx0, gx0), dot(gx1, gx1), dot(gx0, gx0), dot(gx1, gx1)));
+    vec4 nz0 = taylorInvSqrt(vec4(dot(gz0, gz0), dot(gz1, gz1), dot(gz0, gz0), dot(gz1, gz1)));
+    gz0 *= nz0; gz1 *= nz0;
+
+    vec4 g0 = permute(permute(ix + iy0) + iz0);
+    vec4 g1 = permute(permute(ix + iy1) + iz0);
+    vec4 g2 = permute(permute(ix + iy0) + iz1);
+    vec4 g3 = permute(permute(ix + iy1) + iz1);
+
+    vec4 n0_ = g0 * 0.5 + 0.5;
+    vec4 n1 = g1 * 0.5 + 0.5;
+    vec4 n2 = g2 * 0.5 + 0.5;
+    vec4 n3 = g3 * 0.5 + 0.5;
+
+    n0_ = n0_ * 2.0 - 1.0; n1 = n1 * 2.0 - 1.0;
+    n2 = n2 * 2.0 - 1.0; n3 = n3 * 2.0 - 1.0;
+
+    float nx0 = dot(n0_, vec4(f0.x, f0.y, f0.z, f0.x));
+    float nx1 = dot(n1, vec4(f1.x, f0.y, f0.z, f1.x));
+    float nx2 = dot(n2, vec4(f0.x, f1.y, f0.z, f0.x));
+    float nx3 = dot(n3, vec4(f1.x, f1.y, f0.z, f1.x));
+    float ny0 = dot(n0_, vec4(f0.x, f0.y, f1.z, f0.x));
+    float ny1 = dot(n1, vec4(f1.x, f0.y, f1.z, f1.x));
+    float ny2 = dot(n2, vec4(f0.x, f1.y, f1.z, f0.x));
+    float ny3 = dot(n3, vec4(f1.x, f1.y, f1.z, f1.x));
+
+    return mix(mix(mix(nx0, nx1, f.x), mix(nx2, nx3, f.x), f.y),
+               mix(mix(ny0, ny1, f.x), mix(ny2, ny3, f.x), f.y), f.z);
+}
+
+vec3 noise(int id) {
+    vec3 pos = fpos(id);
+    float n = perlin3D(pos * 0.3 + time * 0.3);
+    float n2 = perlin3D(pos * 0.3 + time * 0.3 + vec3(7.3, 3.1, 5.7));
+    float n3 = perlin3D(pos * 0.3 + time * 0.3 + vec3(1.7, 9.2, 4.5));
+    return vec3(n, n2, n3);
+}
+
+vec3 depart() {
+    vec3 pos = fpos(int(gl_GlobalInvocationID.x));
+    vec3 sum = vec3(0.f);
+    for (int i = 0; i < fishCount; ++i) {
+        if (i == int(gl_GlobalInvocationID.x)) continue;
+        vec3 other = fpos(i);
+        float decide = step(distance(pos, other), R_DEPART);
+        vec3 dis = pos - other;
+        float k = 1 / (dot(dis, dis) + 0.01);
+        sum += decide * k * dis;
+    }
+    return sum;
+}
+
+vec3 alignBoids() {
+    vec3 pos = fpos(int(gl_GlobalInvocationID.x));
+    vec3 vel = fdir(int(gl_GlobalInvocationID.x)) * fvel(int(gl_GlobalInvocationID.x));
+    vec3 sum = vec3(0.f);
+    int count = 0;
+    for (int i = 0; i < fishCount; ++i) {
+        if (i == int(gl_GlobalInvocationID.x)) continue;
+        float decide = step(distance(pos, fpos(i)), R_ALIGN);
+        vec3 vel2 = fdir(i) * fvel(i);
+        sum += vel2 * decide;
+        count += int(decide);
+    }
+    if (count > 0) sum /= float(count);
+    return sum - vel;
+}
+
+vec3 cohesion() {
+    vec3 pos = fpos(int(gl_GlobalInvocationID.x));
+    vec3 sum = vec3(0.f);
+    int count = 0;
+    for (int i = 0; i < fishCount; ++i) {
+        if (i == int(gl_GlobalInvocationID.x)) continue;
+        vec3 other = fpos(i);
+        float decide = step(distance(pos, other), R_COHESION);
+        sum += other * decide;
+        count += int(decide);
+    }
+    if (count > 0) return (sum / float(count)) - pos;
+    return vec3(0.f);
+}
+
+vec3 wind() {
+    vec3 pos = fpos(int(gl_GlobalInvocationID.x));
+    return vec3(-pos.z, 0., pos.x);
+}
+
+vec3 drag() {
+    vec3 pos = fpos(int(gl_GlobalInvocationID.x));
+    return vec3(-pos.x, -pos.y, -pos.z);
+}
+
+vec3 floating() {
+    vec3 pos = fpos(int(gl_GlobalInvocationID.x));
+    return vec3(0., 3. - pos.y, 0.);
+}
+
+void main() {
+    if (int(gl_GlobalInvocationID.x) >= fishCount) return;
+
+    int id = int(gl_GlobalInvocationID.x);
+    float v = fvel(id);
+    v = sqrt(v) * 10;
+
+    vels[id] =
+        0.8f * fdir(id) * v +
+        (
+            depart() * 0.4f +
+            alignBoids() +
+            cohesion() +
+            wind() * 0.1 + drag() * 0.01 +
+            floating() * 0.3 +
+            noise(id) * noiseStrength
+        );
+}

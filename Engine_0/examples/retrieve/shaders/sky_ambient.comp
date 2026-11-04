@@ -1,0 +1,221 @@
+#version 450
+
+layout(local_size_x = 4, local_size_y = 8, local_size_z = 1) in;
+
+layout(rgba16f, set = 0, binding = 13) uniform image2D SkyAmbientLUT;
+layout(set = 0, binding = 3) uniform sampler2D TransmittanceLUT;
+layout(set = 0, binding = 4) uniform sampler2D MultipleScatteringLUT;
+
+layout(std140, set = 0, binding = 2) uniform AtmosphereParamsBlock {
+    float H_Rayleigh;
+    float H_Mie;
+    float g_Mie;
+    float PlanetRadius;
+    float AtmosphereRadius;
+    float H_Ozone;
+    float W_Ozone;
+    vec3 SunLuminance;
+    vec3 PlanetCenter;
+} AtmosphereParams;
+
+#define H_Rayleigh AtmosphereParams.H_Rayleigh
+#define H_Mie AtmosphereParams.H_Mie
+#define PlanetRadius AtmosphereParams.PlanetRadius
+#define AtmosphereRadius AtmosphereParams.AtmosphereRadius
+#define H_Ozone AtmosphereParams.H_Ozone
+#define W_Ozone AtmosphereParams.W_Ozone
+#define PlanetCenter AtmosphereParams.PlanetCenter
+
+vec3 lightDir;
+
+#define PI 3.1415926
+#define RAYMARCH_STEP 16
+
+vec3 RayIntersectSphere(vec3 p, vec3 dir, vec3 center, float r) {
+    vec3 oc = center - p;
+    vec3 a = dot(oc, dir) * dir;
+    float dis_sq = dot(oc, oc) - dot(a, a);
+    if (dis_sq > r * r || (dot(oc, dir) < 0 && dot(oc, oc) > r * r)) return center;
+    float b = sqrt(r * r - dis_sq);
+
+    float delta = dot(oc, oc) - r * r;
+    delta = 1.0 - 2.0 * step(0.0, delta);
+
+    return p + a + b * dir * delta;
+}
+
+vec3 RayleighCoeff(float h) {
+    const vec3 sigma0 = vec3(5.802, 13.558, 33.1) * 1e-6;
+    float rho_h = exp(-h / H_Rayleigh);
+    return sigma0 * rho_h;
+}
+
+float RayleighPhase(float cos_theta) {
+    return (3.0 / (16.0 * PI)) * (1.0 + cos_theta * cos_theta);
+}
+
+vec3 MieCoeff(float h) {
+    const vec3 sigma0 = vec3(3.996) * 1e-6;
+    float rho_m = exp(-h / H_Mie);
+    return sigma0 * rho_m;
+}
+
+float MiePhase(float g, float cos_theta) {
+    float a = 3. / 8. / PI;
+    float b = (1 - g * g) * (1 + cos_theta * cos_theta);
+    float c = (2 + g * g) * pow((1 + g * g - 2 * g * cos_theta), 1.5);
+    return a * b / c;
+}
+
+vec3 Scattering_rgb(vec3 indir, vec3 p, vec3 outdir) {
+    float cos_theta = dot(indir, outdir);
+    float h = length(p - PlanetCenter) - PlanetRadius;
+    return RayleighCoeff(h) * RayleighPhase(cos_theta) +
+        MieCoeff(h) * MiePhase(.6, cos_theta);
+}
+
+vec3 MieAbsorbtion_rgb(float h) {
+    const vec3 sigma0 = vec3(4.40) * 1e-6;
+    float rho_m = exp(-h / H_Mie);
+    return sigma0 * rho_m;
+}
+
+vec3 OzoneAbsorbtion_rgb(float h, float center, float width) {
+    const vec3 sigma0 = vec3(0.650, 1.881, 0.085) * 1e-5;
+    float rho_o = max(0., 1 - abs(h - center) / width);
+    return sigma0 * rho_o;
+}
+
+vec2 param2uv(float r, float miu) {
+    r = clamp(r, PlanetRadius, AtmosphereRadius);
+    miu = clamp(miu, -1.0, 1.0);
+    float u = (r - PlanetRadius) / (AtmosphereRadius - PlanetRadius);
+    float v = (miu + 1.0) * 0.5;
+    return vec2(u, v);
+}
+
+vec3 Transmittance(vec3 p1, vec3 p2) {
+    vec3 diff = p2 - p1;
+    if (dot(diff, diff) < 1e-6) return vec3(1.0);
+
+    float r1 = length(p1 - PlanetCenter);
+    float r2 = length(p2 - PlanetCenter);
+
+    vec3 lower = (r1 <= r2) ? p1 : p2;
+    vec3 upper = (r1 <= r2) ? p2 : p1;
+    float rl = clamp(min(r1, r2), PlanetRadius, AtmosphereRadius);
+    float ru = clamp(max(r1, r2), PlanetRadius, AtmosphereRadius);
+
+    vec3 upd = upper - lower;
+    vec3 updir = upd / max(length(upd), 1e-6);
+
+    vec3 rad_l = lower - PlanetCenter;
+    vec3 rad_u = upper - PlanetCenter;
+    float len_l = length(rad_l);
+    float len_u = length(rad_u);
+    float mu_l = clamp(len_l > 1e-3 ? dot(rad_l / len_l, updir) : 1.0, -1.0, 1.0);
+    float mu_u = clamp(len_u > 1e-3 ? dot(rad_u / len_u, updir) : 1.0, -1.0, 1.0);
+
+    vec3 Tl = texture(TransmittanceLUT, param2uv(rl, mu_l)).xyz;
+    vec3 Tu = texture(TransmittanceLUT, param2uv(ru, mu_u)).xyz;
+
+    return Tl / max(Tu, vec3(1e-4));
+}
+
+vec3 intersectUV(vec3 pos, vec3 dir) {
+    vec3 a = RayIntersectSphere(pos, dir, PlanetCenter, AtmosphereRadius);
+    vec3 b = RayIntersectSphere(pos, dir, PlanetCenter, PlanetRadius);
+    vec3 c = b - PlanetCenter;
+    return dot(c, c) < 0.1 ? a : b;
+}
+
+vec3 theSun(vec3 dir, vec3 pos) {
+    vec3 col = vec3(1.);
+    col = col * (step(0.999, dot(dir, -lightDir)));
+    vec3 t = Transmittance(pos, RayIntersectSphere(pos, dir, PlanetCenter, AtmosphereRadius));
+    return col * t;
+}
+
+float height(vec3 pos) {
+    return length(pos - PlanetCenter) - PlanetRadius;
+}
+
+vec3 get_ms(vec3 pos) {
+    float r = length(pos - PlanetCenter);
+    vec3 radialDir = normalize(pos - PlanetCenter);
+    float miu = dot(normalize(-lightDir), radialDir);
+    return texture(MultipleScatteringLUT, param2uv(r, miu)).rgb;
+}
+
+vec3 RayMarch(vec3 pos, vec3 dir, vec3 sunLuminance) {
+    vec3 col = vec3(0.);
+    vec3 p1 = pos;
+
+    vec3 v_intersect = intersectUV(pos, dir);
+    vec3 b = v_intersect - PlanetCenter;
+    if (dot(b, b) < 0.1) return vec3(0.);
+
+    float dis = length(v_intersect - pos);
+    float ds = dis / float(RAYMARCH_STEP);
+
+    for (int i = 0; i < RAYMARCH_STEP; ++i) {
+        vec3 p2 = RayIntersectSphere(p1, -lightDir, PlanetCenter, AtmosphereRadius);
+
+        vec3 t1 = Transmittance(p2, p1);
+        vec3 s = Scattering_rgb(lightDir, p1, -dir);
+        vec3 t2 = Transmittance(p1, pos);
+
+        vec3 inScattering = t1 * s * t2 * ds * sunLuminance;
+
+        vec3 radialDir = normalize(p1 - PlanetCenter);
+        float muMS = dot(normalize(-lightDir), radialDir);
+        vec3 multiScattering = texture(MultipleScatteringLUT, param2uv(length(p1 - PlanetCenter), muMS)).xyz;
+        vec3 sigma = MieCoeff(height(p1)) + RayleighCoeff(height(p1));
+        col += multiScattering * t2 * sigma * ds;
+        col += inScattering;
+        p1 += dir * ds;
+    }
+
+    col += theSun(dir, pos);
+    return col;
+}
+
+#define PHI 0.61828
+vec3 fibonacciGrid(int n, int N) {
+    float z = 2.0 * float(n) / float(N - 1) - 1.0;
+    float l_xy = sqrt(max(0.0, 1.0 - z * z));
+    float x = l_xy * cos(2 * PI * n * PHI);
+    float y = l_xy * sin(2 * PI * n * PHI);
+    return vec3(x, y, z);
+}
+
+void main() {
+    ivec2 sz = imageSize(SkyAmbientLUT);
+    if (gl_GlobalInvocationID.x >= uint(sz.x) || gl_GlobalInvocationID.y >= uint(sz.y))
+        return;
+
+    vec2 size = vec2(sz);
+    vec2 uv = vec2(gl_GlobalInvocationID.xy) / size;
+    float r = mix(PlanetRadius, AtmosphereRadius, uv.x);
+    float miu = mix(-1.0, 1.0, uv.y);
+    vec3 sunDir = vec3(sqrt(max(0.0, 1.0 - miu * miu)), miu, 0.0);
+    lightDir = -sunDir;
+    vec3 pos = vec3(0.0, r - PlanetRadius, 0.0);
+
+    const int N_DIRECTION = 128;
+    vec3 acc = vec3(0.0);
+    int cnt = 0;
+    for (int i = 0; i < N_DIRECTION; ++i) {
+        vec3 dir = fibonacciGrid(i, N_DIRECTION);
+        if (dir.y <= 0.0) continue;
+        vec3 col = RayMarch(pos, dir, vec3(1.));
+        acc += col * dir.y;
+        cnt++;
+    }
+    vec3 irr = acc * (2.0 * PI / float(cnt));
+
+    if (any(isnan(irr)) || any(isinf(irr))) irr = vec3(0.0);
+    irr = max(irr, vec3(0.0));
+
+    imageStore(SkyAmbientLUT, ivec2(gl_GlobalInvocationID.xy), vec4(irr, 1.0));
+}

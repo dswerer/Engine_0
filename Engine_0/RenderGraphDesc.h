@@ -1,5 +1,5 @@
 #pragma once
-#include "rhi/RHIDesc.h"   // 复用 RHI 公共词表（ImageFormat/ImageViewType/LoadOp/StoreOp/ClearValue/ImageSubresource/kMaxColorAttachments）
+#include "rhi/RHIDesc.h"
 #include <string>
 #include <vector>
 #include <optional>
@@ -22,9 +22,14 @@ namespace dEngine {
 	using rhi::DepthStencilValue;
 	using rhi::ClearValue;
 	using rhi::ImageSubresource;
+	using rhi::ImageSubresourceRange;
+	using rhi::ImageViewDesc;
+	using rhi::SamplerDesc;
 	using rhi::kMaxColorAttachments;
 	using rhi::CompareOp;
 	using rhi::CullMode;
+	using rhi::ColorAttachmentState;
+	using rhi::DepthStencilState;
 	using rhi::BufferUsage;
 	using rhi::IndexType;
 	using rhi::PrimitiveTopology;
@@ -33,7 +38,7 @@ namespace dEngine {
 	using rhi::VertexAttribute;
 	using rhi::ShaderStageDesc;
 
-#pragma region ImageDesc // 图像描述
+#pragma region ImageDesc
 
 	struct ImageDesc {
 		uint32_t      width = 0;
@@ -44,34 +49,28 @@ namespace dEngine {
 		uint32_t      samples = 1;
 		ImageFormat   format = ImageFormat::None;
 		ImageViewType viewType = ImageViewType::Dim2D;
-		// 跨帧存活：图把帧首同步闭环成「上帧末次使用 -> 本帧首次使用」，
-		// 不再每帧从 initialLayout 重新起步（否则会丢弃上帧内容）；仅帧内资源保持 false
+		// 跨帧存活：帧首闭环上帧末次使用，仅帧内资源保持 false。
 		bool          crossFrame = false;
 	};
 
 #pragma endregion
 
-#pragma region BufferDesc // 缓冲描述
+#pragma region BufferDesc
 
-	// 图侧 Buffer 节点：创建位由描述显式给出。
-	// 图像能从 shader 绑定派生 usage，是因为 Usage 里已有采样/存储语义；
-	// 缓冲目前没有顶点/索引/统一缓冲的用法枚举，等 DrawBinding 落地后再改为按边派生
+	// 图侧 Buffer：创建位（usage）由描述显式给出。
 	struct BufferDesc {
 		uint64_t    size = 0;
 		BufferUsage usage = BufferUsage::None; // 显式创建位（Vertex/Index/Uniform/Storage/Transfer*）
 		bool        hostVisible = false;      // 决定 VMA 内存类型
-		// 跨帧存活：帧首按「上帧末次访问 -> 本帧首次访问」补内存依赖（无布局语义）
+		// 跨帧存活：帧首补内存依赖（无布局语义）。
 		bool        crossFrame = false;
 	};
 
 #pragma endregion
 
-#pragma region Common // 公共内容
+#pragma region Common
 
-	// 逐次访问的用途（非资源属性）。Buffer 的 shader 通道用 UniformRead / StorageRead / StorageWrite；
-	// 顶点/索引流是固定功能输入，也不进描述符布局，但其读语义仍需记录在拓扑读边里
-	// （VertexInputRead / IndexRead），供 barrier compiler 映射 VERTEX_INPUT / INDEX_READ。
-	// 注意与 RHI 的创建能力位 ImageUsage/BufferUsage 是正交的两根轴（后者在 rhi 命名空间）。
+	// 逐次访问用途（非资源属性），与 RHI 创建能力位是正交两条轴。
 	enum class Usage {
 		Auto,
 		ColorAttachment, DepthStencilAttachment, ResolveSrc, ResolveDst,
@@ -82,14 +81,19 @@ namespace dEngine {
 		TransferRead, TransferWrite,  // 拷贝通道：源读 / 目的写（Buffer 或 Image）
 		HostWrite,                    // Host 节点的 CPU 写（映射 HOST 阶段，仅 Buffer）
 		HostRead,                     // Host 节点的 CPU 读（映射 HOST 阶段 + HOST_READ，仅 Buffer）
-		PresentSrc                    // 呈现收尾（布局转 PresentSrc）
+		PresentSrc,                   // 呈现收尾（布局转 PresentSrc）
+		MuxPrepare,                   // mux 候选准备：仅做布局转到 ShaderReadOnly（无内存读写）
+		MuxSelect                     // mux 输出选择：虚拟写，不产生布局转换（状态继承准备布局）
 	};
 
-	// 依赖边的 use 记录：资源 × 用途（barrier compiler 的输入粒度）。
-	// usage 为渲染语义；Vulkan 侧 stage/access 由 compiler 按 usage 查表产出，不在此存储
+	// 依赖边的 use 记录：资源 × 用途，barrier compiler 的输入。
 	struct ResourceUse {
 		uint32_t resourceId = 0;
 		Usage    usage = Usage::Auto;
+		// 反射回填：该资源在这条边上的实际 shader 阶段并集（空 = 未知，barrier 取保守并集）
+		rhi::ShaderStageMask stages = rhi::ShaderStageMask::None;
+		// 可选：该边实际触达的子资源范围；未填时按节点 view / 操作语义推导
+		std::optional<rhi::ImageSubresourceRange> range;
 	};
 
 	struct ViewportDesc {
@@ -100,7 +104,7 @@ namespace dEngine {
 
 #pragma endregion
 
-#pragma region PassDesc // Pass 描述
+#pragma region PassDesc
 
 	// 附件绑定。resourceName 声明期用户填；resourceId 由 ProcessRegister 独占回填
 	struct AttachmentBinding {
@@ -111,10 +115,11 @@ namespace dEngine {
 		LoadOp                  load = LoadOp::DontCare;
 		StoreOp                 store = StoreOp::Store;
 		ClearValue              clear {};
+		// 可选：附件实际使用的子资源范围；空 = 节点 view
+		std::optional<rhi::ImageSubresourceRange> range;
 	};
 
-	// shader 资源绑定，与 AttachmentBinding 平级。
-	// 匹配约定：shader 变量名 == 图资源名——RHI 反射产出管线布局后，RealizePass 按名对账
+	// shader 资源绑定：变量名须与图资源名相同，Realize 时按名对账。
 	struct ShaderBinding {
 		std::string             resourceName;
 		std::optional<uint32_t> resourceId;
@@ -122,36 +127,36 @@ namespace dEngine {
 		// Buffer 专用：描述符的窗口（0 长度 = 整个 buffer）。图像绑定忽略这两个字段
 		uint64_t                offset = 0;
 		uint64_t                range = 0;
+		// 图像专用：自定义采样状态（空 = 设备默认采样器）；采样器按描述去重共享
+		std::optional<SamplerDesc> sampler;
 		// 反射回填（RealizePass 对账成功后写入；注册期不填）——与 resourceId 的两阶段模式同构
 		std::optional<uint32_t> set;
 		std::optional<uint32_t> binding;
+		// 反射回填：数组绑定的元素数（层展开的同步范围据此计算）
+		std::optional<uint32_t> arrayCount;
 	};
 
-	// 管线状态描述：shader 与固定功能状态，与附件布局（attachments/viewport）分离。
-	// 两类信息不在此处由用户填写：
-	//   附件格式签名（colorFormats/depthFormat）—— Realize 时由图从附件按 slot 推导；
-	//   描述符布局 —— 由 RHI 对 SPIR-V 反射得出，RealizePass 按「变量名 == 资源名」对账回填 set/binding
+	// 管线状态：shader 与固定功能；附件格式与描述符布局由引擎推导。
 	struct PipelineDesc {
 		std::vector<ShaderStageDesc> shaders; // 各阶段 SPIR-V 路径（离线 glslc 产出；组合合法性由 RHI 校验）
 
-		// 顶点输入布局（管线状态）：绑定/属性直接复用 RHI 的无后端词表版结构。
-		// 两向量均留空 = 缺省：按 Vertex 阶段反射派生单流交错布局（字段顺序须与 location 顺序一致）；
-		// shader 无用户输入时为空布局（gl_VertexIndex 路径）
+		// 顶点输入：两向量留空 = 按反射派生单流交错布局。
 		PrimitiveTopology topology = PrimitiveTopology::TriangleList;
+		// 细分管线：每个 patch 的控制点数；启用 Tess 阶段时 topology 须为 PatchList
+		uint32_t tessPatchControlPoints = 3;
 		std::vector<VertexInputBinding> vertexBindings;
 		std::vector<VertexAttribute>    vertexAttributes;
 
-		// 固定功能（与 RHI 最小集对齐；实际深度开关还受有无深度附件约束，无深度时 RHI 自动关闭）
-		bool      depthTestEnable  = true;
-		bool      depthWriteEnable = true;
-		bool      blendEnable      = false;      // 单附件统一，逐附件后置
-		CompareOp depthCompareOp   = CompareOp::Less;
-		CullMode  cullMode         = CullMode::Back;
+		// 固定功能（实际深度开关还受有无深度附件约束，无深度时 RHI 自动关闭）
+		CullMode  cullMode = CullMode::Back;
+		// 逐附件颜色状态：空 = 全默认（blend 关、写满 RGBA）
+		std::vector<ColorAttachmentState> colorStates;
+		DepthStencilState depthStencil {};
+		std::array<float, 4> blendConstants { 0.0f, 0.0f, 0.0f, 0.0f };
 		uint32_t  pushConstantSize = 0;          // 0=无；全部 stage 共享、offset 固定 0
 	};
 
-	// 顶点流：声明「用哪个 Buffer 资源、从哪个偏移开始」，序号即管线的 binding index。
-	// stride/属性格式属于布局，在 PipelineDesc 的 vertexBindings/vertexAttributes 里
+	// 顶点流：声明资源与起始偏移，序号即管线的 binding index。
 	struct VertexStreamBinding {
 		std::string             resourceName; // 须是图中注册的 Buffer 节点
 		std::optional<uint32_t> resourceId;   // ProcessRegister 回填
@@ -166,8 +171,7 @@ namespace dEngine {
 		IndexType               type = IndexType::UInt32;
 	};
 
-	// 绘制数量来源（执行参数，非声明）：注册期不写死，宿主每帧经 RenderPass::SetDraw 提供。
-	// Direct = 数值走 CPU；Indirect = 参数在 buffer 里（有索引流则走 indexed indirect）
+	// 绘制数量来源：执行参数，Direct 走 CPU，Indirect 从 buffer 读。
 	struct DrawSource {
 		enum Kind { Direct, Indirect };
 		Kind        kind = Direct;
@@ -179,6 +183,9 @@ namespace dEngine {
 		uint32_t    instanceCount = 1;
 	};
 
+	// 静态纹理堆容量：固定 set 0 / binding 0 的 sampler2D 数组长度（引擎级常量）
+	inline constexpr uint32_t kStaticTextureHeapCapacity = 16;
+
 	struct RenderPassDesc {
 		std::vector<AttachmentBinding> attachments;    // 顺序无语义，slot 显式
 		std::vector<ShaderBinding>     shaderBindings; // 与 attachments 平级
@@ -187,10 +194,13 @@ namespace dEngine {
 		std::optional<IndexStreamBinding> indexStream;
 		ViewportDesc                   viewport {};
 		PipelineDesc                   pipeline {};    // 管线状态（shader/blend/depth/cull/vertex layout）
+		// push constant 数据（字节）：非空时录制阶段按 pipeline.pushConstantSize 推送
+		std::vector<uint8_t>           pushConstantData;
+		// 绑定静态纹理堆到 set 0，动态资源从 set 1 起。
+		bool                           bindStaticHeap = false;
 	};
 
-	// 计算 Pass：单 compute shader + 工作组数；描述符布局同样由 SPIR-V 反射产出，
-	// shaderBindings 按「变量名 == 资源名」对账（与 RenderPassDesc 同约定）
+	// 计算 Pass：单 compute shader + 工作组数，绑定按名对账。
 	struct ComputePassDesc {
 		std::vector<ShaderBinding> shaderBindings;
 		ShaderStageDesc            shader;
@@ -198,32 +208,28 @@ namespace dEngine {
 		uint32_t                   groupCountX = 1;
 		uint32_t                   groupCountY = 1;
 		uint32_t                   groupCountZ = 1;
-		// 间接派发：indirectBuffer 非空时工作组数从该 Buffer 读取（忽略上面三个数值）。
-		// 参数 Buffer 须登记在本 pass 的读集（拓扑边 usage=IndirectRead），barrier 才会把它排到正确位置
+		// 间接派发：Buffer 须在本 pass 读集，工作组数取自它。
 		std::string                indirectBuffer;
 		std::optional<uint32_t>    indirectBufferId; // ProcessRegister 回填
 		uint64_t                   indirectOffset = 0;
+		// push constant 数据（字节）：非空时录制阶段按 pushConstantSize 推送
+		std::vector<uint8_t>       pushConstantData;
+		// 绑定静态纹理堆到 set 0（与 RenderPassDesc 同语义）
+		bool                       bindStaticHeap = false;
 	};
 
-	// Host Pass：纯 CPU 回调（解码/上传等宿主机工作），不录任何命令。
-	// 它经 RegisterPass 的 write 集声明「往哪个 Buffer 写」，拓扑边记为 HostWrite；
-	// 回调是执行参数，可在 Realize 后经 HostPass::SetCallback 覆盖 desc 中的声明。
-	// 回调参数是同步上下文：业务代码前 WaitForGpu()、业务代码后 SignalGpu()
+	// Host Pass：纯 CPU 回调（不录命令），写边记为 HostWrite。
 	struct HostPassDesc {
 		std::function<void(HostContext&)> callback;
 	};
 
-	// 传输 Pass：单次拷贝。方向决定两端资源类型：
-	//   BufferToImage：Buffer -> Image（上传；源读 TransferRead、目的写 TransferWrite）
-	//   ImageToBuffer：Image -> Buffer（回读；目的 Buffer 须 hostVisible + TransferDst）
-	//   BufferToBuffer：Buffer -> Buffer（中转/压实）
-	//   ImageToImage：Image -> Image（同格式；blit=false 为等尺寸拷贝，true 为可缩放 blit）
-	// 两端即拓扑边：source 进读边、dest 进写边；图像侧布局由 compiler 按 TransferRead/Write 推导
+	// 传输 Pass：单次拷贝，两端即拓扑读/写边，方向决定资源类型。
 	enum class TransferKind {
 		BufferToImage,
 		ImageToBuffer,
 		BufferToBuffer,
-		ImageToImage
+		ImageToImage,
+		ClearImage
 	};
 
 	struct TransferPassDesc {
@@ -232,27 +238,36 @@ namespace dEngine {
 		std::optional<uint32_t> sourceId; // ProcessRegister 回填
 		std::string             destName;
 		std::optional<uint32_t> destId;   // ProcessRegister 回填
-		// Buffer 侧窗口：0 表示整段。BufferToImage 用 srcOffset；ImageToBuffer 用 dstOffset；
-		// BufferToBuffer 两者都用；byteSize 仅 BufferToBuffer 使用（0 = 取两者较小值）
+		// Buffer 窗口：0 表示整段，byteSize 仅 BufferToBuffer 使用。
 		uint64_t                srcOffset = 0;
 		uint64_t                dstOffset = 0;
 		uint64_t                byteSize = 0;
 		// ImageToImage 专用：false = vkCmdCopyImage（尺寸须一致），true = vkCmdBlitImage（可缩放）
 		bool                    blit = false;
 		bool                    linearFilter = true; // blit 过滤：true=线性（需格式支持），false=最近邻
+		// 区域拷贝：为空时按旧的整图 mip0 全层语义
+		std::vector<rhi::BufferImageCopyRegion> bufferImageRegions;
+		std::vector<rhi::ImageCopyRegion>        imageRegions;
+		std::vector<rhi::ImageBlitRegion>        blitRegions;
+		// ClearImage 专用：清场范围与值
+		rhi::ImageSubresourceRange clearRange { {}, 0, 0 };
+		rhi::ClearValue            clearValue {};
 	};
 
-	// Present Pass：呈现收尾。读边声明 presentable image（映射为 Usage::PresentSrc），
-	// barrier compiler 据此产出 ColorAttachment -> PresentSrc 的布局转换；不录任何绘制命令。
-	// 交换链的 acquire 等待与渲染完成信号由 SubmitGraph 的 FrameSync 挂到本节点所在的批
+	// Mux Pass：零命令选择点，输出为 Borrow-later，按帧槽 retarget。
+	struct MuxPassDesc {
+		std::vector<std::string> alternatives; // 顺序即选择索引
+	};
+
+	// Present Pass：只做布局转换到 PresentSrc，不录绘制命令。
 	struct PresentPassDesc {
 	};
 
 #pragma endregion
 
-#pragma region DescAlias // 注册接口别名（Desc 变体）
+#pragma region DescAlias
 	using PassDesc = std::variant<std::monostate, RenderPassDesc, ComputePassDesc,
-		HostPassDesc, TransferPassDesc, PresentPassDesc>;
+		HostPassDesc, TransferPassDesc, MuxPassDesc, PresentPassDesc>;
 	using ResourceDesc = std::variant<std::monostate, ImageDesc, BufferDesc>;
 #pragma endregion
 }

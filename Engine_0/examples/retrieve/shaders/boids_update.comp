@@ -1,0 +1,83 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std140, set = 0, binding = 1) uniform BoidsParamsBlock {
+    int fishCount;
+    float time;
+    float noiseStrength;
+    float boundaryMargin;
+    vec4 boundsMin;
+    vec4 boundsMax;
+    float boundaryStrength;
+} BoidsParams;
+
+layout(std430, set = 0, binding = 9) buffer fishesBlock {
+    float data[7168];
+} fishes;
+
+layout(std430, set = 0, binding = 10) buffer outvelBlock {
+    vec3 vels[1024];
+} outvel;
+
+#define fishCount BoidsParams.fishCount
+#define time BoidsParams.time
+#define noiseStrength BoidsParams.noiseStrength
+#define boundaryMargin BoidsParams.boundaryMargin
+#define boundsMin BoidsParams.boundsMin
+#define boundsMax BoidsParams.boundsMax
+#define boundaryStrength BoidsParams.boundaryStrength
+#define data fishes.data
+#define vels outvel.vels
+
+vec3 fpos(int i) {
+    return vec3(data[i * 3], data[i * 3 + 1], data[i * 3 + 2]);
+}
+
+vec3 fdir(int i) {
+    int offset = fishCount * 3;
+    return vec3(data[i * 3 + offset], data[i * 3 + 1 + offset], data[i * 3 + 2 + offset]);
+}
+
+float fvel(int i) {
+    int offset = fishCount * 6;
+    return data[i + offset];
+}
+
+int dpos(int i) { return i * 3; }
+int ddir(int i) { return i * 3 + fishCount * 3; }
+int dvel(int i) { return i + fishCount * 6; }
+
+void main() {
+    int thisId = int(gl_GlobalInvocationID.x);
+    if (thisId >= fishCount) return;
+
+    vec3 pos = fpos(thisId);
+    vec3 vel = vels[thisId];
+    pos += vel * 0.001;
+
+    vec3 newVel = vel;
+    for (int c = 0; c < 3; ++c) {
+        if (pos[c] < boundsMin[c]) {
+            pos[c] = boundsMin[c];
+            newVel[c] = abs(newVel[c]);
+        }
+        if (pos[c] > boundsMax[c]) {
+            pos[c] = boundsMax[c];
+            newVel[c] = -abs(newVel[c]);
+        }
+    }
+
+    data[dpos(thisId)] = pos.x;
+    data[dpos(thisId) + 1] = pos.y;
+    data[dpos(thisId) + 2] = pos.z;
+
+    float len = length(newVel);
+    data[dvel(thisId)] = len;
+    if (len > 0.001) {
+        vec3 vdir = newVel / len;
+        data[ddir(thisId)] = vdir.x;
+        data[ddir(thisId) + 1] = vdir.y;
+        data[ddir(thisId) + 2] = vdir.z;
+    }
+}

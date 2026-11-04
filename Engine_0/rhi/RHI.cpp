@@ -3,13 +3,11 @@
 #include "../external/vk_mem_alloc.h"
 #include "../external/spv_reflect/spirv_reflect.h"
 
-// Win32 表面：vulkan_win32.h 依赖 windows.h 提供的 HWND / HINSTANCE
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
 #include <vulkan/vulkan_win32.h>
 
-// windows.h 把 CreateSemaphore 宏定义为 CreateSemaphoreA/W，与 RHI 的 Device::CreateSemaphore 同名冲突
 #undef CreateSemaphore
 
 #include <vector>
@@ -18,17 +16,12 @@
 #include <cstring>
 #include <algorithm>
 
-// RHI 实现落脚点。当前阶段已落地 Device 初始化（Instance / 表面 / 物理设备 / 逻辑设备 / VMA）、
-// 交换链（Swapchain）、视图（ImageView）与管线 / 描述符（Pipeline / Descriptor）；
-// 命令录制与提交留待后续阶段。
-
 using namespace dEngine::rhi;
 
 namespace {
 
 	constexpr const char* kValidationLayer = "VK_LAYER_KHRONOS_validation";
 
-	// 校验层是否可用（不可用则静默降级为无校验）
 	bool HasValidationLayer() {
 		uint32_t count = 0;
 		if (vkEnumerateInstanceLayerProperties(&count, nullptr) != VK_SUCCESS) return false;
@@ -42,16 +35,15 @@ namespace {
 
 	VKAPI_ATTR VkBool32 VKAPI_CALL DebugCallback(
 		VkDebugUtilsMessageSeverityFlagBitsEXT      severity,
-		VkDebugUtilsMessageTypeFlagsEXT             /*type*/,
+		VkDebugUtilsMessageTypeFlagsEXT              ,
 		const VkDebugUtilsMessengerCallbackDataEXT* data,
-		void*                                       /*userData*/) {
+		void*                                        ) {
 		const char* level = (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) ? "ERROR"
 			: (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) ? "WARN" : "INFO";
 		std::cerr << "[Vulkan " << level << "] " << data->pMessage << "\n";
 		return VK_FALSE;
 	}
 
-	// 设备是否支持交换链扩展（有 surface 时的必要条件）
 	bool SupportsSwapchain(VkPhysicalDevice pd) {
 		uint32_t count = 0;
 		vkEnumerateDeviceExtensionProperties(pd, nullptr, &count, nullptr);
@@ -63,9 +55,6 @@ namespace {
 		return false;
 	}
 
-	// 选择物理设备：必须支持图形队列；有 surface 时还需支持呈现与交换链扩展；优先独显
-	//需要注意的是：队列族的需求仅在这里显式出现。compute/transfer 挑专用族（不含 graphics 位），
-	// 无专用族时兜底 graphics 族（规范保证 GRAPHICS 必带 COMPUTE/TRANSFER 能力位，兜底恒有效）
 	VkPhysicalDevice PickPhysicalDevice(VkInstance instance, VkSurfaceKHR surface,
 		uint32_t& outGraphicsFamily, uint32_t& outPresentFamily,
 		uint32_t& outComputeFamily, uint32_t& outTransferFamily) {
@@ -94,7 +83,6 @@ namespace {
 			}
 			if (graphics == UINT32_MAX) continue;
 
-			// 专用 compute（不含 graphics 位）/ 专用 transfer（不含 graphics、compute 位）：各取首个命中族
 			uint32_t compute = UINT32_MAX, transfer = UINT32_MAX;
 			for (uint32_t i = 0; i < familyCount; ++i) {
 				const VkQueueFlags flags = families[i].queueFlags;
@@ -107,7 +95,6 @@ namespace {
 				}
 			}
 
-			// 呈现队列：优先与图形同族（复用同一队列）；否则另找支持呈现的队列族
 			uint32_t present = graphics;
 			if (surface != VK_NULL_HANDLE) {
 				VkBool32 support = VK_FALSE;
@@ -118,7 +105,7 @@ namespace {
 						vkGetPhysicalDeviceSurfaceSupportKHR(pd, i, surface, &support);
 						if (support) { present = i; break; }
 					}
-					if (present == UINT32_MAX) continue; // 无呈现队列，跳过该设备
+					if (present == UINT32_MAX) continue;
 				}
 			}
 
@@ -136,13 +123,11 @@ namespace {
 
 		outGraphicsFamily = bestGraphics;
 		outPresentFamily = bestPresent;
-		// 兜底：无专用族时回落 graphics（规范保证其必带 COMPUTE/TRANSFER 能力位）
 		outComputeFamily  = (bestCompute  != UINT32_MAX) ? bestCompute  : bestGraphics;
 		outTransferFamily = (bestTransfer != UINT32_MAX) ? bestTransfer : bestGraphics;
 		return best;
 	}
 
-	// ---- 描述层词表 -> Vulkan 枚举映射 ----
 	VkFormat ToVkFormat(ImageFormat format) {
 		switch (format) {
 			case ImageFormat::R8:         return VK_FORMAT_R8_UNORM;
@@ -164,8 +149,6 @@ namespace {
 		}
 	}
 
-	// Vulkan 枚举 -> 描述层词表反查（把 surface 选定格式回填到借用的 backbuffer 描述）
-	// 注意：描述层无 sRGB 变体，*_SRGB 与对应 UNORM 归一到同一 ImageFormat
 	ImageFormat FromVkFormat(VkFormat format) {
 		switch (format) {
 			case VK_FORMAT_R8_UNORM:                 return ImageFormat::R8;
@@ -222,7 +205,6 @@ namespace {
 		return flags;
 	}
 
-	// 描述层 view 类型 -> VkImageViewType（建视图用；与 ToVkImageType 的 VkImageType 是两套枚举）
 	VkImageViewType ToVkImageViewType(ImageViewType viewType) {
 		switch (viewType) {
 			case ImageViewType::Dim1D:      return VK_IMAGE_VIEW_TYPE_1D;
@@ -235,7 +217,50 @@ namespace {
 		}
 	}
 
-	// 真实 VkFormat -> 视图 aspect（深度/模版格式走 Depth/Stencil，其余走 Color）
+	VkFilter ToVkFilter(Filter filter) {
+		return filter == Filter::Nearest ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
+	}
+	VkSamplerMipmapMode ToVkSamplerMipmapMode(SamplerMipmapMode mode) {
+		return mode == SamplerMipmapMode::Nearest ? VK_SAMPLER_MIPMAP_MODE_NEAREST
+			: VK_SAMPLER_MIPMAP_MODE_LINEAR;
+	}
+	VkSamplerAddressMode ToVkAddressMode(SamplerAddressMode mode) {
+		switch (mode) {
+			case SamplerAddressMode::MirroredRepeat: return VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
+			case SamplerAddressMode::ClampToEdge:    return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+			case SamplerAddressMode::ClampToBorder:  return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+			default:                                 return VK_SAMPLER_ADDRESS_MODE_REPEAT;
+		}
+	}
+
+	ShaderStageMask ToStageMask(ShaderStage stage) {
+		switch (stage) {
+			case ShaderStage::Vertex:      return ShaderStageMask::Vertex;
+			case ShaderStage::Fragment:    return ShaderStageMask::Fragment;
+			case ShaderStage::TessControl: return ShaderStageMask::TessControl;
+			case ShaderStage::TessEval:    return ShaderStageMask::TessEval;
+			case ShaderStage::Geometry:    return ShaderStageMask::Geometry;
+			case ShaderStage::Compute:     return ShaderStageMask::Compute;
+			case ShaderStage::Task:        return ShaderStageMask::Task;
+			case ShaderStage::Mesh:        return ShaderStageMask::Mesh;
+			default:                       return ShaderStageMask::None;
+		}
+	}
+
+	VkShaderStageFlags ToVkStageMask(ShaderStageMask mask) {
+		VkShaderStageFlags flags = 0;
+		const uint32_t m = static_cast<uint32_t>(mask);
+		if (m & static_cast<uint32_t>(ShaderStageMask::Vertex))      flags |= VK_SHADER_STAGE_VERTEX_BIT;
+		if (m & static_cast<uint32_t>(ShaderStageMask::TessControl)) flags |= VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT;
+		if (m & static_cast<uint32_t>(ShaderStageMask::TessEval))    flags |= VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
+		if (m & static_cast<uint32_t>(ShaderStageMask::Geometry))    flags |= VK_SHADER_STAGE_GEOMETRY_BIT;
+		if (m & static_cast<uint32_t>(ShaderStageMask::Fragment))    flags |= VK_SHADER_STAGE_FRAGMENT_BIT;
+		if (m & static_cast<uint32_t>(ShaderStageMask::Task))        flags |= VK_SHADER_STAGE_TASK_BIT_EXT;
+		if (m & static_cast<uint32_t>(ShaderStageMask::Mesh))        flags |= VK_SHADER_STAGE_MESH_BIT_EXT;
+		if (m & static_cast<uint32_t>(ShaderStageMask::Compute))     flags |= VK_SHADER_STAGE_COMPUTE_BIT;
+		return flags;
+	}
+
 	VkImageAspectFlags ToVkAspect(VkFormat format) {
 		switch (format) {
 			case VK_FORMAT_D32_SFLOAT:           return VK_IMAGE_ASPECT_DEPTH_BIT;
@@ -246,7 +271,6 @@ namespace {
 		}
 	}
 
-	// 描述符资源类别 -> VkDescriptorType（SampledImage 走 combined image sampler，复用 RHI 默认采样器）
 	VkDescriptorType ToVkDescriptorType(ResourceType type) {
 		switch (type) {
 			case ResourceType::SampledImage:  return VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
@@ -280,7 +304,62 @@ namespace {
 		}
 	}
 
-	// 描述层布局 -> VkImageLayout
+	VkBlendFactor ToVkBlendFactor(BlendFactor f) {
+		switch (f) {
+			case BlendFactor::Zero:                 return VK_BLEND_FACTOR_ZERO;
+			case BlendFactor::One:                  return VK_BLEND_FACTOR_ONE;
+			case BlendFactor::SrcColor:             return VK_BLEND_FACTOR_SRC_COLOR;
+			case BlendFactor::OneMinusSrcColor:     return VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR;
+			case BlendFactor::DstColor:             return VK_BLEND_FACTOR_DST_COLOR;
+			case BlendFactor::OneMinusDstColor:     return VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR;
+			case BlendFactor::SrcAlpha:             return VK_BLEND_FACTOR_SRC_ALPHA;
+			case BlendFactor::OneMinusSrcAlpha:     return VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+			case BlendFactor::DstAlpha:             return VK_BLEND_FACTOR_DST_ALPHA;
+			case BlendFactor::OneMinusDstAlpha:     return VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA;
+			case BlendFactor::ConstantColor:        return VK_BLEND_FACTOR_CONSTANT_COLOR;
+			case BlendFactor::OneMinusConstantColor:return VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR;
+			case BlendFactor::ConstantAlpha:        return VK_BLEND_FACTOR_CONSTANT_ALPHA;
+			case BlendFactor::OneMinusConstantAlpha:return VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA;
+			case BlendFactor::SrcAlphaSaturate:     return VK_BLEND_FACTOR_SRC_ALPHA_SATURATE;
+			default:                                return VK_BLEND_FACTOR_ONE;
+		}
+	}
+
+	VkBlendOp ToVkBlendOp(BlendOp op) {
+		switch (op) {
+			case BlendOp::Add:             return VK_BLEND_OP_ADD;
+			case BlendOp::Subtract:        return VK_BLEND_OP_SUBTRACT;
+			case BlendOp::ReverseSubtract: return VK_BLEND_OP_REVERSE_SUBTRACT;
+			case BlendOp::Min:             return VK_BLEND_OP_MIN;
+			case BlendOp::Max:             return VK_BLEND_OP_MAX;
+			default:                       return VK_BLEND_OP_ADD;
+		}
+	}
+
+	VkColorComponentFlags ToVkColorWriteMask(ColorWriteMask mask) {
+		const uint8_t m = static_cast<uint8_t>(mask);
+		VkColorComponentFlags flags = 0;
+		if (m & static_cast<uint8_t>(ColorWriteMask::R)) flags |= VK_COLOR_COMPONENT_R_BIT;
+		if (m & static_cast<uint8_t>(ColorWriteMask::G)) flags |= VK_COLOR_COMPONENT_G_BIT;
+		if (m & static_cast<uint8_t>(ColorWriteMask::B)) flags |= VK_COLOR_COMPONENT_B_BIT;
+		if (m & static_cast<uint8_t>(ColorWriteMask::A)) flags |= VK_COLOR_COMPONENT_A_BIT;
+		return flags;
+	}
+
+	VkStencilOp ToVkStencilOp(StencilOp op) {
+		switch (op) {
+			case StencilOp::Keep:       return VK_STENCIL_OP_KEEP;
+			case StencilOp::Zero:       return VK_STENCIL_OP_ZERO;
+			case StencilOp::Replace:    return VK_STENCIL_OP_REPLACE;
+			case StencilOp::IncrClamp:  return VK_STENCIL_OP_INCREMENT_AND_CLAMP;
+			case StencilOp::DecrClamp:  return VK_STENCIL_OP_DECREMENT_AND_CLAMP;
+			case StencilOp::Invert:     return VK_STENCIL_OP_INVERT;
+			case StencilOp::IncrWrap:   return VK_STENCIL_OP_INCREMENT_AND_WRAP;
+			case StencilOp::DecrWrap:   return VK_STENCIL_OP_DECREMENT_AND_WRAP;
+			default:                    return VK_STENCIL_OP_KEEP;
+		}
+	}
+
 	VkImageLayout ToVkImageLayout(ImageLayout layout) {
 		switch (layout) {
 			case ImageLayout::General:                return VK_IMAGE_LAYOUT_GENERAL;
@@ -295,25 +374,24 @@ namespace {
 		}
 	}
 
-	// PipelineStage -> VkPipelineStageFlags2（TopOfPipe/BottomOfPipe 在 sync2 中废弃，折到 None）
 	VkPipelineStageFlags2 ToVkPipelineStage(PipelineStage stage) {
-		switch (stage) {
-			case PipelineStage::VertexShader:       return VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT;
-			case PipelineStage::FragmentShader:     return VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-			case PipelineStage::EarlyFragmentTests: return VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT;
-			case PipelineStage::LateFragmentTests:  return VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
-			case PipelineStage::ColorAttachmentOut: return VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-			case PipelineStage::ComputeShader:      return VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-			case PipelineStage::Transfer:           return VK_PIPELINE_STAGE_2_TRANSFER_BIT;
-			case PipelineStage::AllCommands:        return VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-			case PipelineStage::Host:               return VK_PIPELINE_STAGE_2_HOST_BIT;
-			case PipelineStage::VertexInput:        return VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT;
-			case PipelineStage::DrawIndirect:       return VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT;
-			case PipelineStage::TopOfPipe:
-			case PipelineStage::BottomOfPipe:
-			case PipelineStage::None:
-			default:                                return VK_PIPELINE_STAGE_2_NONE;
-		}
+		const uint64_t s = static_cast<uint64_t>(stage);
+		VkPipelineStageFlags2 flags = 0;
+		if (s & static_cast<uint64_t>(PipelineStage::VertexShader))       flags |= VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT;
+		if (s & static_cast<uint64_t>(PipelineStage::TessControlShader))  flags |= VK_PIPELINE_STAGE_2_TESSELLATION_CONTROL_SHADER_BIT;
+		if (s & static_cast<uint64_t>(PipelineStage::TessEvalShader))     flags |= VK_PIPELINE_STAGE_2_TESSELLATION_EVALUATION_SHADER_BIT;
+		if (s & static_cast<uint64_t>(PipelineStage::GeometryShader))     flags |= VK_PIPELINE_STAGE_2_GEOMETRY_SHADER_BIT;
+		if (s & static_cast<uint64_t>(PipelineStage::FragmentShader))     flags |= VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+		if (s & static_cast<uint64_t>(PipelineStage::EarlyFragmentTests)) flags |= VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT;
+		if (s & static_cast<uint64_t>(PipelineStage::LateFragmentTests))  flags |= VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+		if (s & static_cast<uint64_t>(PipelineStage::ColorAttachmentOut)) flags |= VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+		if (s & static_cast<uint64_t>(PipelineStage::ComputeShader))      flags |= VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+		if (s & static_cast<uint64_t>(PipelineStage::Transfer))           flags |= VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+		if (s & static_cast<uint64_t>(PipelineStage::AllCommands))        flags |= VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+		if (s & static_cast<uint64_t>(PipelineStage::Host))               flags |= VK_PIPELINE_STAGE_2_HOST_BIT;
+		if (s & static_cast<uint64_t>(PipelineStage::VertexInput))        flags |= VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT;
+		if (s & static_cast<uint64_t>(PipelineStage::DrawIndirect))       flags |= VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT;
+		return flags;
 	}
 
 	VkAccessFlags2 ToVkAccess(Access access) {
@@ -350,7 +428,6 @@ namespace {
 		return op == StoreOp::Store ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
 	}
 
-	// ClearValue variant -> VkClearValue（颜色走 color 分量，深度模版走 depthStencil 分量）
 	VkClearValue ToVkClearValue(const ClearValue& value) {
 		VkClearValue out{};
 		if (const auto* color = std::get_if<std::array<float, 4>>(&value.value)) {
@@ -361,7 +438,6 @@ namespace {
 		return out;
 	}
 
-	// 读取 SPIR-V 二进制；打不开或长度非 4 的倍数时返回空（Vulkan 要求 codeSize 为 4 的倍数）
 	std::vector<uint32_t> ReadSpirv(const std::string& path) {
 		std::ifstream file(path, std::ios::binary | std::ios::ate);
 		if (!file) return {};
@@ -373,8 +449,6 @@ namespace {
 		return code;
 	}
 
-	// ShaderStage -> Vulkan stage 位。Task/Mesh 位的存在不等于设备已启用相应扩展——
-	// 当前版本在 CreatePipeline 入口对未支持的阶段明确拒绝
 	VkShaderStageFlagBits ToVkStage(ShaderStage stage) {
 		switch (stage) {
 			case ShaderStage::Vertex:      return VK_SHADER_STAGE_VERTEX_BIT;
@@ -389,13 +463,13 @@ namespace {
 		}
 	}
 
-	// 图元拓扑与顶点属性格式 -> Vulkan（第一版最小集）
 	VkPrimitiveTopology ToVkTopology(PrimitiveTopology t) {
 		switch (t) {
 			case PrimitiveTopology::PointList:     return VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
 			case PrimitiveTopology::LineList:      return VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
 			case PrimitiveTopology::LineStrip:     return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
 			case PrimitiveTopology::TriangleStrip: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+			case PrimitiveTopology::PatchList:     return VK_PRIMITIVE_TOPOLOGY_PATCH_LIST;
 			default:                               return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
 		}
 	}
@@ -424,8 +498,6 @@ namespace {
 		}
 	}
 
-	// 图形管线着色器阶段组合校验：至少一个阶段、无重复；
-	// Vertex 与 Task/Mesh 互斥（顶点来源二选一）；Task 须伴随 Mesh；TessControl/TessEval 成对
 	bool ValidateStageCombination(const std::vector<ShaderStageDesc>& shaders) {
 		if (shaders.empty()) {
 			std::cerr << "[RHI] 管线须至少声明一个着色器阶段\n";
@@ -464,12 +536,13 @@ namespace {
 			std::cerr << "[RHI] TessControl/TessEval 须成对出现\n";
 			return false;
 		}
+		if ((hasTC || hasTE) && (hasMesh || hasTask)) {
+			std::cerr << "[RHI] Tessellation 与 Task/Mesh 不能同时使用\n";
+			return false;
+		}
 		return true;
 	}
 
-	// SpvReflectDescriptorType -> ResourceType（描述层词表）。
-	// 分离式 SAMPLED_IMAGE / SAMPLER、texel buffer、dynamic buffer、input attachment
-	// 等当前词表未覆盖，遇到即报暂不支持
 	bool ToResourceType(SpvReflectDescriptorType t, ResourceType& out) {
 		switch (t) {
 			case SPV_REFLECT_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER: out = ResourceType::SampledImage;   return true;
@@ -480,7 +553,6 @@ namespace {
 		}
 	}
 
-	// SpvReflectFormat -> 顶点属性格式（仅 float 1~4 分量；整型/双精度等暂不支持）
 	bool ToVertexFormat(SpvReflectFormat f, VertexFormat& out, uint32_t& byteSize) {
 		switch (f) {
 			case SPV_REFLECT_FORMAT_R32_SFLOAT:          out = VertexFormat::Float;  byteSize = 4;  return true;
@@ -491,8 +563,6 @@ namespace {
 		}
 	}
 
-	// SPIR-V 反射：枚举本 stage 的全部描述符绑定（顶层变量名/set/binding/类型/数组长度）。
-	// 描述符布局的唯一事实来源——CreatePipeline 不再接受手工 bindings 声明
 	bool ReflectDescriptorBindings(const std::vector<uint32_t>& code, const char* stageLabel,
 		std::vector<DescriptorBinding>& out) {
 		SpvReflectShaderModule module{};
@@ -521,19 +591,20 @@ namespace {
 			DescriptorBinding db;
 			db.set = b->set;
 			db.binding = b->binding;
-			// 无名描述符变量（SPIR-V 中缺 OpName）：图层按「变量名 == 资源名」对账，
-			// 无名即无法定位，在此 fail-fast；否则会兜底成 ShaderVariableUnbound，误导排查方向
 			if (b->name == nullptr || b->name[0] == '\0') {
+				const char* blockName = (b->type_description != nullptr
+					&& b->type_description->type_name != nullptr)
+					? b->type_description->type_name : "?";
 				std::cerr << "[RHI] " << stageLabel << " 反射到无名的描述符变量: set" << db.set
-					<< " binding" << db.binding << "（顶层变量须具名）\n";
+					<< " binding" << db.binding << "（block=\"" << blockName
+					<< "\" 缺少实例名；请写成 uniform " << blockName
+					<< " { ... } instance;，并让图资源名等于 instance）\n";
 				spvReflectDestroyShaderModule(&module);
 				return false;
 			}
 			db.name = b->name;
-			// 运行时长度数组（OpTypeRuntimeArray）：spv_reflect 把该维记为
-			// SPV_REFLECT_ARRAY_DIM_RUNTIME(=0)，逐维乘下来 count 归零。此时布局的
-			// descriptorCount 无法从 shader 得知，若靠 max(1u, count) 兜底会被静默当成标量，
-			// 造成「布局只给 1 个元素、shader 却按变长索引」的越界——此处显式拒绝
+			db.nonWritable =
+				(b->decoration_flags & SPV_REFLECT_DECORATION_NON_WRITABLE) != 0;
 			bool runtimeArray = false;
 			for (uint32_t d = 0; d < b->array.dims_count; ++d) {
 				if (b->array.dims[d] == SPV_REFLECT_ARRAY_DIM_RUNTIME) {
@@ -561,9 +632,6 @@ namespace {
 		return true;
 	}
 
-	// 顶点输入布局的缺省派生：Vertex 阶段的非 builtin 输入按 location 升序 →
-	// 单流（binding 0）、交错排布（offset 顺序累加，stride = 总字节数）。
-	// 矩阵/数组/非 float 格式显式拒绝（自动布局表达不了），避免静默错位
 	bool DeriveVertexLayout(const std::vector<uint32_t>& code,
 		std::vector<VkVertexInputBindingDescription>& outBindings,
 		std::vector<VkVertexInputAttributeDescription>& outAttributes)
@@ -595,7 +663,6 @@ namespace {
 			}
 		}
 
-		// location 升序 = 交错顺序：顶点结构体字段顺序须与 layout(location) 顺序一致
 		std::sort(vars.begin(), vars.end(),
 			[](const SpvReflectInterfaceVariable* a, const SpvReflectInterfaceVariable* b) {
 				return a->location < b->location;
@@ -603,7 +670,7 @@ namespace {
 
 		uint32_t stride = 0;
 		for (const auto* v : vars) {
-			if (v->built_in >= 0) continue; // gl_VertexIndex 等内建变量不是顶点属性
+			if (v->built_in >= 0) continue;
 			if (v->array.dims_count > 0
 				|| (v->type_description && (v->type_description->type_flags & SPV_REFLECT_TYPE_FLAG_MATRIX)))
 				return fail("顶点输入为矩阵/数组: ", v);
@@ -622,7 +689,7 @@ namespace {
 
 		spvReflectDestroyShaderModule(&module);
 		if (outAttributes.empty())
-			return true; // shader 无用户输入：保持无顶点缓冲（gl_VertexIndex 路径）
+			return true;
 		VkVertexInputBindingDescription binding{};
 		binding.binding = 0;
 		binding.stride = stride;
@@ -631,15 +698,11 @@ namespace {
 		return true;
 	}
 
-	// 一份 stage 与其编译产物（一读两用：反射 + vkCreateShaderModule）
 	struct StageCode {
 		ShaderStage stage;
 		const std::vector<uint32_t>* code;
 	};
 
-	// 反射 + 合并：逐 stage 反射描述符绑定，按 (set,binding) 合并成带 stageFlags 的槽位记录。
-	// 撞槽的共用槽位须同名同类型同长度（Vulkan 布局兼容性 + 「变量名==资源名」对账约定），
-	// stageFlags 按槽位取并集。图形（N stage）与计算（1 stage）共用同一合并规则
 	bool ReflectAndMergeBindings(const std::vector<StageCode>& stages,
 		std::vector<MergedDescriptor>& outSlots,
 		VkShaderStageFlags& outAllStages)
@@ -652,9 +715,11 @@ namespace {
 			if (!ReflectDescriptorBindings(*sc.code, ShaderStageName(sc.stage), stageBindings))
 				return false;
 			const VkShaderStageFlags stageFlag = ToVkStage(sc.stage);
-			outAllStages |= stageFlag; // 供 push constant 的 stage 集合使用
+			outAllStages |= stageFlag;
+			const ShaderStageMask stageMask = ToStageMask(sc.stage);
 
 			for (auto& b : stageBindings) {
+				b.stages = b.stages | stageMask;
 				bool slotFound = false;
 				for (auto& slot : outSlots) {
 					if (slot.binding.set == b.set && slot.binding.binding == b.binding) {
@@ -664,7 +729,9 @@ namespace {
 								<< " binding" << b.binding << "（" << slot.binding.name << " vs " << b.name << "）\n";
 							return false;
 						}
-						slot.stages |= stageFlag; // 共用槽位：stageFlags 取并集
+						slot.stages |= stageFlag;
+						slot.binding.stages = slot.binding.stages | b.stages;
+						slot.binding.nonWritable = slot.binding.nonWritable && b.nonWritable;
 						slotFound = true;
 						break;
 					}
@@ -676,18 +743,14 @@ namespace {
 		return true;
 	}
 
-} // namespace
+}
 
-//创建设备（instance/physical device/logical device/queue family）
 std::unique_ptr<Device> Device::Create(const DeviceDesc& desc)
 {
 	auto device = std::make_unique<Device>();
-	// nativeWindowHandle 非空时启用表面 + 交换链路径；为空则纯离屏（无 surface / swapchain）
 
-	// ---- 校验层（不可用则降级为无校验）----
 	const bool validation = desc.enableValidation && HasValidationLayer();
 
-	// ---- VkInstance ----
 	VkApplicationInfo app{};
 	app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
 	app.pApplicationName = "Engine_0";
@@ -702,7 +765,6 @@ std::unique_ptr<Device> Device::Create(const DeviceDesc& desc)
 		layers.push_back(kValidationLayer);
 		extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
 	}
-	// 有窗口句柄时启用表面扩展（Win32 平台固定可用）
 	if (desc.nativeWindowHandle) {
 		extensions.push_back(VK_KHR_SURFACE_EXTENSION_NAME);
 		extensions.push_back(VK_KHR_WIN32_SURFACE_EXTENSION_NAME);
@@ -721,7 +783,6 @@ std::unique_ptr<Device> Device::Create(const DeviceDesc& desc)
 		return nullptr;
 	}
 
-	// ---- 调试信使（仅在开启校验时）----
 	if (validation) {
 		VkDebugUtilsMessengerCreateInfoEXT messengerCI{};
 		messengerCI.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT;
@@ -739,7 +800,6 @@ std::unique_ptr<Device> Device::Create(const DeviceDesc& desc)
 		}
 	}
 
-	// ---- 表面（仅窗口路径创建；离屏/测试路径跳过）----
 	if (desc.nativeWindowHandle) {
 		VkWin32SurfaceCreateInfoKHR surfaceCI{};
 		surfaceCI.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR;
@@ -753,7 +813,6 @@ std::unique_ptr<Device> Device::Create(const DeviceDesc& desc)
 		device->m_windowHeight = desc.height;
 	}
 
-	// ---- 物理设备（须支持图形队列；有表面时还须支持呈现与交换链扩展）----
 	device->m_physicalDevice = PickPhysicalDevice(device->m_instance, device->m_surface,
 		device->m_graphicsQueueFamily, device->m_presentQueueFamily,
 		device->m_computeQueueFamily, device->m_transferQueueFamily);
@@ -767,7 +826,6 @@ std::unique_ptr<Device> Device::Create(const DeviceDesc& desc)
 	device->m_deviceName = props.deviceName;
 	device->m_apiVersion = props.apiVersion;
 
-	// ---- 时间戳能力（性能诊断）：三类队列族都须 timestampValidBits > 0，跨队列比较还要求 ----
 	{
 		uint32_t familyCount = 0;
 		vkGetPhysicalDeviceQueueFamilyProperties(device->m_physicalDevice, &familyCount, nullptr);
@@ -786,14 +844,13 @@ std::unique_ptr<Device> Device::Create(const DeviceDesc& desc)
 		device->m_timestampPeriod = props.limits.timestampPeriod;
 	}
 
-	// ---- 逻辑设备 + 队列（图形必选；呈现/compute/transfer 族去重后各建一条）（1.3 核心：dynamic rendering + synchronization2）----
 	std::vector<uint32_t> families;
 	auto pushFamily = [&families](uint32_t f) {
 		for (uint32_t existing : families) if (existing == f) return;
 		families.push_back(f);
 	};
 	pushFamily(device->m_graphicsQueueFamily);
-	pushFamily(device->m_computeQueueFamily);   // 兜底时与 graphics 同族，去重后跳过
+	pushFamily(device->m_computeQueueFamily);
 	pushFamily(device->m_transferQueueFamily);
 	if (device->m_presentQueueFamily != device->m_graphicsQueueFamily) {
 		pushFamily(device->m_presentQueueFamily);
@@ -820,7 +877,6 @@ std::unique_ptr<Device> Device::Create(const DeviceDesc& desc)
 	features13.dynamicRendering = VK_TRUE;
 	features13.synchronization2 = VK_TRUE;
 
-	// timeline semaphore（Vulkan 1.2）：先查支持再启用；不支持时 CreateTimelineSemaphore 返回空
 	VkPhysicalDeviceVulkan12Features supported12{};
 	supported12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
 	VkPhysicalDeviceFeatures2 supportedFeatures{};
@@ -828,15 +884,46 @@ std::unique_ptr<Device> Device::Create(const DeviceDesc& desc)
 	supportedFeatures.pNext = &supported12;
 	vkGetPhysicalDeviceFeatures2(device->m_physicalDevice, &supportedFeatures);
 	device->m_timelineSupported = supported12.timelineSemaphore == VK_TRUE;
+	device->m_bindlessSupported = supported12.descriptorIndexing == VK_TRUE
+		&& supported12.descriptorBindingPartiallyBound == VK_TRUE
+		&& supportedFeatures.features.shaderSampledImageArrayDynamicIndexing == VK_TRUE;
+	device->m_depthBoundsSupported = supportedFeatures.features.depthBounds == VK_TRUE;
+	device->m_independentBlendSupported = supportedFeatures.features.independentBlend == VK_TRUE;
+	device->m_tessellationSupported = supportedFeatures.features.tessellationShader == VK_TRUE;
+	device->m_geometrySupported = supportedFeatures.features.geometryShader == VK_TRUE;
+	device->m_vertexPipelineStoresAndAtomics =
+		supportedFeatures.features.vertexPipelineStoresAndAtomics == VK_TRUE;
+
+	VkPhysicalDeviceProperties physProps{};
+	vkGetPhysicalDeviceProperties(device->m_physicalDevice, &physProps);
+	device->m_maxSamplerAnisotropy = physProps.limits.maxSamplerAnisotropy > 0.0f
+		? physProps.limits.maxSamplerAnisotropy : 1.0f;
+	device->m_maxTessellationPatchSize = physProps.limits.maxTessellationPatchSize > 0
+		? physProps.limits.maxTessellationPatchSize : 1u;
 
 	VkPhysicalDeviceVulkan12Features features12{};
 	features12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
 	features12.timelineSemaphore = supported12.timelineSemaphore;
+	if (device->m_bindlessSupported) {
+		features12.descriptorIndexing = supported12.descriptorIndexing;
+		features12.descriptorBindingPartiallyBound = supported12.descriptorBindingPartiallyBound;
+		features12.shaderSampledImageArrayNonUniformIndexing =
+			supported12.shaderSampledImageArrayNonUniformIndexing;
+	}
 	features12.pNext = &features13;
 
 	VkPhysicalDeviceFeatures2 features2{};
 	features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
 	features2.pNext = &features12;
+	features2.features.samplerAnisotropy = supportedFeatures.features.samplerAnisotropy;
+	features2.features.independentBlend = supportedFeatures.features.independentBlend;
+	features2.features.depthBounds = supportedFeatures.features.depthBounds;
+	features2.features.tessellationShader = device->m_tessellationSupported ? VK_TRUE : VK_FALSE;
+	features2.features.geometryShader = device->m_geometrySupported ? VK_TRUE : VK_FALSE;
+	features2.features.vertexPipelineStoresAndAtomics =
+		device->m_vertexPipelineStoresAndAtomics ? VK_TRUE : VK_FALSE;
+	if (device->m_bindlessSupported)
+		features2.features.shaderSampledImageArrayDynamicIndexing = VK_TRUE;
 
 	VkDeviceCreateInfo deviceCI{};
 	deviceCI.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
@@ -851,19 +938,15 @@ std::unique_ptr<Device> Device::Create(const DeviceDesc& desc)
 		return nullptr;
 	}
 	vkGetDeviceQueue(device->m_device, device->m_graphicsQueueFamily, 0, &device->m_graphicsQueue);
-	// 呈现与图形同族时取到的是同一队列句柄
 	vkGetDeviceQueue(device->m_device, device->m_presentQueueFamily, 0, &device->m_presentQueue);
-	// compute/transfer 兜底与图形同族时同样取到同一队列句柄
 	vkGetDeviceQueue(device->m_device, device->m_computeQueueFamily, 0, &device->m_computeQueue);
 	vkGetDeviceQueue(device->m_device, device->m_transferQueueFamily, 0, &device->m_transferQueue);
 
-	// ---- 每队列一条 GPU timeline（GPU→Host 的等待端点）；值由 Submit 单调分配 ----
 	if (device->m_timelineSupported) {
 		for (uint32_t i = 0; i < 3; ++i)
 			device->m_queueTimelines[i] = device->CreateTimelineSemaphore(0);
 	}
 
-	// ---- VMA 分配器 ----
 	VmaVulkanFunctions vulkanFunctions{};
 	vulkanFunctions.vkGetInstanceProcAddr = vkGetInstanceProcAddr;
 	vulkanFunctions.vkGetDeviceProcAddr = vkGetDeviceProcAddr;
@@ -880,7 +963,6 @@ std::unique_ptr<Device> Device::Create(const DeviceDesc& desc)
 		return nullptr;
 	}
 
-	// ---- descriptor pool（带 FREE 位，允许单个集合归还；容量按类型留足）----
 	const VkDescriptorPoolSize poolSizes[] = {
 		{ VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1024 },
 		{ VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          1024 },
@@ -898,7 +980,6 @@ std::unique_ptr<Device> Device::Create(const DeviceDesc& desc)
 		return nullptr;
 	}
 
-	// ---- 默认采样器（SampledImage 复用）：线性过滤 + 重复寻址 ----
 	VkSamplerCreateInfo samplerCI{};
 	samplerCI.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
 	samplerCI.magFilter = VK_FILTER_LINEAR;
@@ -913,7 +994,6 @@ std::unique_ptr<Device> Device::Create(const DeviceDesc& desc)
 		return nullptr;
 	}
 
-	// ---- 管线缓存（跨管线复用编译结果）----
 	VkPipelineCacheCreateInfo cacheCI{};
 	cacheCI.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
 	if (vkCreatePipelineCache(device->m_device, &cacheCI, nullptr, &device->m_pipelineCache) != VK_SUCCESS) {
@@ -921,8 +1001,6 @@ std::unique_ptr<Device> Device::Create(const DeviceDesc& desc)
 		return nullptr;
 	}
 
-	// ---- 帧槽（数量来自 DeviceDesc，钳制 [1,8]；创建期决定，运行期不变更）----
-	// 命令池覆盖 graphics/compute/transfer 三类（present 族不录命令，不建池）
 	std::vector<uint32_t> slotFamilies;
 	auto pushSlotFamily = [&slotFamilies](uint32_t f) {
 		for (uint32_t existing : slotFamilies) if (existing == f) return;
@@ -948,12 +1026,8 @@ std::unique_ptr<Device> Device::Create(const DeviceDesc& desc)
 
 Device::~Device()
 {
-	// 兜底：用户未等完在飞提交就销毁设备时，先等设备空闲（后续销毁均要求无在飞命令）
 	if (m_device != VK_NULL_HANDLE) vkDeviceWaitIdle(m_device);
-	// 逆序清理（帧槽 / descriptor pool / 采样器 / 管线缓存须先于逻辑设备销毁；
-	// 帧槽虽是成员 vector，但若不在此显式清空，其析构将晚于 vkDestroyDevice）
 	m_frameSlots.clear();
-	// 队列 timeline 同属逻辑设备，须先于 vkDestroyDevice 释放（成员析构晚于本函数体）
 	for (auto& timeline : m_queueTimelines)
 		timeline.reset();
 	if (m_descriptorPool) {
@@ -995,7 +1069,7 @@ Device::~Device()
 const char* Device::DeviceName() const { return m_deviceName.c_str(); }
 uint32_t    Device::ApiVersion() const { return m_apiVersion; }
 
-#pragma region Image // 图像资源 / 视图
+#pragma region Image
 
 ImageView::ImageView(VkDevice device, VkImageView view)
 	: m_device(device), m_view(view) {}
@@ -1017,10 +1091,8 @@ Image::Image(VkDevice device, VkFormat format, VmaAllocator_T* allocator, VkImag
 
 Image::~Image()
 {
-	// 视图先于底层图像销毁（视图由 RHI 创建，借用图像同样如此）
 	m_views.clear();
 
-	// 借用（交换链 backbuffer / 外部导入）不拥有底层句柄，跳过销毁
 	if (m_borrowed || !m_allocator || m_image == VK_NULL_HANDLE) return;
 	vmaDestroyImage(m_allocator, m_image, m_allocation);
 	m_image = VK_NULL_HANDLE;
@@ -1033,24 +1105,56 @@ std::unique_ptr<Image> Image::Borrow(VkDevice device, VkImage image, VkFormat fo
 	return std::unique_ptr<Image>(new Image(device, format, nullptr, image, nullptr, desc, true));
 }
 
-// 显式注册视图：按 (mipLevel, layer) 去重，命中直接返回同一引用；视图随 Image 析构统一销毁
 const ImageView& Image::CreateView(ImageSubresource sub) const
 {
-	const uint64_t key = (static_cast<uint64_t>(sub.mipLevel) << 32) | sub.layer;
+	ImageViewDesc desc;
+	desc.range.base = sub;
+	desc.range.mipLevelCount = 1;
+	desc.range.layerCount = 1;
+	return CreateView(desc);
+}
+
+const ImageView& Image::CreateView(const ImageViewDesc& view) const
+{
+	const uint32_t maxMip = m_desc.mipLevels == 0 ? 1 : m_desc.mipLevels;
+	const uint32_t maxLayer = m_desc.arrayLayers == 0 ? 1 : m_desc.arrayLayers;
+	ImageSubresourceRange range = view.range;
+	if (range.base.mipLevel >= maxMip) range.base.mipLevel = maxMip - 1;
+	if (range.base.layer >= maxLayer) range.base.layer = maxLayer - 1;
+	if (range.mipLevelCount == 0) range.mipLevelCount = maxMip - range.base.mipLevel;
+	if (range.layerCount == 0) range.layerCount = maxLayer - range.base.layer;
+	range.mipLevelCount = std::min(range.mipLevelCount, maxMip - range.base.mipLevel);
+	range.layerCount = std::min(range.layerCount, maxLayer - range.base.layer);
+
+	const VkFormat format = view.format == ImageFormat::None ? m_format : ToVkFormat(view.format);
+	ImageViewType viewType = view.viewType;
+	if (viewType == ImageViewType::None) {
+		viewType = m_desc.viewType;
+		if (range.layerCount > 1 && viewType == ImageViewType::Dim2D)
+			viewType = ImageViewType::Dim2DArray;
+	}
+
+	const uint64_t key =
+		(static_cast<uint64_t>(range.base.mipLevel & 0xFFu) << 56) |
+		(static_cast<uint64_t>(range.mipLevelCount & 0xFFu) << 48) |
+		(static_cast<uint64_t>(range.base.layer & 0xFFFFu) << 32) |
+		(static_cast<uint64_t>(range.layerCount & 0xFFFFu) << 16) |
+		(static_cast<uint64_t>(static_cast<uint32_t>(format) & 0xFFu) << 8) |
+		static_cast<uint64_t>(static_cast<uint32_t>(viewType) & 0xFu);
 	if (auto it = m_views.find(key); it != m_views.end()) return *it->second;
 
 	VkImageViewCreateInfo viewCI{};
 	viewCI.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
 	viewCI.image = m_image;
-	viewCI.viewType = ToVkImageViewType(m_desc.viewType);
-	viewCI.format = m_format;
+	viewCI.viewType = ToVkImageViewType(viewType);
+	viewCI.format = format;
 	viewCI.components = { VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
 		VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY };
-	viewCI.subresourceRange.aspectMask = ToVkAspect(m_format);
-	viewCI.subresourceRange.baseMipLevel = sub.mipLevel;
-	viewCI.subresourceRange.levelCount = 1;
-	viewCI.subresourceRange.baseArrayLayer = sub.layer;
-	viewCI.subresourceRange.layerCount = 1;
+	viewCI.subresourceRange.aspectMask = ToVkAspect(format);
+	viewCI.subresourceRange.baseMipLevel = range.base.mipLevel;
+	viewCI.subresourceRange.levelCount = range.mipLevelCount;
+	viewCI.subresourceRange.baseArrayLayer = range.base.layer;
+	viewCI.subresourceRange.layerCount = range.layerCount;
 
 	VkImageView handle = VK_NULL_HANDLE;
 	if (m_device == VK_NULL_HANDLE || m_image == VK_NULL_HANDLE ||
@@ -1059,17 +1163,65 @@ const ImageView& Image::CreateView(ImageSubresource sub) const
 		handle = VK_NULL_HANDLE;
 	}
 
-	// 用 node 容器承载，先取引用再 move：move unique_ptr 不搬移所指对象，引用保持有效
-	auto view = std::unique_ptr<ImageView>(new ImageView(m_device, handle));
-	const ImageView& ref = *view;
-	m_views.emplace(key, std::move(view));
+	auto imageView = std::unique_ptr<ImageView>(new ImageView(m_device, handle));
+	const ImageView& ref = *imageView;
+	m_views.emplace(key, std::move(imageView));
 	return ref;
+}
+
+const ImageView& Image::ReinterpretView(ImageFormat format, ImageSubresourceRange range) const
+{
+	ImageViewDesc desc;
+	desc.range = range;
+	desc.format = format;
+	return CreateView(desc);
+}
+
+Sampler::Sampler(VkDevice device, VkSampler sampler) : m_device(device), m_sampler(sampler) {}
+
+Sampler::~Sampler()
+{
+	if (m_sampler != VK_NULL_HANDLE && m_device != VK_NULL_HANDLE)
+		vkDestroySampler(m_device, m_sampler, nullptr);
+}
+
+VkSampler Sampler::NativeHandle() const { return m_sampler; }
+
+std::unique_ptr<Sampler> Device::CreateSampler(const SamplerDesc& desc)
+{
+	if (m_device == VK_NULL_HANDLE) return nullptr;
+
+	const bool anisotropy = desc.anisotropyEnable && m_maxSamplerAnisotropy > 1.0f;
+	VkSamplerCreateInfo samplerCI{};
+	samplerCI.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+	samplerCI.magFilter = ToVkFilter(desc.magFilter);
+	samplerCI.minFilter = ToVkFilter(desc.minFilter);
+	samplerCI.mipmapMode = ToVkSamplerMipmapMode(desc.mipmapMode);
+	samplerCI.addressModeU = ToVkAddressMode(desc.addressU);
+	samplerCI.addressModeV = ToVkAddressMode(desc.addressV);
+	samplerCI.addressModeW = ToVkAddressMode(desc.addressW);
+	samplerCI.mipLodBias = desc.mipLodBias;
+	samplerCI.anisotropyEnable = anisotropy ? VK_TRUE : VK_FALSE;
+	samplerCI.maxAnisotropy = anisotropy
+		? std::clamp(desc.maxAnisotropy, 1.0f, m_maxSamplerAnisotropy) : 1.0f;
+	samplerCI.minLod = desc.minLod;
+	samplerCI.maxLod = desc.maxLod;
+	samplerCI.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+	samplerCI.unnormalizedCoordinates = VK_FALSE;
+
+	VkSampler handle = VK_NULL_HANDLE;
+	if (vkCreateSampler(m_device, &samplerCI, nullptr, &handle) != VK_SUCCESS) {
+		std::cerr << "[RHI] vkCreateSampler 失败\n";
+		return nullptr;
+	}
+	return std::unique_ptr<Sampler>(new Sampler(m_device, handle));
 }
 
 std::unique_ptr<Image> Device::CreateImage(const ImageCreateInfo& info)
 {
 	VkImageCreateInfo imageCI{};
 	imageCI.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+	imageCI.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
 	imageCI.imageType = ToVkImageType(info.viewType);
 	imageCI.format = ToVkFormat(info.format);
 	imageCI.extent = { info.width, info.height, info.depth };
@@ -1081,7 +1233,6 @@ std::unique_ptr<Image> Device::CreateImage(const ImageCreateInfo& info)
 	imageCI.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 	imageCI.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
-	// 图像一律走设备本地内存（VMA 按 usage 自动选堆）
 	VmaAllocationCreateInfo allocCI{};
 	allocCI.usage = VMA_MEMORY_USAGE_AUTO;
 
@@ -1101,7 +1252,7 @@ const ImageCreateInfo& Image::Desc() const { return m_desc; }
 
 #pragma endregion
 
-#pragma region Buffer // 缓冲资源
+#pragma region Buffer
 
 Buffer::Buffer(VmaAllocator_T* allocator, VkBuffer buffer, VmaAllocation_T* allocation,
 	const BufferCreateInfo& desc, void* mapped)
@@ -1109,7 +1260,6 @@ Buffer::Buffer(VmaAllocator_T* allocator, VkBuffer buffer, VmaAllocation_T* allo
 
 Buffer::~Buffer()
 {
-	// 主机可见缓冲走 VMA 的持久映射（MAPPED_BIT），解除映射由 VMA 在销毁时统一处理
 	if (!m_allocator || m_buffer == VK_NULL_HANDLE) return;
 	vmaDestroyBuffer(m_allocator, m_buffer, m_allocation);
 	m_buffer = VK_NULL_HANDLE;
@@ -1129,7 +1279,6 @@ std::unique_ptr<Buffer> Device::CreateBuffer(const BufferCreateInfo& info)
 	allocCI.usage = VMA_MEMORY_USAGE_AUTO;
 	VmaAllocationInfo allocInfo{};
 	if (info.hostVisible) {
-		// 顺序写入 + 持久映射：Map() 直接返回已映射指针
 		allocCI.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
 			| VMA_ALLOCATION_CREATE_MAPPED_BIT;
 	}
@@ -1144,7 +1293,6 @@ std::unique_ptr<Buffer> Device::CreateBuffer(const BufferCreateInfo& info)
 	return std::unique_ptr<Buffer>(new Buffer(m_allocator, buffer, allocation, info, allocInfo.pMappedData));
 }
 
-// 持久映射：hostVisible 缓冲在创建时即映射，这里直接返回缓存指针；非 hostVisible 返回空
 void* Buffer::Map()
 {
 	return m_mapped;
@@ -1155,8 +1303,6 @@ const void* Buffer::Map() const
 	return m_mapped;
 }
 
-// 非一致内存的可见性出口：未映射（非 hostVisible）时没有可回写/失效的缓存，直接返回。
-// 范围按缓冲总长钳制；offset 越界视为无效请求。一致内存上这两个调用由驱动退化为 no-op
 void Buffer::Flush(std::uint64_t offset, std::uint64_t size) const
 {
 	if (m_allocator == nullptr || m_allocation == nullptr || m_mapped == nullptr)
@@ -1186,7 +1332,7 @@ const BufferCreateInfo& Buffer::Desc() const { return m_desc; }
 
 #pragma endregion
 
-#pragma region Sync // 同步原语
+#pragma region Sync
 
 Semaphore::Semaphore(VkDevice device, VkSemaphore semaphore, bool timeline)
 	: m_device(device), m_semaphore(semaphore), m_timeline(timeline) {}
@@ -1320,12 +1466,10 @@ std::unique_ptr<Semaphore> Device::CreateTimelineSemaphore(std::uint64_t initial
 
 #pragma endregion
 
-#pragma region Swapchain // 交换链
+#pragma region Swapchain
 
-// 纯构建：查询表面能力、选定格式与尺寸、创建交换链并取回 backbuffer（首次与重建共用）
 bool Swapchain::Build(const Context& context, VkSwapchainKHR oldSwapchain, BuildResult& result)
 {
-	// ---- 表面能力与格式 ----
 	VkSurfaceCapabilitiesKHR caps{};
 	vkGetPhysicalDeviceSurfaceCapabilitiesKHR(context.physicalDevice, context.surface, &caps);
 
@@ -1338,8 +1482,6 @@ bool Swapchain::Build(const Context& context, VkSwapchainKHR oldSwapchain, Build
 	std::vector<VkSurfaceFormatKHR> formats(formatCount);
 	vkGetPhysicalDeviceSurfaceFormatsKHR(context.physicalDevice, context.surface, &formatCount, formats.data());
 
-	// 优先 B8G8R8A8_UNORM + SRGB_NONLINEAR（描述层词表无 sRGB 变体，Format() 会归一化为 BGRA8，
-	// 优选 UNORM 使管线附件格式签名与实际交换链格式一致）；否则取首个
 	VkSurfaceFormatKHR chosen = formats[0];
 	for (const auto& f : formats) {
 		if (f.format == VK_FORMAT_B8G8R8A8_UNORM && f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
@@ -1347,28 +1489,23 @@ bool Swapchain::Build(const Context& context, VkSwapchainKHR oldSwapchain, Build
 			break;
 		}
 	}
-	// 旧式单值 UNDEFINED 报告：按常用 8 位 BGRA 处理
 	if (formatCount == 1 && formats[0].format == VK_FORMAT_UNDEFINED) {
 		chosen.format = VK_FORMAT_B8G8R8A8_UNORM;
 		chosen.colorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
 	}
 
-	// ---- 范围：优先表面当前尺寸；无定义时按窗口尺寸夹到能力区间 ----
 	VkExtent2D extent = caps.currentExtent;
 	if (extent.width == UINT32_MAX) {
 		extent.width = std::clamp(context.windowWidth, caps.minImageExtent.width, caps.maxImageExtent.width);
 		extent.height = std::clamp(context.windowHeight, caps.minImageExtent.height, caps.maxImageExtent.height);
 	}
-	// 最小化 / 尺寸为 0：无法创建交换链，本次不重建（等下一帧尺寸恢复）
 	if (extent.width == 0 || extent.height == 0) {
 		return false;
 	}
 
-	// ---- 图像数：最小 +1（避免等垂直同步），不超过上限 ----
 	uint32_t imageCount = caps.minImageCount + 1;
 	if (caps.maxImageCount > 0 && imageCount > caps.maxImageCount) imageCount = caps.maxImageCount;
 
-	// ---- 创建（presentMode 固定 FIFO，规范保证始终可用）----
 	VkSwapchainCreateInfoKHR swapchainCI{};
 	swapchainCI.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
 	swapchainCI.surface = context.surface;
@@ -1386,7 +1523,6 @@ bool Swapchain::Build(const Context& context, VkSwapchainKHR oldSwapchain, Build
 
 	uint32_t families[2] = { context.graphicsFamily, context.presentFamily };
 	if (context.graphicsFamily != context.presentFamily) {
-		// 图形与呈现在不同队列族：并发共享，避免上层自行处理队列所有权转移
 		swapchainCI.imageSharingMode = VK_SHARING_MODE_CONCURRENT;
 		swapchainCI.queueFamilyIndexCount = 2;
 		swapchainCI.pQueueFamilyIndices = families;
@@ -1400,7 +1536,6 @@ bool Swapchain::Build(const Context& context, VkSwapchainKHR oldSwapchain, Build
 		return false;
 	}
 
-	// ---- backbuffer：逐张包成非拥有 Image（借用，析构不销毁 VkImage）----
 	uint32_t imageCountActual = 0;
 	vkGetSwapchainImagesKHR(context.device, result.swapchain, &imageCountActual, nullptr);
 	std::vector<VkImage> images(imageCountActual);
@@ -1416,7 +1551,6 @@ bool Swapchain::Build(const Context& context, VkSwapchainKHR oldSwapchain, Build
 	result.images.clear();
 	result.images.reserve(images.size());
 	for (VkImage image : images) {
-		// 真实格式原样传入（backbuffer 常为 SRGB，视图格式须与图像一致）
 		result.images.push_back(Image::Borrow(context.device, image, chosen.format, backbufferDesc));
 	}
 
@@ -1425,7 +1559,6 @@ bool Swapchain::Build(const Context& context, VkSwapchainKHR oldSwapchain, Build
 	return true;
 }
 
-// 创建 count 个 acquire 信号量；任一失败返回空（表示失败，已创建的由 unique_ptr 释放）
 std::vector<std::unique_ptr<Semaphore>> Swapchain::CreateAcquireSemaphores(VkDevice device, uint32_t count)
 {
 	std::vector<std::unique_ptr<Semaphore>> semaphores;
@@ -1449,20 +1582,16 @@ Swapchain::Swapchain(const Context& context, BuildResult&& built,
 	: m_context(context), m_swapchain(built.swapchain), m_surfaceFormat(built.surfaceFormat),
 	  m_extent(built.extent), m_images(std::move(built.images)),
 	  m_acquireSemaphores(std::move(acquireSemaphores)), maxFrameInFlight(maxFramesInFlight) {
-	// 渲染完成信号量按 image 数建：同一 image 重新 acquire 前其上次 present 必已完成，
-	// 此刻 signal 复用才安全（单一信号量会在 present 消费完成前被下一帧再次 signal）
 	m_renderDone = CreateAcquireSemaphores(m_context.device, static_cast<uint32_t>(m_images.size()));
 	if (m_renderDone.size() != m_images.size()) {
 		std::cerr << "[RHI] 渲染完成信号量创建失败\n";
-		m_renderDone.clear(); // 降级：presentReady 为空，Present 不等待
+		m_renderDone.clear();
 	}
 }
 
 Swapchain::~Swapchain()
 {
-	// renderDone 的 wait 由呈现引擎消费，帧回收的 fence 等不到它：销毁前先等设备完全空闲
 	if (m_context.device) vkDeviceWaitIdle(m_context.device);
-	// 逆序：先释放借用图像包装（不销毁底层 VkImage），再销毁交换链，最后释放信号量
 	m_images.clear();
 	if (m_context.device && m_swapchain != VK_NULL_HANDLE) {
 		vkDestroySwapchainKHR(m_context.device, m_swapchain, nullptr);
@@ -1471,23 +1600,19 @@ Swapchain::~Swapchain()
 	m_acquireSemaphores.clear();
 }
 
-// 自动重建：先等设备空闲——既确认旧链图像 / 旧信号量不再被引用，也让旧 acquire 信号量可安全销毁
 bool Swapchain::Recreate()
 {
 	vkDeviceWaitIdle(m_context.device);
 
-	// 新链以旧链为 oldSwapchain 复用（降低资源峰值）；失败则保留现状，下一帧再试
 	BuildResult built;
 	if (!Build(m_context, m_swapchain, built)) return false;
 
-	// acquire 信号量一并重造：旧的可能留有 acquire 置位但未被 Submit 消费的信号，无法复用
 	auto acquireSemaphores = CreateAcquireSemaphores(m_context.device, maxFrameInFlight);
 	if (acquireSemaphores.size() != maxFrameInFlight) {
 		vkDestroySwapchainKHR(m_context.device, built.swapchain, nullptr);
 		return false;
 	}
 
-	// renderDone 同步重造：image 数可能已随新链尺寸变化
 	auto renderDone = CreateAcquireSemaphores(m_context.device, static_cast<uint32_t>(built.images.size()));
 	if (renderDone.size() != built.images.size()) {
 		vkDestroySwapchainKHR(m_context.device, built.swapchain, nullptr);
@@ -1509,8 +1634,6 @@ bool Swapchain::Recreate()
 	return true;
 }
 
-// 表面尺寸是否已与交换链不符：部分驱动（实测 NVIDIA/Win32）在窗口 resize 后仍返回 VK_SUCCESS，
-// 因此不能只依赖 acquire 返回值，需按表面能力主动比对。currentExtent 无定义时无法据此判断。
 bool Swapchain::NeedsRecreate() const
 {
 	VkSurfaceCapabilitiesKHR caps{};
@@ -1535,7 +1658,7 @@ std::unique_ptr<Swapchain> Device::CreateSwapchain()
 	context.presentFamily = m_presentQueueFamily;
 	context.windowWidth = m_windowWidth;
 	context.windowHeight = m_windowHeight;
-	context.maxFramesInFlight = static_cast<uint32_t>(m_frameSlots.size()); // acquire 信号量轮转数与 Device 帧槽数一致
+	context.maxFramesInFlight = static_cast<uint32_t>(m_frameSlots.size());
 
 	Swapchain::BuildResult built;
 	if (!Swapchain::Build(context, VK_NULL_HANDLE, built)) return nullptr;
@@ -1553,14 +1676,9 @@ std::unique_ptr<Swapchain> Device::CreateSwapchain()
 
 Swapchain::Frame Swapchain::AcquireNextImage()
 {
-	Frame frame;              // acquired=false；交换链失效时上层跳过渲染
-	m_lastFrame = Frame{};    // 清空上一帧记录，成功获取时再回填
+	Frame frame;
+	m_lastFrame = Frame{};
 
-	// 重建判定有两路来源：
-	//   1) 显式挂起标志（suboptimal / present 失配）
-	//   2) 表面尺寸已与交换链不符——部分驱动（实测 NVIDIA/Win32）resize 后仍返回 VK_SUCCESS，
-	//      不能只依赖 acquire 返回值，须主动比对表面能力
-	// 重建成功则本帧无图像（acquired=false），上层跳过渲染；重建失败（如最小化）同样跳过，下次调用再试
 	if (m_recreatePending || NeedsRecreate()) {
 		Recreate();
 		return frame;
@@ -1573,7 +1691,6 @@ Swapchain::Frame Swapchain::AcquireNextImage()
 		acquire, VK_NULL_HANDLE, &imageIndex);
 
 	if (result == VK_ERROR_OUT_OF_DATE_KHR) {
-		// 表面已失效：本帧没有未呈现的图像，立即重建；本帧由上层跳过
 		Recreate();
 		return frame;
 	}
@@ -1581,12 +1698,11 @@ Swapchain::Frame Swapchain::AcquireNextImage()
 		std::cerr << "[RHI] vkAcquireNextImageKHR 失败: " << result << "\n";
 		return frame;
 	}
-	// SUBOPTIMAL：图像仍可用（acquire 信号量已置位），本帧照常渲染，重建推迟到下次获取前
 	if (result == VK_SUBOPTIMAL_KHR) m_recreatePending = true;
 
 	frame.imageIndex = imageIndex;
 	frame.backbuffer = m_images[imageIndex].get();
-	frame.ready = m_acquireSemaphores[m_frameIndex].get(); // 与上面 acquire 用的是同一槽（尚未轮转）
+	frame.ready = m_acquireSemaphores[m_frameIndex].get();
 	frame.presentReady = imageIndex < m_renderDone.size() ? m_renderDone[imageIndex].get() : nullptr;
 	frame.acquired = true;
 	m_lastFrame = frame;
@@ -1596,9 +1712,8 @@ Swapchain::Frame Swapchain::AcquireNextImage()
 
 void Swapchain::Present(const Semaphore* presentWait)
 {
-	if (!m_lastFrame.acquired) return; // 未获取到图像（交换链失效），无需呈现
+	if (!m_lastFrame.acquired) return;
 
-	// 等待信号量：外部传入优先；否则用当帧 image 对应的内部渲染完成信号量（Submit 经 signals 产出）
 	VkSemaphore wait = presentWait ? presentWait->NativeHandle()
 		: (m_lastFrame.presentReady ? m_lastFrame.presentReady->NativeHandle() : VK_NULL_HANDLE);
 
@@ -1615,9 +1730,9 @@ void Swapchain::Present(const Semaphore* presentWait)
 	m_lastFrame = Frame{};
 
 	if (result == VK_ERROR_OUT_OF_DATE_KHR) {
-		Recreate();               // 表面失效：图像已交给呈现引擎，立即重建
+		Recreate();
 	} else if (result == VK_SUBOPTIMAL_KHR) {
-		m_recreatePending = true; // 仍可呈现：推迟到下次获取前重建
+		m_recreatePending = true;
 	} else if (result != VK_SUCCESS) {
 		std::cerr << "[RHI] vkQueuePresentKHR 失败: " << result << "\n";
 	}
@@ -1629,7 +1744,7 @@ uint32_t    Swapchain::Height() const { return m_extent.height; }
 
 #pragma endregion
 
-#pragma region Descriptor // 描述符布局 / 集合
+#pragma region Descriptor
 
 DescriptorSetLayout::DescriptorSetLayout(VkDevice device, VkDescriptorSetLayout layout,
 	std::vector<DescriptorBinding> bindings)
@@ -1653,7 +1768,6 @@ DescriptorSet::DescriptorSet(VkDevice device, VkDescriptorPool pool, VkSampler d
 
 DescriptorSet::~DescriptorSet()
 {
-	// 归还单个集合：须确保引用它的命令缓冲已完成（池创建时带 FREE 位）
 	if (m_device && m_pool && m_set != VK_NULL_HANDLE) {
 		vkFreeDescriptorSets(m_device, m_pool, 1, &m_set);
 		m_set = VK_NULL_HANDLE;
@@ -1662,9 +1776,8 @@ DescriptorSet::~DescriptorSet()
 
 VkDescriptorSet DescriptorSet::NativeHandle() const { return m_set; }
 
-// 图像绑定：数组按 layer 递增逐层展开；类型取自分配时记录的 binding 表
-// （SampledImage → combined 描述符 + 内置采样器；StorageImage → storage 描述符、无采样器）
-void DescriptorSet::Write(uint32_t binding, const Image& image, ImageSubresource view, uint32_t count)
+void DescriptorSet::Write(uint32_t binding, const Image& image, ImageSubresource view, uint32_t count,
+	const Sampler* sampler, ImageFormat viewFormat, uint32_t firstElement, ImageLayout layout)
 {
 	if (count == 0) {
 		std::cerr << "[RHI] 描述符写入失败：count 为 0（binding " << binding << "）\n";
@@ -1676,28 +1789,33 @@ void DescriptorSet::Write(uint32_t binding, const Image& image, ImageSubresource
 		if (it->second == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
 	}
 	const bool storage = (type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+	if (layout == ImageLayout::Undefined)
+		layout = storage ? ImageLayout::General : ImageLayout::ShaderReadOnly;
 
 	std::vector<VkDescriptorImageInfo> imageInfos(count);
 	for (uint32_t i = 0; i < count; ++i) {
-		const ImageSubresource sub{ view.mipLevel, view.layer + i };
-		const ImageView& imageView = image.CreateView(sub);
+		ImageViewDesc viewDesc;
+		viewDesc.range.base = ImageSubresource{ view.mipLevel, view.layer + i };
+		viewDesc.range.mipLevelCount = 1;
+		viewDesc.range.layerCount = 1;
+		viewDesc.format = viewFormat;
+		const ImageView& imageView = image.CreateView(viewDesc);
 		if (imageView.NativeHandle() == VK_NULL_HANDLE) {
 			std::cerr << "[RHI] 描述符写入失败：图像视图无效（binding " << binding
 				<< " 元素 " << i << "）\n";
 			return;
 		}
-		imageInfos[i].sampler = storage ? VK_NULL_HANDLE : m_defaultSampler;
+		imageInfos[i].sampler = storage ? VK_NULL_HANDLE
+			: (sampler != nullptr ? sampler->NativeHandle() : m_defaultSampler);
 		imageInfos[i].imageView = imageView.NativeHandle();
-		// 固定布局：实际使用前须由 barrier 把资源转到该布局
-		imageInfos[i].imageLayout = storage
-			? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		imageInfos[i].imageLayout = ToVkImageLayout(layout);
 	}
 
 	VkWriteDescriptorSet write{};
 	write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
 	write.dstSet = m_set;
 	write.dstBinding = binding;
-	write.dstArrayElement = 0;
+	write.dstArrayElement = firstElement;
 	write.descriptorCount = count;
 	write.descriptorType = type;
 	write.pImageInfo = imageInfos.data();
@@ -1705,7 +1823,6 @@ void DescriptorSet::Write(uint32_t binding, const Image& image, ImageSubresource
 	vkUpdateDescriptorSets(m_device, 1, &write, 0, nullptr);
 }
 
-// 缓冲绑定：range 为 0 表示到缓冲末尾；数组按 range 步进（第 i 个元素 offset + i*range）
 void DescriptorSet::Write(uint32_t binding, const Buffer& buffer, uint64_t offset, uint64_t range, uint32_t count)
 {
 	if (count == 0 || (count > 1 && range == 0)) {
@@ -1753,7 +1870,6 @@ std::unique_ptr<DescriptorSet> Device::AllocateDescriptorSet(const DescriptorSet
 		return nullptr;
 	}
 
-	// 记录 binding -> 类型，供缓冲区写接口选择正确的 VkDescriptorType
 	std::unordered_map<uint32_t, VkDescriptorType> bindingTypes;
 	for (const auto& b : layout.Bindings()) bindingTypes[b.binding] = ToVkDescriptorType(b.type);
 
@@ -1761,9 +1877,51 @@ std::unique_ptr<DescriptorSet> Device::AllocateDescriptorSet(const DescriptorSet
 		m_defaultSampler, set, std::move(bindingTypes)));
 }
 
+std::unique_ptr<DescriptorSetLayout> Device::CreateDescriptorSetLayout(
+	const std::vector<DescriptorBinding>& bindings, bool partiallyBound)
+{
+	if (bindings.empty()) {
+		std::cerr << "[RHI] CreateDescriptorSetLayout 失败：bindings 为空\n";
+		return nullptr;
+	}
+
+	std::vector<VkDescriptorSetLayoutBinding> vkBindings(bindings.size());
+	std::vector<VkDescriptorBindingFlags> bindingFlags(bindings.size(),
+		partiallyBound ? VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT : 0);
+	for (size_t i = 0; i < bindings.size(); ++i) {
+		const DescriptorBinding& b = bindings[i];
+		VkDescriptorSetLayoutBinding vb{};
+		vb.binding = b.binding;
+		vb.descriptorType = ToVkDescriptorType(b.type);
+		vb.descriptorCount = b.arrayCount;
+		vb.stageFlags = b.stages == ShaderStageMask::None
+			? VK_SHADER_STAGE_ALL : ToVkStageMask(b.stages);
+		vkBindings[i] = vb;
+	}
+
+	VkDescriptorSetLayoutBindingFlagsCreateInfo flagsCI{};
+	flagsCI.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO;
+	flagsCI.bindingCount = partiallyBound ? static_cast<uint32_t>(bindingFlags.size()) : 0;
+	flagsCI.pBindingFlags = partiallyBound ? bindingFlags.data() : nullptr;
+
+	VkDescriptorSetLayoutCreateInfo layoutCI{};
+	layoutCI.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+	layoutCI.pNext = partiallyBound ? &flagsCI : nullptr;
+	layoutCI.bindingCount = static_cast<uint32_t>(vkBindings.size());
+	layoutCI.pBindings = vkBindings.data();
+
+	VkDescriptorSetLayout rawLayout = VK_NULL_HANDLE;
+	if (vkCreateDescriptorSetLayout(m_device, &layoutCI, nullptr, &rawLayout) != VK_SUCCESS) {
+		std::cerr << "[RHI] vkCreateDescriptorSetLayout 失败（手工布局）\n";
+		return nullptr;
+	}
+	return std::unique_ptr<DescriptorSetLayout>(
+		new DescriptorSetLayout(m_device, rawLayout, bindings));
+}
+
 #pragma endregion
 
-#pragma region Pipeline // 管线与管线布局
+#pragma region Pipeline
 
 Pipeline::Pipeline(VkDevice device, VkPipeline pipeline, VkPipelineLayout layout, uint32_t pushConstantSize,
 	VkShaderStageFlags stageFlags, VkPipelineBindPoint bindPoint,
@@ -1774,7 +1932,6 @@ Pipeline::Pipeline(VkDevice device, VkPipeline pipeline, VkPipelineLayout layout
 
 Pipeline::~Pipeline()
 {
-	// 顺序：管线 -> 管线布局；集合布局由 m_setLayouts 成员析构自动释放
 	if (m_device && m_pipeline != VK_NULL_HANDLE) {
 		vkDestroyPipeline(m_device, m_pipeline, nullptr);
 		m_pipeline = VK_NULL_HANDLE;
@@ -1800,22 +1957,23 @@ const DescriptorSetLayout* Pipeline::SetLayout(uint32_t setIndex) const
 	return setIndex < m_setLayouts.size() ? m_setLayouts[setIndex].get() : nullptr;
 }
 
-// 反射槽位表 -> 各 set 布局 + 管线布局。图形 / 计算管线共用：
-// 两者只有阶段集合与 vkCreate*Pipelines 入口不同，描述符布局一律由反射得出。
-// 失败时已创建的布局就地释放（unique_ptr / 手工销毁），不留给调用方
 bool Device::BuildSetLayouts(std::vector<MergedDescriptor> slots, uint32_t pushConstantSize,
-	VkShaderStageFlags pushStages,
+	VkShaderStageFlags pushStages, const DescriptorSetLayout* externalSet0,
 	std::vector<std::unique_ptr<DescriptorSetLayout>>& outLayouts, VkPipelineLayout& outLayout)
 {
-	// ---- push constant 合法性（全部 stage 共享、offset 固定 0）----
 	if (pushConstantSize > 0 && (pushConstantSize % 4 != 0 || pushConstantSize > 128)) {
 		std::cerr << "[RHI] pushConstantSize 须 4 字节对齐且 <= 128: " << pushConstantSize << "\n";
 		return false;
 	}
 
-	// ---- 按 set 分组（组内 binding 升序，保证布局可预测）----
+	if (externalSet0 != nullptr) {
+		slots.erase(std::remove_if(slots.begin(), slots.end(),
+			[](const MergedDescriptor& s) { return s.binding.set == 0; }), slots.end());
+	}
+
 	uint32_t setCount = 0;
 	for (const auto& s : slots) setCount = std::max(setCount, s.binding.set + 1);
+	if (externalSet0 != nullptr) setCount = std::max(setCount, 1u);
 
 	std::vector<std::vector<MergedDescriptor>> bySet(setCount);
 	for (auto& s : slots)
@@ -1825,20 +1983,20 @@ bool Device::BuildSetLayouts(std::vector<MergedDescriptor> slots, uint32_t pushC
 			[](const MergedDescriptor& a, const MergedDescriptor& c) { return a.binding.binding < c.binding.binding; });
 	}
 
-	// ---- 各 set 的描述符集合布局（由 Pipeline 持有）----
 	outLayouts.clear();
-	outLayouts.reserve(setCount);
-	for (uint32_t i = 0; i < setCount; ++i) {
+	outLayouts.resize(setCount);
+	const uint32_t firstOwnedSet = externalSet0 != nullptr ? 1u : 0u;
+	for (uint32_t i = firstOwnedSet; i < setCount; ++i) {
 		std::vector<VkDescriptorSetLayoutBinding> vkBindings;
 		vkBindings.reserve(bySet[i].size());
-		std::vector<DescriptorBinding> groupDescs; // DescriptorSetLayout 侧仅持声明（stageFlags 已烙进 Vk 对象）
+		std::vector<DescriptorBinding> groupDescs;
 		groupDescs.reserve(bySet[i].size());
 		for (auto& s : bySet[i]) {
 			VkDescriptorSetLayoutBinding vb{};
 			vb.binding = s.binding.binding;
 			vb.descriptorType = ToVkDescriptorType(s.binding.type);
 			vb.descriptorCount = s.binding.arrayCount;
-			vb.stageFlags = s.stages; // 反射累积：实际使用该槽位的 stage 并集
+			vb.stageFlags = s.stages;
 			vkBindings.push_back(vb);
 			groupDescs.push_back(std::move(s.binding));
 		}
@@ -1851,14 +2009,12 @@ bool Device::BuildSetLayouts(std::vector<MergedDescriptor> slots, uint32_t pushC
 		VkDescriptorSetLayout rawLayout = VK_NULL_HANDLE;
 		if (vkCreateDescriptorSetLayout(m_device, &layoutCI, nullptr, &rawLayout) != VK_SUCCESS) {
 			std::cerr << "[RHI] vkCreateDescriptorSetLayout 失败（set " << i << "）\n";
-			outLayouts.clear(); // 已建布局随 unique_ptr 释放
+			outLayouts.clear();
 			return false;
 		}
-		outLayouts.push_back(std::unique_ptr<DescriptorSetLayout>(
-			new DescriptorSetLayout(m_device, rawLayout, std::move(groupDescs))));
+		outLayouts[i].reset(new DescriptorSetLayout(m_device, rawLayout, std::move(groupDescs)));
 	}
 
-	// ---- 管线布局（push constant：全部 stage 共享、offset 0；desc 未声明则无 range）----
 	VkPushConstantRange pushRange{};
 	pushRange.stageFlags = pushStages;
 	pushRange.size = pushConstantSize;
@@ -1866,9 +2022,11 @@ bool Device::BuildSetLayouts(std::vector<MergedDescriptor> slots, uint32_t pushC
 	VkPipelineLayoutCreateInfo layoutCI{};
 	layoutCI.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
 	layoutCI.setLayoutCount = static_cast<uint32_t>(outLayouts.size());
-	// Pipeline 持有 unique_ptr，不暴露批量句柄：临时收集一次供 vkCreatePipelineLayout 使用
-	std::vector<VkDescriptorSetLayout> rawLayouts(outLayouts.size());
-	for (size_t i = 0; i < outLayouts.size(); ++i) rawLayouts[i] = outLayouts[i]->NativeHandle();
+	std::vector<VkDescriptorSetLayout> rawLayouts(outLayouts.size(), VK_NULL_HANDLE);
+	for (size_t i = 0; i < outLayouts.size(); ++i) {
+		if (i == 0 && externalSet0 != nullptr) rawLayouts[i] = externalSet0->NativeHandle();
+		else if (outLayouts[i]) rawLayouts[i] = outLayouts[i]->NativeHandle();
+	}
 	layoutCI.pSetLayouts = rawLayouts.empty() ? nullptr : rawLayouts.data();
 	layoutCI.pushConstantRangeCount = (pushConstantSize > 0) ? 1u : 0u;
 	layoutCI.pPushConstantRanges = (pushConstantSize > 0) ? &pushRange : nullptr;
@@ -1884,28 +2042,74 @@ bool Device::BuildSetLayouts(std::vector<MergedDescriptor> slots, uint32_t pushC
 	return true;
 }
 
-// dynamic rendering 下的图形管线：多态渲染无需 VkRenderPass，附件格式经 VkPipelineRenderingCreateInfo 声明
-std::unique_ptr<Pipeline> Device::CreatePipeline(const GraphicsPipelineDesc& desc)
+std::unique_ptr<Pipeline> Device::CreatePipeline(const GraphicsPipelineDesc& desc,
+	const DescriptorSetLayout* externalSet0)
 {
-	// ---- 阶段组合校验（Vertex×Mesh 互斥、Tess 成对、至少一个顶点来源阶段）----
 	if (!ValidateStageCombination(desc.shaders))
 		return nullptr;
-	// 当前版本仅实现 Vertex/Fragment/Geometry 的状态创建：
-	// Tess 需要 tessellation state，Task/Mesh 需要设备扩展与特性，待后续版本
+	bool hasTess = false;
+	bool hasGeometry = false;
 	for (const auto& s : desc.shaders) {
 		switch (s.stage) {
 			case ShaderStage::Vertex:
 			case ShaderStage::Fragment:
+			case ShaderStage::TessControl:
+			case ShaderStage::TessEval:
 			case ShaderStage::Geometry:
 				break;
 			default:
 				std::cerr << "[RHI] 暂不支持的着色器阶段: " << ShaderStageName(s.stage)
-					<< "（tess/mesh 待后续版本）\n";
+					<< "（task/mesh 待后续版本）\n";
 				return nullptr;
+		}
+		if (s.stage == ShaderStage::TessControl || s.stage == ShaderStage::TessEval)
+			hasTess = true;
+		if (s.stage == ShaderStage::Geometry)
+			hasGeometry = true;
+	}
+	if (hasGeometry && !m_geometrySupported) {
+		std::cerr << "[RHI] 设备不支持几何着色器\n";
+		return nullptr;
+	}
+	if (hasTess) {
+		if (!m_tessellationSupported) {
+			std::cerr << "[RHI] 设备不支持细分着色器\n";
+			return nullptr;
+		}
+		if (desc.topology != PrimitiveTopology::PatchList) {
+			std::cerr << "[RHI] 细分管线要求 topology = PatchList\n";
+			return nullptr;
+		}
+		if (desc.tessPatchControlPoints == 0
+			|| desc.tessPatchControlPoints > m_maxTessellationPatchSize) {
+			std::cerr << "[RHI] tessPatchControlPoints(" << desc.tessPatchControlPoints
+				<< ") 越界，设备上限为 " << m_maxTessellationPatchSize << "\n";
+			return nullptr;
 		}
 	}
 
-	// ---- 读取 SPIR-V（一读两用：同一份 code 喂反射与 vkCreateShaderModule）----
+	if (!desc.colorStates.empty() && desc.colorStates.size() != desc.colorAttachmentCount) {
+		std::cerr << "[RHI] colorStates 数量(" << desc.colorStates.size()
+			<< ") 与颜色附件数(" << desc.colorAttachmentCount << ") 不一致\n";
+		return nullptr;
+	}
+	if (!desc.colorStates.empty() && !m_independentBlendSupported) {
+		const ColorAttachmentState& first = desc.colorStates.front();
+		for (const ColorAttachmentState& st : desc.colorStates) {
+			if (st.enableBlend != first.enableBlend || st.srcColor != first.srcColor
+				|| st.dstColor != first.dstColor || st.srcAlpha != first.srcAlpha
+				|| st.dstAlpha != first.dstAlpha || st.colorOp != first.colorOp
+				|| st.alphaOp != first.alphaOp || st.writeMask != first.writeMask) {
+				std::cerr << "[RHI] 设备不支持 independentBlend：逐附件 blend/writeMask 必须完全一致\n";
+				return nullptr;
+			}
+		}
+	}
+	if (desc.depthFormat != ImageFormat::None && desc.depthStencil.depthBoundsTestEnable
+		&& !m_depthBoundsSupported) {
+		std::cerr << "[RHI] 设备不支持 depthBounds，已关闭该测试（depth test/compare 保留）\n";
+	}
+
 	std::vector<std::vector<uint32_t>> codes(desc.shaders.size());
 	for (size_t i = 0; i < desc.shaders.size(); ++i) {
 		codes[i] = ReadSpirv(desc.shaders[i].spirvPath);
@@ -1915,24 +2119,39 @@ std::unique_ptr<Pipeline> Device::CreatePipeline(const GraphicsPipelineDesc& des
 		}
 	}
 
-	// ---- 反射 + 合并：逐 stage 枚举后按 (set,binding) 合并（前端，与计算共用）----
 	std::vector<StageCode> stageCodes;
 	stageCodes.reserve(desc.shaders.size());
 	for (size_t i = 0; i < desc.shaders.size(); ++i)
 		stageCodes.push_back({ desc.shaders[i].stage, &codes[i] });
 
-	std::vector<MergedDescriptor> merged; // 每条记录 = 槽位声明 + 其 stageFlags 并集
-	VkShaderStageFlags allStages = 0;     // push constant 的 stage 集合（desc 级声明，非反射）
+	std::vector<MergedDescriptor> merged;
+	VkShaderStageFlags allStages = 0;
 	if (!ReflectAndMergeBindings(stageCodes, merged, allStages))
 		return nullptr;
 
-	// ---- 描述符集合布局 + 管线布局（与计算管线共用同一构建路径）----
+	if (!m_vertexPipelineStoresAndAtomics) {
+		const uint32_t vertexish = static_cast<uint32_t>(
+			ShaderStageMask::Vertex | ShaderStageMask::TessControl
+			| ShaderStageMask::TessEval | ShaderStageMask::Geometry);
+		for (const auto& slot : merged) {
+			if ((static_cast<uint32_t>(slot.binding.stages) & vertexish) == 0)
+				continue;
+			if (slot.binding.nonWritable)
+				continue;
+			if (slot.binding.type == ResourceType::StorageBuffer
+				|| slot.binding.type == ResourceType::StorageImage) {
+				std::cerr << "[RHI] 顶点/细分/几何阶段引用可写 storage 资源 \""
+					<< slot.binding.name
+					<< "\"；请在 shader 中声明 readonly，或使用支持 vertexPipelineStoresAndAtomics 的设备\n";
+			}
+		}
+	}
+
 	std::vector<std::unique_ptr<DescriptorSetLayout>> layouts;
 	VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
-	if (!BuildSetLayouts(merged, desc.pushConstantSize, allStages, layouts, pipelineLayout))
+	if (!BuildSetLayouts(merged, desc.pushConstantSize, allStages, externalSet0, layouts, pipelineLayout))
 		return nullptr;
 
-	// ---- shader 模块（复用已读的 SPIR-V code；入口固定 main）----
 	auto createModule = [&](const std::vector<uint32_t>& code, VkShaderModule& out) {
 		VkShaderModuleCreateInfo moduleCI{};
 		moduleCI.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
@@ -1963,10 +2182,6 @@ std::unique_ptr<Pipeline> Device::CreatePipeline(const GraphicsPipelineDesc& des
 		stages[i].pName = "main";
 	}
 
-	// ---- 固定功能状态 ----
-	// 顶点输入：声明为空 = 走缺省——从 Vertex 阶段反射派生「单流、交错排布」布局；
-	// shader 无用户输入时派生结果为空，即沿用 gl_VertexIndex 生成顶点（全屏三角形）。
-	// 任一向量非空 = 整条按显式声明直译（多流/per-instance/非 float 格式等场景）
 	std::vector<VkVertexInputBindingDescription> vkBindings;
 	std::vector<VkVertexInputAttributeDescription> vkAttributes;
 	if (desc.vertexBindings.empty() && desc.vertexAttributes.empty()) {
@@ -2010,7 +2225,6 @@ std::unique_ptr<Pipeline> Device::CreatePipeline(const GraphicsPipelineDesc& des
 	inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
 	inputAssembly.topology = ToVkTopology(desc.topology);
 
-	// viewport/scissor 走动态态（CommandList::SetViewport 设置）；结构中的 count 仍须 >= 1
 	VkPipelineViewportStateCreateInfo viewportState{};
 	viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
 	viewportState.viewportCount = 1;
@@ -2026,36 +2240,61 @@ std::unique_ptr<Pipeline> Device::CreatePipeline(const GraphicsPipelineDesc& des
 	rasterization.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
 	rasterization.polygonMode = VK_POLYGON_MODE_FILL;
 	rasterization.cullMode = ToVkCullMode(desc.cullMode);
-	rasterization.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; // 与 GLSL 约定一致
+	rasterization.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
 	rasterization.lineWidth = 1.0f;
 
 	VkPipelineMultisampleStateCreateInfo multisample{};
 	multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
 	multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
 
-	// 无深度附件时必须关闭深度测试/写入，否则语义与实际附件不符
 	const bool hasDepth = desc.depthFormat != ImageFormat::None;
+	const bool hasStencil = desc.depthFormat == ImageFormat::D24S8;
+	const DepthStencilState& ds = desc.depthStencil;
+	rasterization.depthBiasEnable = ds.depthBiasEnable ? VK_TRUE : VK_FALSE;
+	rasterization.depthBiasConstantFactor = ds.depthBiasConstant;
+	rasterization.depthBiasSlopeFactor = ds.depthBiasSlope;
+	rasterization.depthBiasClamp = ds.depthBiasClamp;
+	VkStencilOpState frontFace{};
+	VkStencilOpState backFace{};
+	auto fillStencilFace = [](VkStencilOpState& out, const StencilFaceState& face) {
+		out.failOp = ToVkStencilOp(face.failOp);
+		out.passOp = ToVkStencilOp(face.passOp);
+		out.depthFailOp = ToVkStencilOp(face.depthFailOp);
+		out.compareOp = ToVkCompareOp(face.compareOp);
+		out.compareMask = face.compareMask;
+		out.writeMask = face.writeMask;
+		out.reference = face.reference;
+	};
+	fillStencilFace(frontFace, ds.front);
+	fillStencilFace(backFace, ds.back);
+
 	VkPipelineDepthStencilStateCreateInfo depthStencil{};
 	depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-	depthStencil.depthTestEnable = (hasDepth && desc.depthTestEnable) ? VK_TRUE : VK_FALSE;
-	depthStencil.depthWriteEnable = (hasDepth && desc.depthWriteEnable) ? VK_TRUE : VK_FALSE;
-	depthStencil.depthCompareOp = ToVkCompareOp(desc.depthCompareOp);
-	depthStencil.maxDepthBounds = 1.0f;
+	depthStencil.depthTestEnable = (hasDepth && ds.depthTestEnable) ? VK_TRUE : VK_FALSE;
+	depthStencil.depthWriteEnable = (hasDepth && ds.depthWriteEnable) ? VK_TRUE : VK_FALSE;
+	depthStencil.depthCompareOp = ToVkCompareOp(ds.depthCompareOp);
+	depthStencil.depthBoundsTestEnable = (hasDepth && ds.depthBoundsTestEnable && m_depthBoundsSupported)
+		? VK_TRUE : VK_FALSE;
+	depthStencil.minDepthBounds = ds.minDepthBounds;
+	depthStencil.maxDepthBounds = ds.maxDepthBounds;
+	depthStencil.stencilTestEnable = (hasStencil && ds.stencilTestEnable) ? VK_TRUE : VK_FALSE;
+	depthStencil.front = frontFace;
+	depthStencil.back = backFace;
 
-	// 每个颜色槽一份混合状态；数量必须等于 colorAttachmentCount
+	const ColorAttachmentState defaultColorState{};
 	std::vector<VkPipelineColorBlendAttachmentState> blendAttachments;
 	blendAttachments.reserve(desc.colorAttachmentCount);
 	for (uint32_t i = 0; i < desc.colorAttachmentCount; ++i) {
+		const ColorAttachmentState& st = desc.colorStates.empty() ? defaultColorState : desc.colorStates[i];
 		VkPipelineColorBlendAttachmentState blend{};
-		blend.blendEnable = desc.blendEnable ? VK_TRUE : VK_FALSE;
-		blend.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
-		blend.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
-		blend.colorBlendOp = VK_BLEND_OP_ADD;
-		blend.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
-		blend.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
-		blend.alphaBlendOp = VK_BLEND_OP_ADD;
-		blend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
-			| VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+		blend.blendEnable = st.enableBlend ? VK_TRUE : VK_FALSE;
+		blend.srcColorBlendFactor = ToVkBlendFactor(st.srcColor);
+		blend.dstColorBlendFactor = ToVkBlendFactor(st.dstColor);
+		blend.colorBlendOp = ToVkBlendOp(st.colorOp);
+		blend.srcAlphaBlendFactor = ToVkBlendFactor(st.srcAlpha);
+		blend.dstAlphaBlendFactor = ToVkBlendFactor(st.dstAlpha);
+		blend.alphaBlendOp = ToVkBlendOp(st.alphaOp);
+		blend.colorWriteMask = ToVkColorWriteMask(st.writeMask);
 		blendAttachments.push_back(blend);
 	}
 
@@ -2063,14 +2302,13 @@ std::unique_ptr<Pipeline> Device::CreatePipeline(const GraphicsPipelineDesc& des
 	colorBlend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
 	colorBlend.attachmentCount = static_cast<uint32_t>(blendAttachments.size());
 	colorBlend.pAttachments = blendAttachments.empty() ? nullptr : blendAttachments.data();
+	std::copy(desc.blendConstants.begin(), desc.blendConstants.end(), colorBlend.blendConstants);
 
-	// ---- dynamic rendering 的附件格式签名 ----
 	std::vector<VkFormat> colorFormats;
 	colorFormats.reserve(desc.colorAttachmentCount);
 	for (uint32_t i = 0; i < desc.colorAttachmentCount; ++i) {
 		colorFormats.push_back(ToVkFormat(desc.colorFormats[i]));
 	}
-	// D24S8 带模版分量，须同时声明；D32F 无模版，stencil 留 UNDEFINED
 	const VkFormat depthFormat = hasDepth ? ToVkFormat(desc.depthFormat) : VK_FORMAT_UNDEFINED;
 	const VkFormat stencilFormat = (desc.depthFormat == ImageFormat::D24S8)
 		? VK_FORMAT_D24_UNORM_S8_UINT : VK_FORMAT_UNDEFINED;
@@ -2082,6 +2320,12 @@ std::unique_ptr<Pipeline> Device::CreatePipeline(const GraphicsPipelineDesc& des
 	renderingInfo.depthAttachmentFormat = depthFormat;
 	renderingInfo.stencilAttachmentFormat = stencilFormat;
 
+	VkPipelineTessellationStateCreateInfo tessellation{};
+	if (hasTess) {
+		tessellation.sType = VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO;
+		tessellation.patchControlPoints = desc.tessPatchControlPoints;
+	}
+
 	VkGraphicsPipelineCreateInfo pipelineCI{};
 	pipelineCI.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
 	pipelineCI.pNext = &renderingInfo;
@@ -2089,6 +2333,7 @@ std::unique_ptr<Pipeline> Device::CreatePipeline(const GraphicsPipelineDesc& des
 	pipelineCI.pStages = stages.data();
 	pipelineCI.pVertexInputState = &vertexInput;
 	pipelineCI.pInputAssemblyState = &inputAssembly;
+	pipelineCI.pTessellationState = hasTess ? &tessellation : nullptr;
 	pipelineCI.pViewportState = &viewportState;
 	pipelineCI.pRasterizationState = &rasterization;
 	pipelineCI.pMultisampleState = &multisample;
@@ -2096,9 +2341,9 @@ std::unique_ptr<Pipeline> Device::CreatePipeline(const GraphicsPipelineDesc& des
 	pipelineCI.pColorBlendState = &colorBlend;
 	pipelineCI.pDynamicState = &dynamicState;
 	pipelineCI.layout = pipelineLayout;
-	pipelineCI.renderPass = VK_NULL_HANDLE;      // dynamic rendering
+	pipelineCI.renderPass = VK_NULL_HANDLE;
 	pipelineCI.basePipelineHandle = VK_NULL_HANDLE;
-	pipelineCI.basePipelineIndex = -1;           // 零初始化会给 0，须显式写 -1
+	pipelineCI.basePipelineIndex = -1;
 
 	VkPipeline pipeline = VK_NULL_HANDLE;
 	const VkResult result = vkCreateGraphicsPipelines(m_device, m_pipelineCache, 1, &pipelineCI, nullptr, &pipeline);
@@ -2115,9 +2360,8 @@ std::unique_ptr<Pipeline> Device::CreatePipeline(const GraphicsPipelineDesc& des
 		desc.pushConstantSize, allStages, VK_PIPELINE_BIND_POINT_GRAPHICS, std::move(layouts)));
 }
 
-// 计算管线：单 Compute 阶段；描述符布局同样由该 SPIR-V 反射得出，
-// 因此计算侧的 descriptor set 分配 / 写入与图形侧走同一套路径
-std::unique_ptr<Pipeline> Device::CreateComputePipeline(const ComputePipelineDesc& desc)
+std::unique_ptr<Pipeline> Device::CreateComputePipeline(const ComputePipelineDesc& desc,
+	const DescriptorSetLayout* externalSet0)
 {
 	if (desc.shader.stage != ShaderStage::Compute) {
 		std::cerr << "[RHI] 计算管线须声明 Compute 阶段（收到 "
@@ -2131,7 +2375,6 @@ std::unique_ptr<Pipeline> Device::CreateComputePipeline(const ComputePipelineDes
 		return nullptr;
 	}
 
-	// ---- 反射 + 合并（单 stage 也走同一路径：共用槽位校验与 stageFlags 归一化只有一份实现）----
 	std::vector<MergedDescriptor> slots;
 	VkShaderStageFlags allStages = 0;
 	if (!ReflectAndMergeBindings({ { ShaderStage::Compute, &code } }, slots, allStages))
@@ -2139,10 +2382,9 @@ std::unique_ptr<Pipeline> Device::CreateComputePipeline(const ComputePipelineDes
 
 	std::vector<std::unique_ptr<DescriptorSetLayout>> layouts;
 	VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
-	if (!BuildSetLayouts(slots, desc.pushConstantSize, allStages, layouts, pipelineLayout))
+	if (!BuildSetLayouts(slots, desc.pushConstantSize, allStages, externalSet0, layouts, pipelineLayout))
 		return nullptr;
 
-	// ---- shader 模块与计算管线 ----
 	VkShaderModuleCreateInfo moduleCI{};
 	moduleCI.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
 	moduleCI.codeSize = code.size() * sizeof(uint32_t);
@@ -2163,7 +2405,7 @@ std::unique_ptr<Pipeline> Device::CreateComputePipeline(const ComputePipelineDes
 	pipelineCI.stage.pName = "main";
 	pipelineCI.layout = pipelineLayout;
 	pipelineCI.basePipelineHandle = VK_NULL_HANDLE;
-	pipelineCI.basePipelineIndex = -1; // 零初始化会给 0，须显式写 -1
+	pipelineCI.basePipelineIndex = -1;
 
 	VkPipeline pipeline = VK_NULL_HANDLE;
 	const VkResult result = vkCreateComputePipelines(m_device, m_pipelineCache, 1, &pipelineCI, nullptr, &pipeline);
@@ -2183,12 +2425,11 @@ std::unique_ptr<Pipeline> Device::CreateComputePipeline(const ComputePipelineDes
 
 #pragma endregion
 
-#pragma region FrameSlot // 帧槽
+#pragma region FrameSlot
 
 FrameSlot::FrameSlot(VkDevice device, std::vector<uint32_t> queueFamilies)
 	: m_device(device)
 {
-	// 每队列族一池：命令缓冲只能提交到与其 pool 同族的队列
 	for (uint32_t family : queueFamilies) {
 		VkCommandPoolCreateInfo poolCI{};
 		poolCI.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
@@ -2196,14 +2437,12 @@ FrameSlot::FrameSlot(VkDevice device, std::vector<uint32_t> queueFamilies)
 		VkCommandPool pool = VK_NULL_HANDLE;
 		if (vkCreateCommandPool(m_device, &poolCI, nullptr, &pool) != VK_SUCCESS) {
 			std::cerr << "[RHI] vkCreateCommandPool 失败（family=" << family << "）\n";
-			return; // 半成品由 Device::Create 的池数量校验拦截
+			return;
 		}
 		m_pools.push_back(FamilyPool{ family, pool });
 	}
 	m_liveBuffers.resize(m_pools.size());
-	// 内部 fence 改为按需创建（见 AcquireFence）：一帧内每次提交一个，避免逐次 CPU 收账
 
-	// 时间戳查询池：每槽一池、按批复用索引。队列族不支持时间戳时写入会被跳过（见 BeginCommandList）
 	VkQueryPoolCreateInfo queryCI{};
 	queryCI.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
 	queryCI.queryType = VK_QUERY_TYPE_TIMESTAMP;
@@ -2217,7 +2456,6 @@ FrameSlot::FrameSlot(VkDevice device, std::vector<uint32_t> queueFamilies)
 FrameSlot::~FrameSlot()
 {
 	if (m_device) {
-		// 在录 buffer 先按池释放（正常路径已在 Recycle 清空；此处兜底 Begin 后未提交即销毁的场景）
 		for (size_t i = 0; i < m_pools.size() && i < m_liveBuffers.size(); ++i) {
 			auto& live = m_liveBuffers[i];
 			if (!live.empty()) {
@@ -2233,7 +2471,6 @@ FrameSlot::~FrameSlot()
 			}
 		}
 		m_fencePool.clear();
-		// 理论上 Recycle 已等过；这里只丢弃记录，句柄不归本槽所有
 		m_pending.clear();
 		if (m_timestampPool != VK_NULL_HANDLE) {
 			vkDestroyQueryPool(m_device, m_timestampPool, nullptr);
@@ -2250,7 +2487,6 @@ FrameSlot::~FrameSlot()
 
 VkCommandBuffer FrameSlot::Allocate(uint32_t queueFamily)
 {
-	// 按族查池（≤3 项线性扫）；未建池的族属调用方错误
 	size_t poolIndex = m_pools.size();
 	for (size_t i = 0; i < m_pools.size(); ++i) {
 		if (m_pools[i].family == queueFamily) { poolIndex = i; break; }
@@ -2274,7 +2510,7 @@ VkCommandBuffer FrameSlot::Allocate(uint32_t queueFamily)
 
 	VkCommandBufferBeginInfo beginCI{};
 	beginCI.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-	beginCI.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT; // 一帧内有效
+	beginCI.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 	if (vkBeginCommandBuffer(buffer, &beginCI) != VK_SUCCESS) {
 		std::cerr << "[RHI] vkBeginCommandBuffer 失败\n";
 		vkFreeCommandBuffers(m_device, m_pools[poolIndex].pool, 1, &buffer);
@@ -2287,7 +2523,6 @@ VkCommandBuffer FrameSlot::Allocate(uint32_t queueFamily)
 
 VkFence FrameSlot::AcquireFence()
 {
-	// 池中 fence 都是「等待过并复位」的空闲态（unsignaled）；耗尽时新建
 	if (!m_fencePool.empty()) {
 		VkFence fence = m_fencePool.back();
 		m_fencePool.pop_back();
@@ -2305,7 +2540,6 @@ VkFence FrameSlot::AcquireFence()
 
 void FrameSlot::ReleaseFence(VkFence fence)
 {
-	// 仅用于提交失败路径：fence 从未挂到队列上，仍保持 unsignaled，可直接归还
 	if (fence != VK_NULL_HANDLE) {
 		m_fencePool.push_back(fence);
 	}
@@ -2320,10 +2554,8 @@ void FrameSlot::MarkPending(VkFence fence, bool owned)
 
 void FrameSlot::DrainPending()
 {
-	// pending 为空绝不 wait：避免对无挂起命令的 unsignaled fence 死锁
 	if (m_pending.empty()) return;
 
-	// 一次等全部在飞提交：多队列下各批并行执行，这里只做帧末汇总
 	std::vector<VkFence> fences;
 	fences.reserve(m_pending.size());
 	for (const PendingSubmit& p : m_pending) {
@@ -2335,7 +2567,6 @@ void FrameSlot::DrainPending()
 		std::cerr << "[RHI] 帧槽回收：vkWaitForFences 失败\n";
 	}
 
-	// 内部 fence 复位后归还池；外部 fence 只等待，复位交给使用者
 	for (const PendingSubmit& p : m_pending) {
 		if (p.owned && p.fence != VK_NULL_HANDLE) {
 			vkResetFences(m_device, 1, &p.fence);
@@ -2360,7 +2591,7 @@ void FrameSlot::Recycle()
 
 #pragma endregion
 
-#pragma region CommandList // 命令录制
+#pragma region CommandList
 
 void CommandList::Barrier(std::span<const ImageBarrier> images, std::span<const BufferBarrier> buffers)
 {
@@ -2378,7 +2609,7 @@ void CommandList::Barrier(std::span<const ImageBarrier> images, std::span<const 
 		vk.dstAccessMask = ToVkAccess(b.dstAccess);
 		vk.oldLayout = ToVkImageLayout(b.oldLayout);
 		vk.newLayout = ToVkImageLayout(b.newLayout);
-		vk.srcQueueFamilyIndex = b.srcQueueFamily; // 默认 kQueueFamilyIgnored，与 IGNORED 同值；QFOT 时由调用方显式填
+		vk.srcQueueFamilyIndex = b.srcQueueFamily;
 		vk.dstQueueFamilyIndex = b.dstQueueFamily;
 		vk.image = b.image->NativeHandle();
 		vk.subresourceRange.aspectMask = ToVkAspect(b.image->NativeFormat());
@@ -2399,7 +2630,7 @@ void CommandList::Barrier(std::span<const ImageBarrier> images, std::span<const 
 		vk.srcAccessMask = ToVkAccess(b.srcAccess);
 		vk.dstStageMask = ToVkPipelineStage(b.dstStage);
 		vk.dstAccessMask = ToVkAccess(b.dstAccess);
-		vk.srcQueueFamilyIndex = b.srcQueueFamily; // 默认 kQueueFamilyIgnored，与 IGNORED 同值；QFOT 时由调用方显式填
+		vk.srcQueueFamilyIndex = b.srcQueueFamily;
 		vk.dstQueueFamilyIndex = b.dstQueueFamily;
 		vk.buffer = b.buffer->NativeHandle();
 		vk.offset = b.offset;
@@ -2416,11 +2647,29 @@ void CommandList::Barrier(std::span<const ImageBarrier> images, std::span<const 
 	vkCmdPipelineBarrier2(m_commandBuffer, &dep);
 }
 
+void CommandList::TransitionImage(Image& image, ImageLayout oldLayout, ImageLayout newLayout,
+	ImageSubresourceRange range, PipelineStage srcStage, Access srcAccess,
+	PipelineStage dstStage, Access dstAccess, uint32_t srcQueueFamily, uint32_t dstQueueFamily)
+{
+	ImageBarrier barrier;
+	barrier.image = &image;
+	barrier.range = range;
+	barrier.oldLayout = oldLayout;
+	barrier.newLayout = newLayout;
+	barrier.srcStage = srcStage;
+	barrier.dstStage = dstStage;
+	barrier.srcAccess = srcAccess;
+	barrier.dstAccess = dstAccess;
+	barrier.srcQueueFamily = srcQueueFamily;
+	barrier.dstQueueFamily = dstQueueFamily;
+	Barrier({ &barrier, 1 }, {});
+}
+
 void CommandList::BeginRendering(const RenderingInfo& info)
 {
-	if (m_commandBuffer == VK_NULL_HANDLE || info.colors == nullptr) return;
+	if (m_commandBuffer == VK_NULL_HANDLE) return;
+	if (info.colorCount > 0 && info.colors == nullptr) return;
 
-	// 颜色附件（null image 的槽位跳过，后续槽位前移）
 	std::vector<VkRenderingAttachmentInfo> colors;
 	colors.reserve(info.colorCount);
 	for (uint32_t i = 0; i < info.colorCount; ++i) {
@@ -2428,7 +2677,9 @@ void CommandList::BeginRendering(const RenderingInfo& info)
 		if (!att.image) continue;
 		VkRenderingAttachmentInfo vk{};
 		vk.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-		vk.imageView = att.image->CreateView(att.view).NativeHandle();
+		ImageViewDesc viewDesc;
+		viewDesc.range = att.range;
+		vk.imageView = att.image->CreateView(viewDesc).NativeHandle();
 		vk.imageLayout = ToVkImageLayout(att.layout);
 		vk.loadOp = ToVkLoadOp(att.load);
 		vk.storeOp = ToVkStoreOp(att.store);
@@ -2440,7 +2691,9 @@ void CommandList::BeginRendering(const RenderingInfo& info)
 	const bool hasDepth = info.depth && info.depth->image;
 	if (hasDepth) {
 		depth.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-		depth.imageView = info.depth->image->CreateView(info.depth->view).NativeHandle();
+		ImageViewDesc viewDesc;
+		viewDesc.range = info.depth->range;
+		depth.imageView = info.depth->image->CreateView(viewDesc).NativeHandle();
 		depth.imageLayout = ToVkImageLayout(info.depth->layout);
 		depth.loadOp = ToVkLoadOp(info.depth->load);
 		depth.storeOp = ToVkStoreOp(info.depth->store);
@@ -2451,7 +2704,7 @@ void CommandList::BeginRendering(const RenderingInfo& info)
 	rendering.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
 	rendering.renderArea.offset = { info.renderArea.x, info.renderArea.y };
 	rendering.renderArea.extent = { info.renderArea.width, info.renderArea.height };
-	rendering.layerCount = 1;
+	rendering.layerCount = info.layerCount == 0 ? 1 : info.layerCount;
 	rendering.colorAttachmentCount = static_cast<uint32_t>(colors.size());
 	rendering.pColorAttachments = colors.empty() ? nullptr : colors.data();
 	rendering.pDepthAttachment = hasDepth ? &depth : nullptr;
@@ -2466,9 +2719,7 @@ void CommandList::EndRendering()
 void CommandList::BindPipeline(const Pipeline& pipeline)
 {
 	if (m_commandBuffer == VK_NULL_HANDLE) return;
-	// 图形 / 计算共用入口：绑定点取自管线自身，后续描述符绑定与 push constant 沿用该点
 	vkCmdBindPipeline(m_commandBuffer, pipeline.NativeBindPoint(), pipeline.NativeHandle());
-	// 记录布局与声明，供后续 BindDescriptorSet / PushConstants 使用
 	m_pipelineLayout = pipeline.NativeLayout();
 	m_pushConstantSize = pipeline.PushConstantSize();
 	m_bindPoint = pipeline.NativeBindPoint();
@@ -2499,7 +2750,6 @@ void CommandList::SetViewport(const Viewport& viewport)
 	if (m_commandBuffer == VK_NULL_HANDLE) return;
 	VkViewport vk{ viewport.x, viewport.y, viewport.w, viewport.h, viewport.minDepth, viewport.maxDepth };
 	vkCmdSetViewport(m_commandBuffer, 0, 1, &vk);
-	// 管线开了 dynamic scissor，绘制前必须设置（VUID 07832）；与视口同矩形
 	VkRect2D scissor{ { static_cast<int32_t>(viewport.x), static_cast<int32_t>(viewport.y) },
 		{ static_cast<uint32_t>(viewport.w), static_cast<uint32_t>(viewport.h) } };
 	vkCmdSetScissor(m_commandBuffer, 0, 1, &scissor);
@@ -2548,7 +2798,6 @@ void CommandList::Dispatch(uint32_t groupCountX, uint32_t groupCountY, uint32_t 
 {
 	if (m_commandBuffer == VK_NULL_HANDLE) return;
 	if (groupCountX == 0 || groupCountY == 0 || groupCountZ == 0) {
-		// 任一维为 0 时派发无意义；Vulkan 也要求非零（VUID 00225）
 		std::cerr << "[RHI] Dispatch 工作组数须非零（" << groupCountX << ","
 			<< groupCountY << "," << groupCountZ << "）\n";
 		return;
@@ -2559,43 +2808,150 @@ void CommandList::Dispatch(uint32_t groupCountX, uint32_t groupCountY, uint32_t 
 void CommandList::DispatchIndirect(const Buffer& args, uint64_t offset)
 {
 	if (m_commandBuffer == VK_NULL_HANDLE) return;
-	// 参数为单个 VkDispatchIndirectCommand（groupCountXYZ），由缓冲内容决定
 	vkCmdDispatchIndirect(m_commandBuffer, args.NativeHandle(), offset);
+}
+
+static uint32_t TexelBytes(VkFormat format)
+{
+	switch (format) {
+	case VK_FORMAT_R8_UNORM:
+	case VK_FORMAT_S8_UINT:                              return 1;
+	case VK_FORMAT_R8G8_UNORM:
+	case VK_FORMAT_R16_SFLOAT:                           return 2;
+	case VK_FORMAT_R8G8B8A8_UNORM:
+	case VK_FORMAT_R8G8B8A8_SRGB:
+	case VK_FORMAT_B8G8R8A8_UNORM:
+	case VK_FORMAT_B8G8R8A8_SRGB:
+	case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
+	case VK_FORMAT_R32_SFLOAT:
+	case VK_FORMAT_R16G16_SFLOAT:
+	case VK_FORMAT_D32_SFLOAT:
+	case VK_FORMAT_D24_UNORM_S8_UINT:
+	case VK_FORMAT_D32_SFLOAT_S8_UINT:                   return 4;
+	case VK_FORMAT_R16G16B16A16_SFLOAT:                  return 8;
+	case VK_FORMAT_R32G32_SFLOAT:                        return 8;
+	case VK_FORMAT_R32G32B32A32_SFLOAT:                  return 16;
+	default:                                             return 0;
+	}
+}
+
+static void MipExtent(const ImageCreateInfo& desc, uint32_t mip,
+	uint32_t& width, uint32_t& height, uint32_t& depth)
+{
+	width = std::max(1u, desc.width >> mip);
+	height = std::max(1u, (desc.height == 0 ? 1u : desc.height) >> mip);
+	depth = std::max(1u, (desc.depth == 0 ? 1u : desc.depth) >> mip);
+}
+
+static bool BuildBufferImageRegion(const Buffer& buffer, const Image& image,
+	const BufferImageCopyRegion& in, VkBufferImageCopy& out)
+{
+	const ImageCreateInfo& desc = image.Desc();
+	if (in.subresource.mipLevelCount != 1) {
+		std::cerr << "[RHI] 拷贝区域须只含一个 mip\n";
+		return false;
+	}
+	ImageSubresourceRange range = in.subresource;
+	if (!NormalizeImageSubresourceRange(range, desc.mipLevels, desc.arrayLayers)) {
+		std::cerr << "[RHI] 拷贝区域子资源越界\n";
+		return false;
+	}
+
+	uint32_t mipW = 0, mipH = 0, mipD = 0;
+	MipExtent(desc, range.base.mipLevel, mipW, mipH, mipD);
+	const uint32_t extentW = in.imageExtentWidth == 0 ? mipW : in.imageExtentWidth;
+	const uint32_t extentH = in.imageExtentHeight == 0 ? mipH : in.imageExtentHeight;
+	const uint32_t extentD = in.imageExtentDepth == 0 ? mipD : in.imageExtentDepth;
+	if (in.imageOffsetX < 0 || in.imageOffsetY < 0 || in.imageOffsetZ < 0
+		|| static_cast<uint32_t>(in.imageOffsetX) + extentW > mipW
+		|| static_cast<uint32_t>(in.imageOffsetY) + extentH > mipH
+		|| static_cast<uint32_t>(in.imageOffsetZ) + extentD > mipD) {
+		std::cerr << "[RHI] 拷贝区域超出 mip 尺寸\n";
+		return false;
+	}
+
+	const uint32_t texel = TexelBytes(image.NativeFormat());
+	if (texel == 0) {
+		std::cerr << "[RHI] 拷贝区域格式不受支持\n";
+		return false;
+	}
+	const uint64_t rowLength = in.bufferRowLength == 0 ? extentW : in.bufferRowLength;
+	const uint64_t imageHeight = in.bufferImageHeight == 0 ? extentH : in.bufferImageHeight;
+	const uint64_t required = in.bufferOffset
+		+ static_cast<uint64_t>(range.layerCount) * extentD * imageHeight * rowLength * texel;
+	if (required > buffer.Desc().size) {
+		std::cerr << "[RHI] 拷贝区域超出 buffer 容量\n";
+		return false;
+	}
+
+	out.bufferOffset = in.bufferOffset;
+	out.bufferRowLength = in.bufferRowLength;
+	out.bufferImageHeight = in.bufferImageHeight;
+	out.imageSubresource.aspectMask = ToVkAspect(image.NativeFormat());
+	out.imageSubresource.mipLevel = range.base.mipLevel;
+	out.imageSubresource.baseArrayLayer = range.base.layer;
+	out.imageSubresource.layerCount = range.layerCount;
+	out.imageOffset = { in.imageOffsetX, in.imageOffsetY, in.imageOffsetZ };
+	out.imageExtent = { extentW, extentH, extentD };
+	return true;
+}
+
+void CommandList::CopyBufferToImage(const Buffer& src, Image& dst, ImageLayout dstLayout,
+	std::span<const BufferImageCopyRegion> regions)
+{
+	if (m_commandBuffer == VK_NULL_HANDLE || regions.empty()) return;
+	std::vector<VkBufferImageCopy> vkRegions;
+	vkRegions.reserve(regions.size());
+	for (const auto& r : regions) {
+		VkBufferImageCopy vk{};
+		if (BuildBufferImageRegion(src, dst, r, vk))
+			vkRegions.push_back(vk);
+	}
+	if (vkRegions.empty()) return;
+	vkCmdCopyBufferToImage(m_commandBuffer, src.NativeHandle(), dst.NativeHandle(),
+		ToVkImageLayout(dstLayout), static_cast<uint32_t>(vkRegions.size()), vkRegions.data());
 }
 
 void CommandList::CopyBufferToImage(const Buffer& src, Image& dst, ImageLayout dstLayout, uint64_t bufferOffset)
 {
-	if (m_commandBuffer == VK_NULL_HANDLE) return;
 	const ImageCreateInfo& desc = dst.Desc();
-
-	// 单 region 覆盖全层（接口未暴露逐 region 拷贝；仅 mip0，逐 mip 待接口扩展）。
-	// 层数取图像实际数组层数：VK_REMAINING_ARRAY_LAYERS 需 maintenance5 特性，未启用时非法
-	VkBufferImageCopy region{};
+	BufferImageCopyRegion region;
 	region.bufferOffset = bufferOffset;
-	region.imageSubresource.aspectMask = ToVkAspect(dst.NativeFormat());
-	region.imageSubresource.mipLevel = 0;
-	region.imageSubresource.baseArrayLayer = 0;
-	region.imageSubresource.layerCount = desc.arrayLayers == 0 ? 1 : desc.arrayLayers;
-	region.imageExtent = { desc.width, desc.height, desc.depth };
-	vkCmdCopyBufferToImage(m_commandBuffer, src.NativeHandle(), dst.NativeHandle(),
-		ToVkImageLayout(dstLayout), 1, &region);
+	region.subresource = { { 0, 0 }, 1, desc.arrayLayers == 0 ? 1 : desc.arrayLayers };
+	region.imageExtentWidth = desc.width;
+	region.imageExtentHeight = desc.height;
+	region.imageExtentDepth = desc.depth;
+	CopyBufferToImage(src, dst, dstLayout,
+		std::span<const BufferImageCopyRegion>(&region, 1));
+}
+
+void CommandList::CopyImageToBuffer(const Image& src, const Buffer& dst, ImageLayout srcLayout,
+	std::span<const BufferImageCopyRegion> regions)
+{
+	if (m_commandBuffer == VK_NULL_HANDLE || regions.empty()) return;
+	std::vector<VkBufferImageCopy> vkRegions;
+	vkRegions.reserve(regions.size());
+	for (const auto& r : regions) {
+		VkBufferImageCopy vk{};
+		if (BuildBufferImageRegion(dst, src, r, vk))
+			vkRegions.push_back(vk);
+	}
+	if (vkRegions.empty()) return;
+	vkCmdCopyImageToBuffer(m_commandBuffer, src.NativeHandle(), ToVkImageLayout(srcLayout),
+		dst.NativeHandle(), static_cast<uint32_t>(vkRegions.size()), vkRegions.data());
 }
 
 void CommandList::CopyImageToBuffer(const Image& src, const Buffer& dst, ImageLayout srcLayout, uint64_t bufferOffset)
 {
-	if (m_commandBuffer == VK_NULL_HANDLE) return;
 	const ImageCreateInfo& desc = src.Desc();
-
-	// 与 CopyBufferToImage 对称：全层 mip0 紧打包回读；bufferOffset 是 destination 侧起点
-	VkBufferImageCopy region{};
+	BufferImageCopyRegion region;
 	region.bufferOffset = bufferOffset;
-	region.imageSubresource.aspectMask = ToVkAspect(src.NativeFormat());
-	region.imageSubresource.mipLevel = 0;
-	region.imageSubresource.baseArrayLayer = 0;
-	region.imageSubresource.layerCount = desc.arrayLayers == 0 ? 1 : desc.arrayLayers;
-	region.imageExtent = { desc.width, desc.height, desc.depth };
-	vkCmdCopyImageToBuffer(m_commandBuffer, src.NativeHandle(), ToVkImageLayout(srcLayout),
-		dst.NativeHandle(), 1, &region);
+	region.subresource = { { 0, 0 }, 1, desc.arrayLayers == 0 ? 1 : desc.arrayLayers };
+	region.imageExtentWidth = desc.width;
+	region.imageExtentHeight = desc.height;
+	region.imageExtentDepth = desc.depth;
+	CopyImageToBuffer(src, dst, srcLayout,
+		std::span<const BufferImageCopyRegion>(&region, 1));
 }
 
 void CommandList::CopyBuffer(const Buffer& src, const Buffer& dst, uint64_t srcOffset,
@@ -2613,77 +2969,223 @@ void CommandList::CopyBuffer(const Buffer& src, const Buffer& dst, uint64_t srcO
 	vkCmdCopyBuffer(m_commandBuffer, src.NativeHandle(), dst.NativeHandle(), 1, &region);
 }
 
-void CommandList::CopyImage(const Image& src, Image& dst, ImageLayout srcLayout, ImageLayout dstLayout)
+void CommandList::CopyImage(const Image& src, Image& dst, ImageLayout srcLayout, ImageLayout dstLayout,
+	std::span<const ImageCopyRegion> regions)
 {
-	if (m_commandBuffer == VK_NULL_HANDLE) return;
+	if (m_commandBuffer == VK_NULL_HANDLE || regions.empty()) return;
+	if (src.NativeFormat() != dst.NativeFormat()) {
+		std::cerr << "[RHI] image 拷贝要求相同格式\n";
+		return;
+	}
 	const ImageCreateInfo& s = src.Desc();
 	const ImageCreateInfo& d = dst.Desc();
 
-	// 单 region 覆盖全层 mip0：同格式同尺寸时走拷贝（缩放请用 BlitImage）
-	VkImageCopy region{};
-	region.srcSubresource.aspectMask = ToVkAspect(src.NativeFormat());
-	region.srcSubresource.mipLevel = 0;
-	region.srcSubresource.baseArrayLayer = 0;
-	region.srcSubresource.layerCount = s.arrayLayers == 0 ? 1 : s.arrayLayers;
-	region.dstSubresource.aspectMask = ToVkAspect(dst.NativeFormat());
-	region.dstSubresource.mipLevel = 0;
-	region.dstSubresource.baseArrayLayer = 0;
-	region.dstSubresource.layerCount = d.arrayLayers == 0 ? 1 : d.arrayLayers;
-	region.extent = { s.width, s.height, s.depth };
+	std::vector<VkImageCopy> vkRegions;
+	vkRegions.reserve(regions.size());
+	for (const auto& r : regions) {
+		if (r.srcSubresource.mipLevelCount != 1 || r.dstSubresource.mipLevelCount != 1) {
+			std::cerr << "[RHI] image 拷贝区域须各只含一个 mip\n";
+			continue;
+		}
+		ImageSubresourceRange srcRange = r.srcSubresource;
+		ImageSubresourceRange dstRange = r.dstSubresource;
+		if (!NormalizeImageSubresourceRange(srcRange, s.mipLevels, s.arrayLayers)
+			|| !NormalizeImageSubresourceRange(dstRange, d.mipLevels, d.arrayLayers)) {
+			std::cerr << "[RHI] image 拷贝区域子资源越界\n";
+			continue;
+		}
+		if (srcRange.layerCount != dstRange.layerCount) {
+			std::cerr << "[RHI] image 拷贝的源/目的层数须一致\n";
+			continue;
+		}
+		uint32_t srcW = 0, srcH = 0, srcD = 0;
+		uint32_t dstW = 0, dstH = 0, dstD = 0;
+		MipExtent(s, srcRange.base.mipLevel, srcW, srcH, srcD);
+		MipExtent(d, dstRange.base.mipLevel, dstW, dstH, dstD);
+		const uint32_t ew = r.extentWidth == 0 ? srcW : r.extentWidth;
+		const uint32_t eh = r.extentHeight == 0 ? srcH : r.extentHeight;
+		const uint32_t ed = r.extentDepth == 0 ? srcD : r.extentDepth;
+		if (r.srcOffsetX < 0 || r.srcOffsetY < 0 || r.srcOffsetZ < 0
+			|| r.dstOffsetX < 0 || r.dstOffsetY < 0 || r.dstOffsetZ < 0
+			|| static_cast<uint32_t>(r.srcOffsetX) + ew > srcW
+			|| static_cast<uint32_t>(r.srcOffsetY) + eh > srcH
+			|| static_cast<uint32_t>(r.srcOffsetZ) + ed > srcD
+			|| static_cast<uint32_t>(r.dstOffsetX) + ew > dstW
+			|| static_cast<uint32_t>(r.dstOffsetY) + eh > dstH
+			|| static_cast<uint32_t>(r.dstOffsetZ) + ed > dstD) {
+			std::cerr << "[RHI] image 拷贝区域越界\n";
+			continue;
+		}
+
+		VkImageCopy vk{};
+		vk.srcSubresource.aspectMask = ToVkAspect(src.NativeFormat());
+		vk.srcSubresource.mipLevel = srcRange.base.mipLevel;
+		vk.srcSubresource.baseArrayLayer = srcRange.base.layer;
+		vk.srcSubresource.layerCount = srcRange.layerCount;
+		vk.dstSubresource.aspectMask = ToVkAspect(dst.NativeFormat());
+		vk.dstSubresource.mipLevel = dstRange.base.mipLevel;
+		vk.dstSubresource.baseArrayLayer = dstRange.base.layer;
+		vk.dstSubresource.layerCount = dstRange.layerCount;
+		vk.srcOffset = { r.srcOffsetX, r.srcOffsetY, r.srcOffsetZ };
+		vk.dstOffset = { r.dstOffsetX, r.dstOffsetY, r.dstOffsetZ };
+		vk.extent = { ew, eh, ed };
+		vkRegions.push_back(vk);
+	}
+	if (vkRegions.empty()) return;
 	vkCmdCopyImage(m_commandBuffer, src.NativeHandle(), ToVkImageLayout(srcLayout),
-		dst.NativeHandle(), ToVkImageLayout(dstLayout), 1, &region);
+		dst.NativeHandle(), ToVkImageLayout(dstLayout),
+		static_cast<uint32_t>(vkRegions.size()), vkRegions.data());
+}
+
+void CommandList::CopyImage(const Image& src, Image& dst, ImageLayout srcLayout, ImageLayout dstLayout)
+{
+	const ImageCreateInfo& s = src.Desc();
+	ImageCopyRegion region;
+	region.srcSubresource = { { 0, 0 }, 1, s.arrayLayers == 0 ? 1 : s.arrayLayers };
+	region.dstSubresource = { { 0, 0 }, 1, dst.Desc().arrayLayers == 0 ? 1 : dst.Desc().arrayLayers };
+	region.extentWidth = s.width;
+	region.extentHeight = s.height;
+	region.extentDepth = s.depth;
+	CopyImage(src, dst, srcLayout, dstLayout, std::span<const ImageCopyRegion>(&region, 1));
+}
+
+void CommandList::BlitImage(const Image& src, Image& dst, ImageLayout srcLayout, ImageLayout dstLayout,
+	std::span<const ImageBlitRegion> regions, bool linearFilter)
+{
+	if (m_commandBuffer == VK_NULL_HANDLE || regions.empty()) return;
+	if (src.NativeFormat() != dst.NativeFormat()) {
+		std::cerr << "[RHI] image blit 要求相同格式\n";
+		return;
+	}
+	const ImageCreateInfo& s = src.Desc();
+	const ImageCreateInfo& d = dst.Desc();
+	const VkImageAspectFlags aspect = ToVkAspect(src.NativeFormat());
+	const bool depthStencil = aspect != VK_IMAGE_ASPECT_COLOR_BIT;
+	if (depthStencil && linearFilter) {
+		std::cerr << "[RHI] 深度/模板 blit 不支持线性过滤，已改用最近邻\n";
+		linearFilter = false;
+	}
+
+	std::vector<VkImageBlit> vkRegions;
+	vkRegions.reserve(regions.size());
+	for (const auto& r : regions) {
+		if (r.srcSubresource.mipLevelCount != 1 || r.dstSubresource.mipLevelCount != 1) {
+			std::cerr << "[RHI] blit 区域须各只含一个 mip\n";
+			continue;
+		}
+		ImageSubresourceRange srcRange = r.srcSubresource;
+		ImageSubresourceRange dstRange = r.dstSubresource;
+		if (!NormalizeImageSubresourceRange(srcRange, s.mipLevels, s.arrayLayers)
+			|| !NormalizeImageSubresourceRange(dstRange, d.mipLevels, d.arrayLayers)) {
+			std::cerr << "[RHI] blit 区域子资源越界\n";
+			continue;
+		}
+		if (srcRange.layerCount != dstRange.layerCount) {
+			std::cerr << "[RHI] blit 的源/目的层数须一致\n";
+			continue;
+		}
+		if (r.srcOffsetX1 <= r.srcOffsetX0 || r.srcOffsetY1 <= r.srcOffsetY0
+			|| r.srcOffsetZ1 <= r.srcOffsetZ0 || r.dstOffsetX1 <= r.dstOffsetX0
+			|| r.dstOffsetY1 <= r.dstOffsetY0 || r.dstOffsetZ1 <= r.dstOffsetZ0) {
+			std::cerr << "[RHI] blit 偏移区间无效\n";
+			continue;
+		}
+
+		VkImageBlit vk{};
+		vk.srcSubresource.aspectMask = ToVkAspect(src.NativeFormat());
+		vk.srcSubresource.mipLevel = srcRange.base.mipLevel;
+		vk.srcSubresource.baseArrayLayer = srcRange.base.layer;
+		vk.srcSubresource.layerCount = srcRange.layerCount;
+		vk.srcOffsets[0] = { r.srcOffsetX0, r.srcOffsetY0, r.srcOffsetZ0 };
+		vk.srcOffsets[1] = { r.srcOffsetX1, r.srcOffsetY1, r.srcOffsetZ1 };
+		vk.dstSubresource.aspectMask = ToVkAspect(dst.NativeFormat());
+		vk.dstSubresource.mipLevel = dstRange.base.mipLevel;
+		vk.dstSubresource.baseArrayLayer = dstRange.base.layer;
+		vk.dstSubresource.layerCount = dstRange.layerCount;
+		vk.dstOffsets[0] = { r.dstOffsetX0, r.dstOffsetY0, r.dstOffsetZ0 };
+		vk.dstOffsets[1] = { r.dstOffsetX1, r.dstOffsetY1, r.dstOffsetZ1 };
+		vkRegions.push_back(vk);
+	}
+	if (vkRegions.empty()) return;
+	vkCmdBlitImage(m_commandBuffer, src.NativeHandle(), ToVkImageLayout(srcLayout),
+		dst.NativeHandle(), ToVkImageLayout(dstLayout),
+		static_cast<uint32_t>(vkRegions.size()), vkRegions.data(),
+		linearFilter ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
 }
 
 void CommandList::BlitImage(const Image& src, Image& dst, ImageLayout srcLayout, ImageLayout dstLayout,
 	bool linearFilter)
 {
-	if (m_commandBuffer == VK_NULL_HANDLE) return;
 	const ImageCreateInfo& s = src.Desc();
 	const ImageCreateInfo& d = dst.Desc();
+	ImageBlitRegion region;
+	region.srcSubresource = { { 0, 0 }, 1, s.arrayLayers == 0 ? 1 : s.arrayLayers };
+	region.dstSubresource = { { 0, 0 }, 1, d.arrayLayers == 0 ? 1 : d.arrayLayers };
+	region.srcOffsetX1 = static_cast<int32_t>(s.width);
+	region.srcOffsetY1 = static_cast<int32_t>(s.height);
+	region.srcOffsetZ1 = static_cast<int32_t>(s.depth);
+	region.dstOffsetX1 = static_cast<int32_t>(d.width);
+	region.dstOffsetY1 = static_cast<int32_t>(d.height);
+	region.dstOffsetZ1 = static_cast<int32_t>(d.depth);
+	BlitImage(src, dst, srcLayout, dstLayout, std::span<const ImageBlitRegion>(&region, 1), linearFilter);
+}
 
-	// 源/目的 extent 各按自身尺寸：目的小于源即下采样，反之放大
-	VkImageBlit region{};
-	region.srcSubresource.aspectMask = ToVkAspect(src.NativeFormat());
-	region.srcSubresource.mipLevel = 0;
-	region.srcSubresource.baseArrayLayer = 0;
-	region.srcSubresource.layerCount = s.arrayLayers == 0 ? 1 : s.arrayLayers;
-	region.srcOffsets[1] = { static_cast<int32_t>(s.width), static_cast<int32_t>(s.height),
-		static_cast<int32_t>(s.depth) };
-	region.dstSubresource.aspectMask = ToVkAspect(dst.NativeFormat());
-	region.dstSubresource.mipLevel = 0;
-	region.dstSubresource.baseArrayLayer = 0;
-	region.dstSubresource.layerCount = d.arrayLayers == 0 ? 1 : d.arrayLayers;
-	region.dstOffsets[1] = { static_cast<int32_t>(d.width), static_cast<int32_t>(d.height),
-		static_cast<int32_t>(d.depth) };
-	vkCmdBlitImage(m_commandBuffer, src.NativeHandle(), ToVkImageLayout(srcLayout),
-		dst.NativeHandle(), ToVkImageLayout(dstLayout), 1, &region,
-		linearFilter ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+void CommandList::ClearImage(Image& image, ImageSubresourceRange range, ImageLayout layout,
+	const ClearValue& value)
+{
+	if (m_commandBuffer == VK_NULL_HANDLE) return;
+	const ImageCreateInfo& desc = image.Desc();
+	if (!NormalizeImageSubresourceRange(range, desc.mipLevels, desc.arrayLayers)) {
+		std::cerr << "[RHI] 清场范围越界\n";
+		return;
+	}
+	const VkImageAspectFlags aspect = ToVkAspect(image.NativeFormat());
+	VkImageSubresourceRange vkRange{};
+	vkRange.aspectMask = aspect;
+	vkRange.baseMipLevel = range.base.mipLevel;
+	vkRange.levelCount = range.mipLevelCount;
+	vkRange.baseArrayLayer = range.base.layer;
+	vkRange.layerCount = range.layerCount;
+
+	if (aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) {
+		const DepthStencilValue* ds = std::get_if<DepthStencilValue>(&value.value);
+		if (ds == nullptr) {
+			std::cerr << "[RHI] 深度/模板清场值类型不匹配\n";
+			return;
+		}
+		VkClearDepthStencilValue vk{ ds->depth, ds->stencil };
+		vkCmdClearDepthStencilImage(m_commandBuffer, image.NativeHandle(),
+			ToVkImageLayout(layout), &vk, 1, &vkRange);
+	}
+	else {
+		const std::array<float, 4>* color = std::get_if<std::array<float, 4>>(&value.value);
+		if (color == nullptr) {
+			std::cerr << "[RHI] 颜色清场值类型不匹配\n";
+			return;
+		}
+		VkClearColorValue vk{ { (*color)[0], (*color)[1], (*color)[2], (*color)[3] } };
+		vkCmdClearColorImage(m_commandBuffer, image.NativeHandle(),
+			ToVkImageLayout(layout), &vk, 1, &vkRange);
+	}
 }
 
 void CommandList::ClearColor(Image& image, ImageSubresource view, const float rgba[4], ImageLayout layout)
 {
-	if (m_commandBuffer == VK_NULL_HANDLE || rgba == nullptr) return;
-	VkClearColorValue color{ { rgba[0], rgba[1], rgba[2], rgba[3] } };
-	VkImageSubresourceRange range{};
-	range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; // ClearColorImage 仅允许 color aspect
-	range.baseMipLevel = view.mipLevel;
-	range.levelCount = 1;
-	range.baseArrayLayer = view.layer;
-	range.layerCount = 1;
-	vkCmdClearColorImage(m_commandBuffer, image.NativeHandle(), ToVkImageLayout(layout), &color, 1, &range);
+	if (rgba == nullptr) return;
+	ClearValue value;
+	value.value = std::array<float, 4>{ rgba[0], rgba[1], rgba[2], rgba[3] };
+	ClearImage(image, ImageSubresourceRange{ { view.mipLevel, view.layer }, 1, 1 }, layout, value);
 }
 
 void CommandList::ResetTimestamps(uint32_t first, uint32_t count)
 {
 	if (m_commandBuffer == VK_NULL_HANDLE || m_timestampPool == VK_NULL_HANDLE || count == 0) return;
-	// 查询池按帧槽复用，重置与写入同一批：靠帧槽回收（已等在飞）保证旧查询不再被引用
 	vkCmdResetQueryPool(m_commandBuffer, m_timestampPool, first, count);
 }
 
 void CommandList::WriteTimestamp(uint32_t index)
 {
 	if (m_commandBuffer == VK_NULL_HANDLE || m_timestampPool == VK_NULL_HANDLE) return;
-	// ALL_COMMANDS：本批此前命令全部完成的时刻（批尾即整批结束，批首即队列开始执行本批）
 	vkCmdWriteTimestamp2(m_commandBuffer, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, m_timestampPool, index);
 }
 
@@ -2691,21 +3193,18 @@ VkCommandBuffer CommandList::NativeHandle() const { return m_commandBuffer; }
 
 #pragma endregion
 
-#pragma region Frame // 帧上下文与提交
+#pragma region Frame
 
 CommandList Device::BeginCommandList(QueueClass queue)
 {
 	CommandList list;
 	if (m_frameSlots.empty()) return list;
 
-	// 类别 -> 族（选定期已兜底，无需判空）
 	uint32_t family = m_graphicsQueueFamily;
 	if (queue == QueueClass::AsyncCompute) family = m_computeQueueFamily;
 	else if (queue == QueueClass::Transfer) family = m_transferQueueFamily;
 
-	// 回收当期槽（等在飞提交完成 -> 释放旧命令缓冲）后分配新的
-	// 注意：回收只在 WaitForFrame 做一次；帧内可多次 Begin（不同队列各录一条）
-	FrameSlot& slot = *m_frameSlots[m_frameIndex];
+	FrameSlot& slot = *m_frameSlots[m_currentFrameSlot];
 	list.m_commandBuffer = slot.Allocate(family);
 	list.m_timestampPool = m_timestampsSupported ? slot.TimestampPool() : VK_NULL_HANDLE;
 	return list;
@@ -2724,9 +3223,8 @@ uint32_t Device::QueueFamily(QueueClass cls) const
 std::uint64_t Device::Submit(const SubmitInfo& info)
 {
 	if (m_frameSlots.empty()) return 0;
-	FrameSlot& slot = *m_frameSlots[m_frameIndex];
+	FrameSlot& slot = *m_frameSlots[m_currentFrameSlot];
 
-	// 结束录制（BeginCommandList 自动 begin，Submit 自动 end）
 	std::vector<VkCommandBufferSubmitInfo> commandInfos;
 	commandInfos.reserve(info.commandLists.size());
 	for (const auto& list : info.commandLists) {
@@ -2742,7 +3240,6 @@ std::uint64_t Device::Submit(const SubmitInfo& info)
 	}
 	if (commandInfos.empty()) return 0;
 
-	// 等待信号量（acquire / 跨队列）；stageMask 禁 0，None 折到 AllCommands
 	std::vector<VkSemaphoreSubmitInfo> waitInfos;
 	waitInfos.reserve(info.waits.size());
 	for (const auto& w : info.waits) {
@@ -2752,7 +3249,7 @@ std::uint64_t Device::Submit(const SubmitInfo& info)
 		wi.semaphore = w.semaphore->NativeHandle();
 		wi.stageMask = (w.stage == PipelineStage::None)
 			? VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT : ToVkPipelineStage(w.stage);
-		wi.value = w.value; // binary 语义量必须为 0（结构体默认值即 0）
+		wi.value = w.value;
 		waitInfos.push_back(wi);
 	}
 
@@ -2765,11 +3262,10 @@ std::uint64_t Device::Submit(const SubmitInfo& info)
 		si.semaphore = s.semaphore->NativeHandle();
 		si.stageMask = (s.stage == PipelineStage::None)
 			? VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT : ToVkPipelineStage(s.stage);
-		si.value = s.value; // timeline：本批完成时把值推进到 s.value（须大于当前值）
+		si.value = s.value;
 		signalInfos.push_back(si);
 	}
 
-	// 队列 GPU timeline：每次提交自动推进一个值，主机侧可 QueueTimeline(queue)->Wait(value) 等这批完成
 	std::uint64_t timelineValue = 0;
 	const uint32_t queueIndex = static_cast<uint32_t>(info.queue);
 	if (m_queueTimelines[queueIndex]) {
@@ -2782,8 +3278,6 @@ std::uint64_t Device::Submit(const SubmitInfo& info)
 		signalInfos.push_back(ti);
 	}
 
-	// fence：外部优先（帧末由 RHI 等待，Reset 复用交给使用者）；
-	// 内部 fence 每次提交独立取一个，且不在提交时等待任何在飞提交 —— 多队列批才能并行
 	VkFence fence = VK_NULL_HANDLE;
 	bool ownedFence = false;
 	if (info.signalFence) {
@@ -2793,7 +3287,6 @@ std::uint64_t Device::Submit(const SubmitInfo& info)
 		ownedFence = true;
 	}
 
-	// 目标队列：类别映射（选定期已兜底）；commandLists 须全部来自同族池
 	VkQueue targetQueue = m_graphicsQueue;
 	if (info.queue == QueueClass::AsyncCompute) targetQueue = m_computeQueue;
 	else if (info.queue == QueueClass::Transfer) targetQueue = m_transferQueue;
@@ -2809,8 +3302,8 @@ std::uint64_t Device::Submit(const SubmitInfo& info)
 
 	if (vkQueueSubmit2(targetQueue, 1, &submitInfo, fence) != VK_SUCCESS) {
 		std::cerr << "[RHI] vkQueueSubmit2 失败\n";
-		if (ownedFence) slot.ReleaseFence(fence); // 未挂到队列，fence 仍是空闲态
-		if (timelineValue != 0) --m_queueTimelineValue[queueIndex]; // 撤回未生效的值分配
+		if (ownedFence) slot.ReleaseFence(fence);
+		if (timelineValue != 0) --m_queueTimelineValue[queueIndex];
 		return 0;
 	}
 	slot.MarkPending(fence, ownedFence);
@@ -2829,11 +3322,32 @@ std::uint64_t Device::LastQueueTimelineValue(QueueClass cls) const
 	return (index < 3) ? m_queueTimelineValue[index] : 0;
 }
 
+uint32_t Device::BeginFrame()
+{
+	if (m_frameSlots.empty()) return 0;
+	const uint32_t slotCount = static_cast<uint32_t>(m_frameSlots.size());
+	const uint32_t slotIndex = m_frameIndex;
+
+	if (m_framesBegun >= slotCount)
+		m_frameSlots[slotIndex]->Recycle();
+
+	m_currentFrameSlot = slotIndex;
+	m_frameIndex = (slotIndex + 1) % slotCount;
+	++m_framesBegun;
+	return slotIndex;
+}
+
 void Device::WaitForFrame()
 {
 	if (m_frameSlots.empty()) return;
-	m_frameSlots[m_frameIndex]->Recycle();
-	m_frameIndex = (m_frameIndex + 1) % static_cast<uint32_t>(m_frameSlots.size());
+	m_frameSlots[m_currentFrameSlot]->Recycle();
+}
+
+void Device::WaitAllFrames()
+{
+	for (auto& slot : m_frameSlots) {
+		if (slot) slot->Recycle();
+	}
 }
 
 bool Device::ReadFrameTimestamps(uint32_t first, uint32_t count, std::uint64_t* out) const
@@ -2841,13 +3355,9 @@ bool Device::ReadFrameTimestamps(uint32_t first, uint32_t count, std::uint64_t* 
 	if (!m_timestampsSupported || m_frameSlots.empty() || out == nullptr || count == 0) return false;
 	if (first + count > FrameSlot::kTimestampQueries) return false;
 
-	// 刚被回收并已轮转的槽 = 刚结束那一帧（本帧的命令列表都记在它上面）
-	const uint32_t slotCount = static_cast<uint32_t>(m_frameSlots.size());
-	const uint32_t slotIndex = (m_frameIndex + slotCount - 1) % slotCount;
-	VkQueryPool pool = m_frameSlots[slotIndex]->TimestampPool();
+	VkQueryPool pool = m_frameSlots[m_currentFrameSlot]->TimestampPool();
 	if (pool == VK_NULL_HANDLE) return false;
 
-	// 该槽的 pending 已在 Recycle 中排空，故查询结果必然可用（WAIT 位只作兜底）
 	return vkGetQueryPoolResults(m_device, pool, first, count,
 		sizeof(std::uint64_t) * count, out, sizeof(std::uint64_t),
 		VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS;
@@ -2855,10 +3365,7 @@ bool Device::ReadFrameTimestamps(uint32_t first, uint32_t count, std::uint64_t* 
 
 void Device::WaitIdle()
 {
-	// WaitForFrame 只等 Submit 侧（fence）；present 消费 renderDone 等信号量不为其覆盖，
-	// 销毁信号量前须等设备完全空闲
 	if (m_device != VK_NULL_HANDLE) vkDeviceWaitIdle(m_device);
 }
 
 #pragma endregion
-

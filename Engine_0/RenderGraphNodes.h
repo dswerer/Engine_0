@@ -11,20 +11,18 @@ namespace dEngine {
 		const RenderPassDesc& get_desc() const { return mDesc; }
 		// 实例化产物（Realize 填充；execute 阶段经此取后端对象，未实例化为 nullptr）
 		const rhi::Pipeline* get_rhi() const { return m_rhiHandle.get(); }
-		// 描述符集（RealizePass 按反射的 set 顺序分配并写入；下标即 set 索引）
-		const rhi::DescriptorSet* get_set(uint32_t set) const {
-			return set < m_sets.size() ? m_sets[set].get() : nullptr;
-		}
 		// 绘制数量来源：执行参数，每帧由宿主设置（culling/LOD/indirect 都在这里变）
 		void SetDraw(const DrawSource& draw) { mDraw = draw; }
 		const DrawSource& get_draw() const { return mDraw; }
+		// push constant 运行期覆盖（须与 pipeline.pushConstantSize 匹配）
+		void SetPushConstants(const void* data, uint32_t size);
+		const std::vector<uint8_t>& get_push_constants() const { return mPushConstants; }
 	private:
-		friend RenderGraph; // 基类友元不覆盖派生类新增成员：Realize 需写入句柄
+		friend RenderGraph;
 		RenderPassDesc mDesc;
 		DrawSource mDraw {};
-		// 生命周期随节点 RAII：须保证 graph 先于 device 消亡（作用域嵌套）
+		std::vector<uint8_t> mPushConstants;
 		std::unique_ptr<rhi::Pipeline> m_rhiHandle;
-		std::vector<std::unique_ptr<rhi::DescriptorSet>> m_sets;
 	};
 
 	// 计算节点：desc 提供 shader/工作组数，句柄与描述符集由 Realize 填充
@@ -36,21 +34,17 @@ namespace dEngine {
 		Pass::Type get_type() const override { return Pass::Type::Compute; }
 		const ComputePassDesc& get_desc() const { return mDesc; }
 		const rhi::Pipeline* get_rhi() const { return m_rhiHandle.get(); }
-		const rhi::DescriptorSet* get_set(uint32_t set) const {
-			return set < m_sets.size() ? m_sets[set].get() : nullptr;
-		}
+		// push constant 运行期覆盖（须与 pushConstantSize 匹配）
+		void SetPushConstants(const void* data, uint32_t size);
+		const std::vector<uint8_t>& get_push_constants() const { return mPushConstants; }
 	private:
-		friend RenderGraph; // 基类友元不覆盖派生类新增成员：Realize 需写入句柄
+		friend RenderGraph;
 		ComputePassDesc mDesc;
-		// 生命周期随节点 RAII：须保证 graph 先于 device 消亡（作用域嵌套）
+		std::vector<uint8_t> mPushConstants;
 		std::unique_ptr<rhi::Pipeline> m_rhiHandle;
-		std::vector<std::unique_ptr<rhi::DescriptorSet>> m_sets;
 	};
 
 	// Host 节点：纯 CPU 回调（解码/上传等），不创建后端对象、不录命令。
-	// 写边在拓扑里记为 HostWrite，barrier compiler 据此产出 HOST -> GPU 阶段的内存依赖。
-	// 回调由 SubmitGraph 在独立线程执行（提交线程不阻塞），业务代码夹在
-	// HostContext::WaitForGpu() / SignalGpu() 之间
 	class HostPass : public Pass {
 	public:
 		HostPass(PassTopology&& topo, HostPassDesc desc)
@@ -80,8 +74,7 @@ namespace dEngine {
 		TransferPassDesc mDesc;
 	};
 
-	// 呈现节点：只承载布局转换（读 presentable image -> PresentSrc），无管线/描述符/命令。
-	// acquire 等待与渲染完成信号由 SubmitGraph 的 FrameSync 挂到本节点所在的批
+	// 呈现节点：只承载布局转换到 PresentSrc，无管线/描述符/命令。
 	class PresentPass : public Pass {
 	public:
 		PresentPass(PassTopology&& topo, PresentPassDesc desc)
@@ -93,38 +86,60 @@ namespace dEngine {
 		PresentPassDesc mDesc;
 	};
 
-	// 图像资源节点：一个节点 = 一个「视图身份」（名称即身份，绑定与对账都按名称）。
-	// 底层原生 image 有两种来源：
-	//   Own    — 由 ImageDesc 在 Realize 时创建，usage 由图按全图访问并集推导；
-	//   Borrow — 包装外部已创建/外部管理的 rhi::Image（交换链、外部导入，以及
-	//            「同一原生 image 出多个视图」的别名节点），不创建、不拥有、不参与 usage 汇总
+	// Mux 节点：零命令选择点，选择在 BeginFrame 的主机侧 retarget 完成。
+	class MuxPass : public Pass {
+	public:
+		MuxPass(PassTopology&& topo, MuxPassDesc desc)
+			: Pass(std::move(topo)), mDesc(std::move(desc)) {
+		}
+		Pass::Type get_type() const override { return Pass::Type::Mux; }
+		const MuxPassDesc& get_desc() const { return mDesc; }
+	private:
+		MuxPassDesc mDesc;
+	};
+
+	// 图像节点：一个节点 = 一个视图身份，可自建（Own）或借用（Borrow）。
 	class Image : public Resource {
 	public:
-		// Own：view 为本节点代表的子资源视图（默认首 mip 首层）
-		Image(ResourceTopology&& topo, ImageDesc desc, ImageSubresource view)
-			: Resource(std::move(topo)), mDesc(std::move(desc)), mView(view) {
+		// Own：view 为本节点视图（默认首 mip 首层），count=0 表示整图。
+		Image(ResourceTopology&& topo, ImageDesc desc, ImageSubresource view,
+			rhi::ImageFormat viewFormat = rhi::ImageFormat::None,
+			ImageSubresourceRange barrierRange = ImageSubresourceRange{ {}, 0, 0 })
+			: Resource(std::move(topo)), mDesc(std::move(desc)), mView(view),
+			  mViewFormat(viewFormat), mBarrierRange(barrierRange) {
 		}
 		// Borrow：不拥有底层 image，描述信息由外部 image 回填
-		Image(ResourceTopology&& topo, const rhi::Image* external, ImageSubresource view);
+		Image(ResourceTopology&& topo, const rhi::Image* external, ImageSubresource view,
+			rhi::ImageFormat viewFormat = rhi::ImageFormat::None,
+			ImageSubresourceRange barrierRange = ImageSubresourceRange{ {}, 0, 0 });
+		// Borrow-later：注册时只有 desc（如 mux 输出），句柄由 BeginFrame 的 retarget 填入
+		Image(ResourceTopology&& topo, ImageDesc desc, bool borrowedLater, ImageSubresource view,
+			rhi::ImageFormat viewFormat = rhi::ImageFormat::None,
+			ImageSubresourceRange barrierRange = ImageSubresourceRange{ {}, 0, 0 });
 
 		Resource::Type get_type() const override { return Resource::Type::Image; }
 		const ImageDesc& get_desc() const { return mDesc; }
 		// 本节点代表的子资源视图：绑定时作为起点，数组绑定按 layer 递增展开
 		ImageSubresource get_view() const { return mView; }
-		bool is_borrowed() const { return mExternal != nullptr; }
+		rhi::ImageFormat get_view_format() const { return mViewFormat; }
+		// 同步范围：count 为 0 时补齐到图像末尾；默认整图，收窄后 barrier 只转换该区间
+		ImageSubresourceRange get_barrier_range() const { return mBarrierRange; }
+		// 借用节点（含 Borrow-later）：不创建、不拥有；Borrow-later 的句柄在 retarget 前为空
+		bool is_borrowed() const { return mBorrowed; }
 		// 实例化产物（Own 为自建句柄；Borrow 直接返回外部句柄；未实例化为 nullptr）
 		const rhi::Image* get_rhi() const { return mExternal ? mExternal : m_rhiHandle.get(); }
 	private:
-		friend RenderGraph; // 基类友元不覆盖派生类新增成员：Realize 需写入句柄
+		friend RenderGraph;
 		ImageDesc mDesc;
 		ImageSubresource mView {};
-		// 生命周期随节点 RAII：须保证 graph 先于 device 消亡（作用域嵌套）
-		std::unique_ptr<rhi::Image> m_rhiHandle;  // Own 路径
-		const rhi::Image*          mExternal = nullptr; // Borrow 路径（非拥有）
+		rhi::ImageFormat mViewFormat = rhi::ImageFormat::None;
+		ImageSubresourceRange mBarrierRange { {}, 0, 0 };
+		std::unique_ptr<rhi::Image> m_rhiHandle;
+		const rhi::Image*          mExternal = nullptr;
+		bool                       mBorrowed = false;
 	};
 
-	// 缓冲资源节点：语义与 Image 同构——绑定与对账按名称，底层 rhi::Buffer 可自建（Own，用法来自
-	// BufferDesc）或借用外部句柄（Borrow，不创建、不拥有、不参与 usage 汇总）
+	// 缓冲节点：语义与 Image 同构，可自建（Own）或借用（Borrow）。
 	class Buffer : public Resource {
 	public:
 		// Own：按 BufferDesc 在 Realize 时创建
@@ -133,17 +148,21 @@ namespace dEngine {
 		}
 		// Borrow：不拥有底层 buffer，描述信息由外部 buffer 回填
 		Buffer(ResourceTopology&& topo, const rhi::Buffer* external);
+		// Borrow-later：注册时只有描述，句柄由运行期 retarget 填入
+		Buffer(ResourceTopology&& topo, BufferDesc desc, bool borrowedLater)
+			: Resource(std::move(topo)), mDesc(std::move(desc)), mBorrowed(borrowedLater) {
+		}
 
 		Resource::Type get_type() const override { return Resource::Type::Buffer; }
 		const BufferDesc& get_desc() const { return mDesc; }
-		bool is_borrowed() const { return mExternal != nullptr; }
+		bool is_borrowed() const { return mBorrowed; }
 		// 实例化产物（Own 为自建句柄；Borrow 直接返回外部句柄；未实例化为 nullptr）
 		const rhi::Buffer* get_rhi() const { return mExternal ? mExternal : m_rhiHandle.get(); }
 	private:
-		friend RenderGraph; // 基类友元不覆盖派生类新增成员：Realize 需写入句柄
+		friend RenderGraph;
 		BufferDesc mDesc;
-		// 生命周期随节点 RAII：须保证 graph 先于 device 消亡（作用域嵌套）
-		std::unique_ptr<rhi::Buffer> m_rhiHandle; // Own 路径
-		const rhi::Buffer*           mExternal = nullptr; // Borrow 路径（非拥有）
+		std::unique_ptr<rhi::Buffer> m_rhiHandle;
+		const rhi::Buffer*           mExternal = nullptr;
+		bool                         mBorrowed = false;
 	};
 }

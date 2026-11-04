@@ -8,14 +8,13 @@
 #include <unordered_map>
 #include <vector>
 
-// VMA 分配器句柄前置声明（VmaAllocator / VmaAllocation 实为 *_T*）；避免头文件引入 5k 行 vk_mem_alloc.h
 struct VmaAllocator_T;
 struct VmaAllocation_T;
 
 // RHI 对象层：设备、资源、管线、描述符、命令列表、交换链。
 namespace dEngine::rhi {
 
-#pragma region Device // 设备创建
+#pragma region Device
 
 	struct DeviceDesc {
 		void*    nativeWindowHandle = nullptr; // Win32 窗口句柄；为空则无 swapchain（离屏/测试）
@@ -26,7 +25,7 @@ namespace dEngine::rhi {
 
 #pragma endregion
 
-#pragma region Resource // RAII 资源对象（裸指针传给命令接口；生命周期由 Device 持有）
+#pragma region Resource
 
 	// 视图：由 Image 持有（使用者经 Image::CreateView 显式注册并持引用），销毁由 RHI 统一负责
 	class ImageView {
@@ -44,8 +43,7 @@ namespace dEngine::rhi {
 		VkImageView m_view = VK_NULL_HANDLE;
 	};
 
-	// 拥有 / 借用两种模式：借用的 Image 仅包装外部已存在的 VkImage（交换链 backbuffer、外部导入资源），
-	// 析构时不销毁底层句柄；所有权语义通过 Image::Borrow 显式表达，构造函数不对外暴露。
+	// 拥有/借用两种模式：借用仅包装外部 VkImage（如交换链），析构不销毁底层句柄。
 	class Image {
 	public:
 		Image(const Image&) = delete;
@@ -58,11 +56,15 @@ namespace dEngine::rhi {
 
 		// 显式注册视图：按子资源去重，命中返回同一引用；视图由 Image 持有，随 Image 析构统一销毁
 		const ImageView& CreateView(ImageSubresource sub) const;
+		// 带范围/格式的视图：支持 mip/层区间与格式重解释（如 RGBA8 -> R32），range 的 count 为 0 时补齐到末尾
+		const ImageView& CreateView(const ImageViewDesc& view) const;
+		// 以指定格式重解释图像（默认整图）：等价于 CreateView + format 覆盖
+		const ImageView& ReinterpretView(ImageFormat format,
+			ImageSubresourceRange range = ImageSubresourceRange{ {}, 0, 0 }) const;
 
 		VkImage                NativeHandle() const;
-		VkFormat               NativeFormat() const; // 真实后端格式（借用路径含 SRGB 变体）；barrier/clear 推 aspect 用
+		VkFormat               NativeFormat() const; // 真实后端格式（含 SRGB 变体）
 		const ImageCreateInfo& Desc() const;
-		// 无状态查询接口：RHI 不跟踪 layout，由图的 state tracker 负责
 	private:
 		friend class Device;
 		Image(VkDevice device, VkFormat format, VmaAllocator_T* allocator, VkImage image,
@@ -70,14 +72,12 @@ namespace dEngine::rhi {
 
 		ImageCreateInfo  m_desc;
 		VkDevice         m_device = VK_NULL_HANDLE;
-		VkFormat         m_format = VK_FORMAT_UNDEFINED; // 真实后端格式（借用路径原样保留 SRGB 等）
+		VkFormat         m_format = VK_FORMAT_UNDEFINED;
 		VkImage          m_image = VK_NULL_HANDLE;
 		VmaAllocation_T* m_allocation = nullptr;
 		VmaAllocator_T*  m_allocator = nullptr;
 		bool             m_borrowed = false;
 
-		// 已注册视图缓存（mutable：CreateView 为 const）；键为 (mipLevel << 32) | layer，
-		// 用 node 容器保证返回的引用在后续注册时仍稳定
 		mutable std::unordered_map<uint64_t, std::unique_ptr<ImageView>> m_views;
 	};
 
@@ -92,10 +92,7 @@ namespace dEngine::rhi {
 		void*                   Map();        // 仅 hostVisible 可用，持久映射，不提供 Unmap
 		const void*             Map() const;  // 只读映射指针：写操作须用非 const 句柄
 
-		// 非一致（缺 HOST_COHERENT）主机可见内存的显式可见性操作；尺寸为 0 表示到缓冲末尾。
-		// Flush：主机写完之后、GPU 使用之前调用（把主机缓存回写到设备可见内存）；
-		// Invalidate：GPU 写完之后、主机读取之前调用（丢弃主机缓存，让设备写对主机可见）。
-		// 未映射（hostVisible == false）时为空操作；一致内存上由驱动退化为 no-op
+		// 非一致内存显式可见性：主机写后须 Flush，GPU 写后主机读前须 Invalidate。
 		void Flush(std::uint64_t offset = 0, std::uint64_t size = 0) const;
 		void Invalidate(std::uint64_t offset = 0, std::uint64_t size = 0) const;
 	private:
@@ -112,10 +109,29 @@ namespace dEngine::rhi {
 
 #pragma endregion
 
-#pragma region Descriptor // 描述符布局 / 集合（预编译路径）
+#pragma region Sampler
 
-	// 合并后的描述符槽位：声明本体 + 该槽位的 stageFlags 并集。
-	// 反射/合并产物与布局构建之间用整条记录传递，不做平行数组（后端侧类型，不进入 Desc 层）
+	// 不可变采样状态；同一描述可跨管线共享（由创建方持有）
+	class Sampler {
+	public:
+		Sampler(const Sampler&) = delete;
+		Sampler& operator=(const Sampler&) = delete;
+		~Sampler();
+
+		VkSampler NativeHandle() const;
+	private:
+		friend class Device;
+		Sampler(VkDevice device, VkSampler sampler);
+
+		VkDevice  m_device = VK_NULL_HANDLE;
+		VkSampler m_sampler = VK_NULL_HANDLE;
+	};
+
+#pragma endregion
+
+#pragma region Descriptor
+
+	// 合并后的描述符槽位：绑定声明 + stageFlags 并集（后端侧类型，不进 Desc 层）。
 	struct MergedDescriptor {
 		DescriptorBinding binding;
 		VkShaderStageFlags stages = 0;
@@ -133,7 +149,7 @@ namespace dEngine::rhi {
 		const std::vector<DescriptorBinding>& Bindings() const;
 	private:
 		friend class Pipeline;
-		friend class Device; // CreatePipeline 内构造各 set 的布局
+		friend class Device;
 		DescriptorSetLayout(VkDevice device, VkDescriptorSetLayout layout,
 			std::vector<DescriptorBinding> bindings);
 
@@ -150,10 +166,11 @@ namespace dEngine::rhi {
 		~DescriptorSet();
 
 		VkDescriptorSet NativeHandle() const;
-		// 图像绑定（数组绑定按 layer 递增逐层展开：第 i 个元素用 {view.mipLevel, view.layer + i}）。
-		// 描述符类型取自分配时记录的 binding 表（SampledImage → COMBINED_IMAGE_SAMPLER，
-		// StorageImage → STORAGE_IMAGE），据此选择采样器与 imageLayout
-		void Write(uint32_t binding, const Image& image, ImageSubresource view, uint32_t count = 1);
+		// 图像绑定：数组按 layer 展开；sampler 为空用默认，viewFormat 非 None 则重解释。
+		// layout 为 Undefined 时按描述符类型推导（采样 = ShaderReadOnly，存储 = General）。
+		void Write(uint32_t binding, const Image& image, ImageSubresource view, uint32_t count = 1,
+			const Sampler* sampler = nullptr, ImageFormat viewFormat = ImageFormat::None,
+			uint32_t firstElement = 0, ImageLayout layout = ImageLayout::Undefined);
 		// 缓冲绑定（数组绑定按 range 步进：第 i 个元素 offset + i*range，count > 1 时 range 须非 0）
 		void Write(uint32_t binding, const Buffer& buffer, uint64_t offset, uint64_t range, uint32_t count = 1);
 	private:
@@ -163,15 +180,14 @@ namespace dEngine::rhi {
 
 		VkDevice         m_device = VK_NULL_HANDLE;
 		VkDescriptorPool m_pool = VK_NULL_HANDLE;
-		VkSampler        m_defaultSampler = VK_NULL_HANDLE; // RHI 内置默认采样器（combined image sampler 用）
+		VkSampler        m_defaultSampler = VK_NULL_HANDLE;
 		VkDescriptorSet  m_set = VK_NULL_HANDLE;
-		// binding -> VkDescriptorType：写接口据此选择 uniform/storage 缓冲描述符类型
 		std::unordered_map<uint32_t, VkDescriptorType> m_bindingTypes;
 	};
 
 #pragma endregion
 
-#pragma region Pipeline // 管线对象
+#pragma region Pipeline
 
 	class Pipeline {
 	public:
@@ -197,12 +213,12 @@ namespace dEngine::rhi {
 		uint32_t                                          m_pushConstantSize = 0;
 		VkShaderStageFlags                                m_stageFlags = 0;
 		VkPipelineBindPoint                               m_bindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-		std::vector<std::unique_ptr<DescriptorSetLayout>> m_setLayouts; // 按 set index 排布，保证 SetLayout 返回地址稳定
+		std::vector<std::unique_ptr<DescriptorSetLayout>> m_setLayouts;
 	};
 
 #pragma endregion
 
-#pragma region Sync // 同步原语外壳
+#pragma region Sync
 
 	// CPU-GPU 同步：Wait 阻塞至信号；Reset 仅对已信号的 fence 合法（Submit 挂起期间 Reset 是使用错误）
 	class Fence {
@@ -230,16 +246,13 @@ namespace dEngine::rhi {
 		VkSemaphore NativeHandle() const;
 		bool IsTimeline() const { return m_timeline; }
 
-		// 仅 timeline 语义量有效（binary 调用一律返回 false / 0）：
-		// Signal = 主机侧推进（Host→GPU：GPU 侧用 SubmitInfo 的 wait value 等它）
-		// Wait   = 主机侧等待（GPU→Host：等某个提交把值推进到 value）
+		// 仅 timeline 有效：Signal 推进 Host→GPU，Wait 等待提交推进到 value。
 		bool            Signal(std::uint64_t value);
 		bool            Wait(std::uint64_t value, std::uint64_t timeoutNs = ~0ull) const;
 		std::uint64_t   Value() const;
 	private:
 		friend class Device;
 		friend class Swapchain;
-		// timeline 语义量须按 VK_SEMAPHORE_TYPE_TIMELINE 创建，创建方在 Device 内
 		Semaphore(VkDevice device, VkSemaphore semaphore, bool timeline = false);
 
 		VkDevice    m_device = VK_NULL_HANDLE;
@@ -249,13 +262,22 @@ namespace dEngine::rhi {
 
 #pragma endregion
 
-#pragma region CommandList // 命令录制（Pass 录制回调拿到的对象）
+#pragma region CommandList
 
 	// 句柄类：包装 VkCommandBuffer，无所有权（一帧内有效）
 	class CommandList {
 	public:
 		// 同步：barrier compiler 的直译出口，批量提交便于合并
 		void Barrier(std::span<const ImageBarrier> images, std::span<const BufferBarrier> buffers);
+		// 直接转换单张图像布局：内部构造 ImageBarrier，默认 AllCommands + MemoryRead/Write
+		void TransitionImage(Image& image, ImageLayout oldLayout, ImageLayout newLayout,
+			ImageSubresourceRange range = ImageSubresourceRange{ {}, 0, 0 },
+			PipelineStage srcStage = PipelineStage::AllCommands,
+			Access srcAccess = Access::MemoryWrite,
+			PipelineStage dstStage = PipelineStage::AllCommands,
+			Access dstAccess = Access::MemoryRead,
+			uint32_t srcQueueFamily = kQueueFamilyIgnored,
+			uint32_t dstQueueFamily = kQueueFamilyIgnored);
 
 		// dynamic rendering
 		void BeginRendering(const RenderingInfo& info);
@@ -267,15 +289,13 @@ namespace dEngine::rhi {
 		void PushConstants(const void* data, uint32_t size);
 		void SetViewport(const Viewport& viewport);
 
-		// 顶点/索引与绘制
-		// firstBinding：多流顶点缓冲的起始绑定点（与 Pipeline 的 VertexInputBinding.binding 对应）
+		// 顶点/索引与绘制：firstBinding 为多流顶点缓冲的起始绑定点。
 		void BindVertexBuffer(const Buffer& buffer, uint64_t offset = 0, uint32_t firstBinding = 0);
 		void BindIndexBuffer(const Buffer& buffer, uint64_t offset, IndexType type);
 		void Draw(uint32_t vertexCount, uint32_t firstVertex = 0, uint32_t instanceCount = 1);
 		void DrawIndexed(uint32_t indexCount, uint32_t firstIndex = 0, int32_t vertexOffset = 0,
 			uint32_t instanceCount = 1);
-		// 间接绘制：参数（VkDrawIndirectCommand / VkDrawIndexedIndirectCommand）从 buffer 读取，
-		// drawCount 为条目数（参数在 GPU 侧，CPU 不可见）
+		// 间接绘制：参数从 buffer 读取，drawCount 为条目数（GPU 侧，CPU 不可见）。
 		void DrawIndirect(const Buffer& args, uint64_t offset = 0, uint32_t drawCount = 1);
 		void DrawIndexedIndirect(const Buffer& args, uint64_t offset = 0, uint32_t drawCount = 1);
 
@@ -284,45 +304,50 @@ namespace dEngine::rhi {
 		// 间接派发：工作组数（VkDispatchIndirectCommand）从 buffer 读取，CPU 不可见
 		void DispatchIndirect(const Buffer& args, uint64_t offset = 0);
 
-		// 拷贝/清场（图外工具与上传/回读路径用）
-		// bufferOffset 为 buffer 侧起点（0 = 整段）；拷贝区域固定为图像全层 mip0（接口未暴露逐 region）
+		// 拷贝/清场：bufferOffset 为 buffer 侧起点（0 = 整段），拷贝区域固定为图像全层 mip0。
 		void CopyBufferToImage(const Buffer& src, Image& dst, ImageLayout dstLayout, uint64_t bufferOffset = 0);
+		void CopyBufferToImage(const Buffer& src, Image& dst, ImageLayout dstLayout,
+			std::span<const BufferImageCopyRegion> regions);
 		// 反向回读：图像全层 mip0 -> buffer 指定偏移；srcLayout 须为 TransferSrc（或 General）
 		void CopyImageToBuffer(const Image& src, const Buffer& dst, ImageLayout srcLayout, uint64_t bufferOffset = 0);
+		void CopyImageToBuffer(const Image& src, const Buffer& dst, ImageLayout srcLayout,
+			std::span<const BufferImageCopyRegion> regions);
 		// buffer -> buffer 整段/窗口拷贝；size == 0 时取两者较小值
 		void CopyBuffer(const Buffer& src, const Buffer& dst, uint64_t srcOffset = 0,
 			uint64_t dstOffset = 0, uint64_t size = 0);
 		// image -> image 拷贝：同格式、同尺寸，整图 mip0 全层；两端布局通常为 TransferSrc/TransferDst
 		void CopyImage(const Image& src, Image& dst, ImageLayout srcLayout, ImageLayout dstLayout);
-		// image -> image blit：同格式，可缩放（源/目的 extent 各按自身尺寸）；
-		// linearFilter=true 需格式支持 SAMPLED_IMAGE_FILTER_LINEAR，深度/整数格式请用最近邻
+		void CopyImage(const Image& src, Image& dst, ImageLayout srcLayout, ImageLayout dstLayout,
+			std::span<const ImageCopyRegion> regions);
+		// image→image blit：同格式可缩放；linearFilter 需格式支持，深度/整数格式用最近邻。
 		void BlitImage(const Image& src, Image& dst, ImageLayout srcLayout, ImageLayout dstLayout,
 			bool linearFilter = true);
+		void BlitImage(const Image& src, Image& dst, ImageLayout srcLayout, ImageLayout dstLayout,
+			std::span<const ImageBlitRegion> regions, bool linearFilter = true);
 		void ClearColor(Image& image, ImageSubresource view, const float rgba[4], ImageLayout layout);
+		// 按子资源范围清场；颜色/深度模板值由 value 变体决定
+		void ClearImage(Image& image, ImageSubresourceRange range, ImageLayout layout, const ClearValue& value);
 
-		// GPU 时间戳（性能诊断）：在批首/批尾各打一个点，配合 Device::ReadFrameTimestamps 回读。
-		// ResetTimestamps 必须出现在同一批的 WriteTimestamp 之前；跨帧复用同一索引是安全的——
-		// 帧槽只有在该槽全部在飞提交完成后才回收，届时旧查询已不再被引用
+		// GPU 时间戳：批首/批尾打点，ResetTimestamps 必须位于同批 WriteTimestamp 之前。
 		void ResetTimestamps(uint32_t first, uint32_t count);
 		void WriteTimestamp(uint32_t index); // ALL_COMMANDS 阶段：本批此前命令全部完成的时刻
 
 		VkCommandBuffer NativeHandle() const;
 	private:
-		friend class Device; // BeginCommandList 构造并填句柄
+		friend class Device;
 		VkCommandBuffer  m_commandBuffer = VK_NULL_HANDLE;
-		VkQueryPool      m_timestampPool = VK_NULL_HANDLE; // 所属帧槽的时间戳查询池（队列族不支持时为空）
-		VkPipelineLayout m_pipelineLayout = VK_NULL_HANDLE; // BindPipeline 记录，供描述符 / push constant 绑定用
-		uint32_t         m_pushConstantSize = 0;            // 当前管线声明的 push constant 大小（0=无）
-		VkPipelineBindPoint m_bindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS; // 当前管线绑定点（描述符绑定沿用）
-		VkShaderStageFlags  m_stageFlags = 0;                              // 当前管线的阶段集合（push constant 用）
+		VkQueryPool      m_timestampPool = VK_NULL_HANDLE;
+		VkPipelineLayout m_pipelineLayout = VK_NULL_HANDLE;
+		uint32_t         m_pushConstantSize = 0;
+		VkPipelineBindPoint m_bindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+		VkShaderStageFlags  m_stageFlags = 0;
 	};
 
 #pragma endregion
 
-#pragma region Submit // 提交与帧间同步
+#pragma region Submit
 
-	// 跨队列同步的两端点。binary 语义量 value 必须为 0；timeline 语义量按值匹配
-	// （signal 的 value 须大于当前值，wait 的 value 由提交在该处之后推进）
+	// 跨队列同步端点：binary 语义量 value 必须为 0；timeline 按值匹配。
 	struct SemaphoreWait   { const Semaphore* semaphore = nullptr; PipelineStage stage = PipelineStage::None; std::uint64_t value = 0; };
 	struct SemaphoreSignal { const Semaphore* semaphore = nullptr; PipelineStage stage = PipelineStage::None; std::uint64_t value = 0; };
 
@@ -336,13 +361,9 @@ namespace dEngine::rhi {
 
 #pragma endregion
 
-#pragma region FrameSlot // 帧槽（命令录制与回收上下文）
+#pragma region FrameSlot
 
-	// 单个帧槽：每队列族一个 command pool + 内部 fence 池 + 在录 buffer 集合。
-	// 回收约定：帧内可任意多次 BeginCommandList / Submit（含跨队列），每次 Submit 取一个
-	// 独立 fence 记入在飞集合；回收只在 WaitForFrame（Recycle）时发生 —— 一次性等本槽全部
-	// 在飞提交，不做逐次 CPU 收账，因此多队列提交可真正并行。
-	// pending 为空绝不 wait："Begin 后不 Submit"、漏调 WaitForFrame 只退化为串行，不会死锁。
+	// 帧槽：每族一命令池 + fence 池；仅 WaitForFrame 回收在飞提交，pending 为空不等待。
 	class FrameSlot {
 	public:
 		// 每帧槽时间戳查询容量（每批 2 个：批首/批尾）
@@ -354,39 +375,37 @@ namespace dEngine::rhi {
 
 	private:
 		friend class Device;
-		FrameSlot(VkDevice device, std::vector<uint32_t> queueFamilies); // 去重后的族列表（present 族不建池）
+		FrameSlot(VkDevice device, std::vector<uint32_t> queueFamilies);
 
-		VkCommandBuffer Allocate(uint32_t queueFamily); // 按族查池，分配并 begin（ONE_TIME_SUBMIT），记入在录集合
-		VkFence         AcquireFence();                // 取一个空闲内部 fence（池耗尽则新建，均为 unsignaled）
-		void            ReleaseFence(VkFence fence);   // 未提交成功时原样归还池（仍为 unsignaled）
-		void            MarkPending(VkFence fence, bool owned); // 记录一次在飞提交（外部或内部 fence）
-		void            DrainPending();                // 等全部在飞提交完成并清账（不动在录 buffer）
-		void            Recycle();                     // DrainPending + 按池释放在录 buffer
-		VkQueryPool     TimestampPool() const { return m_timestampPool; } // 时间戳回读（Device 用）
+		VkCommandBuffer Allocate(uint32_t queueFamily);
+		VkFence         AcquireFence();
+		void            ReleaseFence(VkFence fence);
+		void            MarkPending(VkFence fence, bool owned);
+		void            DrainPending();
+		void            Recycle();
+		VkQueryPool     TimestampPool() const { return m_timestampPool; }
 
-		// 每队列族一个命令池（命令缓冲只能提交到与其 pool 同族的队列）
 		struct FamilyPool {
 			uint32_t      family = kQueueFamilyIgnored;
 			VkCommandPool pool = VK_NULL_HANDLE;
 		};
 
-		// 一次提交的在飞记录：owned=true 表示内部 fence（等待后由本槽复位归还）
 		struct PendingSubmit {
 			VkFence fence = VK_NULL_HANDLE;
 			bool    owned = false;
 		};
 
 		VkDevice                            m_device = VK_NULL_HANDLE;
-		std::vector<FamilyPool>             m_pools;      // 每族一池（数量 = 构造传入族数）
-		std::vector<std::vector<VkCommandBuffer>> m_liveBuffers; // 与 m_pools 平行：每池的在录 buffer
-		std::vector<VkFence>                m_fencePool;  // 空闲内部 fence（等待并复位后归还）
-		std::vector<PendingSubmit>          m_pending;    // 本帧在飞提交（每 Submit 一条）
-		VkQueryPool                         m_timestampPool = VK_NULL_HANDLE; // 时间戳查询（每槽一池）
+		std::vector<FamilyPool>             m_pools;
+		std::vector<std::vector<VkCommandBuffer>> m_liveBuffers;
+		std::vector<VkFence>                m_fencePool;
+		std::vector<PendingSubmit>          m_pending;
+		VkQueryPool                         m_timestampPool = VK_NULL_HANDLE;
 	};
 
 #pragma endregion
 
-#pragma region Swapchain // 交换链
+#pragma region Swapchain
 
 	class Swapchain {
 	public:
@@ -403,8 +422,7 @@ namespace dEngine::rhi {
 		~Swapchain();
 
 		Frame       AcquireNextImage();  // 内部管理 acquire semaphore；OUT_OF_DATE 时自动重建
-		// presentWait：外部渲染完成信号量（上层 Submit 产出）；为空则用 Frame::presentReady——
-		// 按 image 索引的内部信号量，规避单一信号量在 present 消费完成前被下一帧再次 signal 的复用风险
+		// presentWait 为空则用按 image 索引的 presentReady，避免跨帧复用同一信号量。
 		void        Present(const Semaphore* presentWait = nullptr);
 		ImageFormat Format() const;
 		uint32_t    Width() const;
@@ -412,7 +430,6 @@ namespace dEngine::rhi {
 	private:
 		friend class Device;
 
-		// 自动重建所需的环境信息（Device 创建时填入；Swapchain 自持，不反向引用 Device）
 		struct Context {
 			VkDevice         device = VK_NULL_HANDLE;
 			VkQueue          presentQueue = VK_NULL_HANDLE;
@@ -422,10 +439,9 @@ namespace dEngine::rhi {
 			uint32_t         presentFamily = 0;
 			uint32_t         windowWidth = 0;
 			uint32_t         windowHeight = 0;
-			uint32_t         maxFramesInFlight = 2; // 与 Device 帧槽数一致（acquire 信号量按槽数建与轮转）
+			uint32_t         maxFramesInFlight = 2;
 		};
 
-		// 新建交换链本体并取回 backbuffer（首次与重建共用；oldSwapchain 非空时复用以降峰值）
 		struct BuildResult {
 			VkSwapchainKHR     swapchain = VK_NULL_HANDLE;
 			VkSurfaceFormatKHR surfaceFormat {};
@@ -438,28 +454,26 @@ namespace dEngine::rhi {
 		Swapchain(const Context& context, BuildResult&& built,
 			std::vector<std::unique_ptr<Semaphore>> acquireSemaphores, uint32_t maxFramesInFlight);
 
-		// 自动重建：等设备空闲后重取格式/尺寸，重建交换链与借用图像，并重造 acquire 信号量
 		bool Recreate();
-		// 表面当前尺寸是否已与交换链不符（部分驱动 resize 后仍返回 VK_SUCCESS，故需主动比对）
 		bool NeedsRecreate() const;
 
 		Context            m_context;
 		VkSwapchainKHR     m_swapchain = VK_NULL_HANDLE;
 		VkSurfaceFormatKHR m_surfaceFormat {};
 		VkExtent2D         m_extent {};
-		std::vector<std::unique_ptr<Image>>     m_images;            // 借用：每张 backbuffer 一个包装
-		std::vector<std::unique_ptr<Semaphore>> m_acquireSemaphores; // 每帧槽一个，由 acquire 置位
-		std::vector<std::unique_ptr<Semaphore>> m_renderDone;       // 每 image 一个，Submit 置位、present 消费
+		std::vector<std::unique_ptr<Image>>     m_images;
+		std::vector<std::unique_ptr<Semaphore>> m_acquireSemaphores;
+		std::vector<std::unique_ptr<Semaphore>> m_renderDone;
 		uint32_t           maxFrameInFlight = 2;
 
-		uint32_t m_frameIndex = 0;          // 帧槽（acquire 信号量索引）；帧回收落地前在获取成功时轮转
-		bool     m_recreatePending = false; // suboptimal 等场景：下次获取前先重建
-		Frame    m_lastFrame {};            // 上一帧获取结果，供 Present 使用
+		uint32_t m_frameIndex = 0;
+		bool     m_recreatePending = false;
+		Frame    m_lastFrame {};
 	};
 
 #pragma endregion
 
-#pragma region DeviceAPI // 设备主接口
+#pragma region DeviceAPI
 
 	class Device {
 	public:
@@ -471,12 +485,32 @@ namespace dEngine::rhi {
 		// 资源与对象创建
 		std::unique_ptr<Image>         CreateImage(const ImageCreateInfo& info);
 		std::unique_ptr<Buffer>        CreateBuffer(const BufferCreateInfo& info);
-		std::unique_ptr<Pipeline>      CreatePipeline(const GraphicsPipelineDesc& desc);
-		std::unique_ptr<Pipeline>      CreateComputePipeline(const ComputePipelineDesc& desc);
+		std::unique_ptr<Sampler>       CreateSampler(const SamplerDesc& desc);
+		std::unique_ptr<Pipeline>      CreatePipeline(const GraphicsPipelineDesc& desc,
+			const DescriptorSetLayout* externalSet0 = nullptr);
+		std::unique_ptr<Pipeline>      CreateComputePipeline(const ComputePipelineDesc& desc,
+			const DescriptorSetLayout* externalSet0 = nullptr);
 		std::unique_ptr<DescriptorSet> AllocateDescriptorSet(const DescriptorSetLayout& layout);
+		// 手工描述符布局（非反射）：partiallyBound=true 启用 PARTIALLY_BOUND。
+		std::unique_ptr<DescriptorSetLayout> CreateDescriptorSetLayout(
+			const std::vector<DescriptorBinding>& bindings, bool partiallyBound = false);
+		// descriptor indexing / 采样图像数组动态索引是否可用（静态纹理堆的前提）
+		bool                           SupportsBindlessTextures() const { return m_bindlessSupported; }
+		// 逐附件独立混合状态是否可用（不同附件不同 blend/writeMask 的前提）
+		bool                           SupportsIndependentBlend() const { return m_independentBlendSupported; }
+		// depth bounds test 是否可用（不可用时 RHI 自动关闭该测试）
+		bool                           SupportsDepthBounds() const { return m_depthBoundsSupported; }
+		// 细分着色器（TessControl/TessEval）是否可用
+		bool                           SupportsTessellation() const { return m_tessellationSupported; }
+		// 几何着色器是否可用
+		bool                           SupportsGeometryShaders() const { return m_geometrySupported; }
+		// 顶点/细分/几何阶段是否可写 storage 资源；不可写时这些阶段必须声明 readonly
+		bool                           SupportsVertexPipelineStoresAndAtomics() const {
+			return m_vertexPipelineStoresAndAtomics;
+		}
 		std::unique_ptr<Fence>         CreateFence(bool signaled = false);
 		std::unique_ptr<Semaphore>     CreateSemaphore(); // binary（acquire/present 链、单次跨队列）
-		// timeline：可被主机 Signal（Host→GPU 唯一的非阻塞手段）；initialValue 由使用者给定
+		// timeline：可被主机 Signal；initialValue 由使用者给定。
 		std::unique_ptr<Semaphore>     CreateTimelineSemaphore(std::uint64_t initialValue = 0);
 		bool                           TimelineSemaphoresSupported() const { return m_timelineSupported; }
 
@@ -484,13 +518,10 @@ namespace dEngine::rhi {
 		std::unique_ptr<Swapchain> CreateSwapchain();
 		CommandList                BeginCommandList(QueueClass queue = QueueClass::Graphics); // 自当期帧对应族 pool 分配
 
-		// 提交与帧回收（frames-in-flight 上限，默认 2）
-		// 提交到 info.queue。返回本次提交在该队列 GPU timeline 上的 signal 值（0 = 设备无 timeline）：
-		// 主机可 QueueTimeline(queue)->Wait(value) 等这一批完成（GPU→Host 的非阻塞等待）
+		// 提交到 info.queue，返回该队列 GPU timeline 的 signal 值（0 = 无 timeline）。
 		std::uint64_t Submit(const SubmitInfo& info);
 
-		// 每队列一条 GPU timeline：值随该队列的提交顺序单调推进（队列内有序，不会与并行队列撞值），
-		// 由 Submit 自动分配并作为信号追加，无需使用者在 signals 里手填
+		// 每队列一条 GPU timeline，由 Submit 自动分配并作为信号追加。
 		Semaphore*    QueueTimeline(QueueClass cls) const;
 		std::uint64_t LastQueueTimelineValue(QueueClass cls) const;
 		void WaitForFrame();
@@ -499,8 +530,7 @@ namespace dEngine::rhi {
 		// 某类队列的族索引（QFOT barrier 字段 / 诊断用；无专用队列时已兜底 graphics）
 		uint32_t QueueFamily(QueueClass cls) const;
 
-		// GPU 时间戳（性能诊断）：须在 WaitForFrame 之后立即调用——回读刚结束那一帧的查询区间，
-		// 输出为设备原始 tick（毫秒换算用 TimestampPeriodNs）。查询索引约定为批 b 的 [2b, 2b+1]
+		// GPU 时间戳：须在 WaitForFrame 后立即调用，输出设备原始 tick。
 		bool ReadFrameTimestamps(uint32_t first, uint32_t count, std::uint64_t* out) const;
 		bool TimestampsSupported() const { return m_timestampsSupported; }   // 各队列族 timestampValidBits > 0
 		bool TimestampsComparable() const { return m_timestampComparable; } // 跨队列同一时间基
@@ -509,44 +539,56 @@ namespace dEngine::rhi {
 		// 诊断信息（日志 / 冒烟测试）
 		const char* DeviceName() const;
 		uint32_t    ApiVersion() const;
+		// 帧槽数固定于创建期；WaitForFrame 只等待当前槽，不要每帧调用。
+		uint32_t FramesInFlight() const { return static_cast<uint32_t>(m_frameSlots.size()); }
+		uint32_t CurrentFrameSlot() const { return m_currentFrameSlot; }
+		uint32_t BeginFrame();     // 开始一帧：回收复用槽并轮转，返回本帧槽索引
+		void     WaitAllFrames();  // 等待所有槽的在飞提交（收尾/回读前用）
 
 	private:
-		// 合并槽位表 -> 各 set 布局 + pipeline layout（图形 / 计算共用）。
-		// 每条记录自带 stageFlags；失败时已建对象就地清理
 		bool BuildSetLayouts(std::vector<MergedDescriptor> slots, uint32_t pushConstantSize,
-			VkShaderStageFlags pushStages,
+			VkShaderStageFlags pushStages, const DescriptorSetLayout* externalSet0,
 			std::vector<std::unique_ptr<DescriptorSetLayout>>& outLayouts, VkPipelineLayout& outLayout);
 
 		VkInstance               m_instance = VK_NULL_HANDLE;
 		VkDebugUtilsMessengerEXT m_debugMessenger = VK_NULL_HANDLE;
-		VkSurfaceKHR             m_surface = VK_NULL_HANDLE;   // 有窗口句柄时创建，否则为空（离屏路径）
+		VkSurfaceKHR             m_surface = VK_NULL_HANDLE;
 		VkPhysicalDevice         m_physicalDevice = VK_NULL_HANDLE;
 		VkDevice                 m_device = VK_NULL_HANDLE;
 		VkQueue                  m_graphicsQueue = VK_NULL_HANDLE;
 		VkQueue                  m_presentQueue = VK_NULL_HANDLE;
 		uint32_t                 m_graphicsQueueFamily = 0;
 		uint32_t                 m_presentQueueFamily = 0;
-		VkQueue                  m_computeQueue = VK_NULL_HANDLE;  // 无专用计算队列时 = graphics 队列
-		VkQueue                  m_transferQueue = VK_NULL_HANDLE; // 无专用传输队列时 = graphics 队列
-		uint32_t                 m_computeQueueFamily = 0;         // 选定期已兜底，恒有效
+		VkQueue                  m_computeQueue = VK_NULL_HANDLE;
+		VkQueue                  m_transferQueue = VK_NULL_HANDLE;
+		uint32_t                 m_computeQueueFamily = 0;
 		uint32_t                 m_transferQueueFamily = 0;
 		VmaAllocator_T*          m_allocator = nullptr;
 		VkDescriptorPool         m_descriptorPool = VK_NULL_HANDLE;
-		VkSampler                m_defaultSampler = VK_NULL_HANDLE;  // 供 combined image sampler 复用
+		VkSampler                m_defaultSampler = VK_NULL_HANDLE;
 		VkPipelineCache          m_pipelineCache = VK_NULL_HANDLE;
 
-		std::vector<std::unique_ptr<FrameSlot>> m_frameSlots; // 帧槽（数量 = DeviceDesc::maxFramesInFlight）
-		uint32_t m_frameIndex = 0;                             // 当期帧槽索引
+		std::vector<std::unique_ptr<FrameSlot>> m_frameSlots;
+		uint32_t m_frameIndex = 0;
+		uint32_t m_currentFrameSlot = 0;
+		uint32_t m_framesBegun = 0;
 
-		bool   m_timestampsSupported = false; // 三类队列族都支持 timestampValidBits > 0
-		bool   m_timestampComparable = false; // limits.timestampComputeAndGraphics（跨队列时间基可比）
-		double m_timestampPeriod = 0.0;       // limits.timestampPeriod（ns / tick）
-		bool   m_timelineSupported = false;   // timelineSemaphore 特性已开启（Create 时查询并启用）
-		// 每队列一条 GPU timeline（下标 = QueueClass），值为该队列已分配的最大 signal 值
+		bool   m_timestampsSupported = false;
+		float  m_maxSamplerAnisotropy = 1.0f;
+		bool   m_bindlessSupported = false;
+		bool   m_depthBoundsSupported = false;
+		bool   m_independentBlendSupported = false;
+		bool   m_tessellationSupported = false;
+		bool   m_geometrySupported = false;
+		bool   m_vertexPipelineStoresAndAtomics = false;
+		uint32_t m_maxTessellationPatchSize = 1;
+		bool   m_timestampComparable = false;
+		double m_timestampPeriod = 0.0;
+		bool   m_timelineSupported = false;
 		std::unique_ptr<Semaphore> m_queueTimelines[3];
 		std::uint64_t              m_queueTimelineValue[3] = { 0, 0, 0 };
 
-		uint32_t m_windowWidth = 0, m_windowHeight = 0; // 无 currentExtent 时的回退尺寸（来自 DeviceDesc）
+		uint32_t m_windowWidth = 0, m_windowHeight = 0;
 
 		std::string m_deviceName;
 		uint32_t    m_apiVersion = 0;
