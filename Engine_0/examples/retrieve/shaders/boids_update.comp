@@ -10,14 +10,16 @@ layout(std140, set = 0, binding = 1) uniform BoidsParamsBlock {
     vec4 boundsMin;
     vec4 boundsMax;
     float boundaryStrength;
+    float minSpeed;
 } BoidsParams;
 
 layout(std430, set = 0, binding = 9) buffer fishesBlock {
     float data[7168];
 } fishes;
 
+// std430 下 vec3 数组步长为 16 字节；这里显式用 vec4，CPU 侧也按 16*N 分配
 layout(std430, set = 0, binding = 10) buffer outvelBlock {
-    vec3 vels[1024];
+    vec4 vels[1024];
 } outvel;
 
 #define fishCount BoidsParams.fishCount
@@ -27,6 +29,7 @@ layout(std430, set = 0, binding = 10) buffer outvelBlock {
 #define boundsMin BoidsParams.boundsMin
 #define boundsMax BoidsParams.boundsMax
 #define boundaryStrength BoidsParams.boundaryStrength
+#define minSpeed BoidsParams.minSpeed
 #define data fishes.data
 #define vels outvel.vels
 
@@ -53,7 +56,15 @@ void main() {
     if (thisId >= fishCount) return;
 
     vec3 pos = fpos(thisId);
-    vec3 vel = vels[thisId];
+    vec3 vel = vels[thisId].xyz;
+
+    // 演示用最低巡游速度：避免少量鱼因力抵消长期静止；minSpeed = 0 时与原工程一致
+    if (minSpeed > 0.0 && length(vel) < minSpeed) {
+        vec3 d = fdir(thisId);
+        if (length(d) < 1e-6) d = vec3(0.0, 0.0, 1.0);
+        vel = normalize(d) * minSpeed;
+    }
+
     pos += vel * 0.001;
 
     vec3 newVel = vel;

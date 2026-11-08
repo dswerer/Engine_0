@@ -52,7 +52,8 @@ constexpr uint32_t kMaxFish = 1024;
 constexpr uint32_t kWorkGroupSize = 256;
 constexpr uint32_t kFishDataFloats = kMaxFish * 7;
 constexpr uint32_t kFishDataBytes = kFishDataFloats * sizeof(float);
-constexpr uint32_t kOutVelBytes = kMaxFish * sizeof(glm::vec3);
+// std430 中 vec3 数组的元素步长是 16 字节；这里按 vec4 分配，避免越界写入
+constexpr uint32_t kOutVelBytes = kMaxFish * sizeof(glm::vec4);
 constexpr uint32_t kShadowSize = 4096;
 constexpr uint32_t kLutSize = 256;
 constexpr uint32_t kSkyAmbientSize = 128;
@@ -63,6 +64,7 @@ const string kAssetDir = RETRIEVE_ASSET_DIR;
 struct Options {
 	bool     smoke = false;
 	uint32_t frames = 60;
+	float    boidsMinSpeed = 0.0f; // 0 = 完全按原工程；>0 为演示用最低巡游速度
 };
 
 struct AppInput {
@@ -72,39 +74,6 @@ struct AppInput {
 	float   lastX = 0.0f;
 	float   lastY = 0.0f;
 };
-
-Pass* FindPass(RenderGraph& graph, const string& name) {
-	for (uint32_t i = 0; graph.GetPass(i) != nullptr; ++i)
-		if (graph.GetPass(i)->get_name() == name)
-			return graph.GetPass(i);
-	return nullptr;
-}
-
-Resource* FindResource(RenderGraph& graph, const string& name) {
-	for (uint32_t i = 0; graph.GetResource(i) != nullptr; ++i)
-		if (graph.GetResource(i)->get_name() == name)
-			return graph.GetResource(i);
-	return nullptr;
-}
-
-rhi::SamplerDesc MakeSampler(bool linear) {
-	rhi::SamplerDesc s;
-	s.magFilter = linear ? rhi::Filter::Linear : rhi::Filter::Nearest;
-	s.minFilter = linear ? rhi::Filter::Linear : rhi::Filter::Nearest;
-	s.mipmapMode = rhi::SamplerMipmapMode::Nearest;
-	s.addressU = rhi::SamplerAddressMode::ClampToEdge;
-	s.addressV = rhi::SamplerAddressMode::ClampToEdge;
-	s.addressW = rhi::SamplerAddressMode::ClampToEdge;
-	return s;
-}
-
-ShaderBinding MakeBinding(const string& name, Usage usage, const optional<rhi::SamplerDesc>& sampler = nullopt) {
-	ShaderBinding b;
-	b.resourceName = name;
-	b.usage = usage;
-	b.sampler = sampler;
-	return b;
-}
 
 glm::mat4 MakeLightSpace(const glm::vec3& lightDir, const glm::vec3& lightPos) {
 	glm::vec3 up;
@@ -161,8 +130,8 @@ bool PrecomputeAtmosphere(rhi::Device& device, const AtmosphereParams& params,
 	transmittanceDesc.groupCountX = kLutSize / 4;
 	transmittanceDesc.groupCountY = kLutSize / 8;
 	transmittanceDesc.shaderBindings = {
-		MakeBinding("AtmosphereParams", Usage::UniformRead),
-		MakeBinding("TransmittanceLUT", Usage::StorageWrite) };
+		ShaderBinding::Uniform("AtmosphereParams"),
+		ShaderBinding::StorageWrite("TransmittanceLUT") };
 	graph.RegisterPass("Transmittance", { "AtmosphereParams" }, { "TransmittanceLUT" },
 		Pass::Compute, transmittanceDesc);
 	graph.RegisterResource("TransmittanceLUT", { "MultipleScattering", "SkyAmbient" },
@@ -173,9 +142,9 @@ bool PrecomputeAtmosphere(rhi::Device& device, const AtmosphereParams& params,
 	msDesc.groupCountX = kLutSize / 4;
 	msDesc.groupCountY = kLutSize / 8;
 	msDesc.shaderBindings = {
-		MakeBinding("AtmosphereParams", Usage::UniformRead),
-		MakeBinding("TransmittanceLUT", Usage::SampledRead, MakeSampler(true)),
-		MakeBinding("MultipleScatteringLUT", Usage::StorageWrite) };
+		ShaderBinding::Uniform("AtmosphereParams"),
+		ShaderBinding::Sampled("TransmittanceLUT", rhi::SamplerDesc::Linear()),
+		ShaderBinding::StorageWrite("MultipleScatteringLUT") };
 	graph.RegisterPass("MultipleScattering", { "AtmosphereParams", "TransmittanceLUT" },
 		{ "MultipleScatteringLUT" }, Pass::Compute, msDesc);
 
@@ -184,10 +153,10 @@ bool PrecomputeAtmosphere(rhi::Device& device, const AtmosphereParams& params,
 	saDesc.groupCountX = kSkyAmbientSize / 4;
 	saDesc.groupCountY = kSkyAmbientSize / 8;
 	saDesc.shaderBindings = {
-		MakeBinding("AtmosphereParams", Usage::UniformRead),
-		MakeBinding("TransmittanceLUT", Usage::SampledRead, MakeSampler(true)),
-		MakeBinding("MultipleScatteringLUT", Usage::SampledRead, MakeSampler(true)),
-		MakeBinding("SkyAmbientLUT", Usage::StorageWrite) };
+		ShaderBinding::Uniform("AtmosphereParams"),
+		ShaderBinding::Sampled("TransmittanceLUT", rhi::SamplerDesc::Linear()),
+		ShaderBinding::Sampled("MultipleScatteringLUT", rhi::SamplerDesc::Linear()),
+		ShaderBinding::StorageWrite("SkyAmbientLUT") };
 	graph.RegisterPass("SkyAmbient", { "AtmosphereParams", "TransmittanceLUT", "MultipleScatteringLUT" },
 		{ "SkyAmbientLUT" }, Pass::Compute, saDesc);
 
@@ -200,7 +169,7 @@ bool PrecomputeAtmosphere(rhi::Device& device, const AtmosphereParams& params,
 	graph.GenerateSubmitSequence();
 	graph.RealizeAll();
 
-	HostPass* hostParams = static_cast<HostPass*>(FindPass(graph, "HostParams"));
+	HostPass* hostParams = static_cast<HostPass*>(graph.FindPass("HostParams"));
 	if (hostParams == nullptr) {
 		cerr << "HostParams 节点缺失\n";
 		return false;
@@ -335,9 +304,9 @@ bool BuildFrameGraph(RenderGraph& graph, const rhi::Buffer* vb, const rhi::Buffe
 	evalDesc.shader = { rhi::ShaderStage::Compute, kShaderDir + "/boids_eval.comp.spv" };
 	evalDesc.groupCountX = (kFishCount + kWorkGroupSize - 1) / kWorkGroupSize;
 	evalDesc.shaderBindings = {
-		MakeBinding("BoidsParams", Usage::UniformRead),
-		MakeBinding("fishes", Usage::StorageRead),
-		MakeBinding("outvel", Usage::StorageWrite) };
+		ShaderBinding::Uniform("BoidsParams"),
+		ShaderBinding::StorageRead("fishes"),
+		ShaderBinding::StorageWrite("outvel") };
 	graph.RegisterPass("BoidsEval", { "BoidsParams", "fishes" }, { "outvel" },
 		Pass::Compute, evalDesc);
 
@@ -345,9 +314,9 @@ bool BuildFrameGraph(RenderGraph& graph, const rhi::Buffer* vb, const rhi::Buffe
 	updateDesc.shader = { rhi::ShaderStage::Compute, kShaderDir + "/boids_update.comp.spv" };
 	updateDesc.groupCountX = (kFishCount + kWorkGroupSize - 1) / kWorkGroupSize;
 	updateDesc.shaderBindings = {
-		MakeBinding("BoidsParams", Usage::UniformRead),
-		MakeBinding("fishes", Usage::StorageWrite),
-		MakeBinding("outvel", Usage::StorageRead) };
+		ShaderBinding::Uniform("BoidsParams"),
+		ShaderBinding::StorageWrite("fishes"),
+		ShaderBinding::StorageRead("outvel") };
 	graph.RegisterPass("BoidsUpdate", { "BoidsParams", "fishes", "outvel" }, { "fishes" },
 		Pass::Compute, updateDesc);
 
@@ -382,9 +351,9 @@ bool BuildFrameGraph(RenderGraph& graph, const rhi::Buffer* vb, const rhi::Buffe
 		shadowDesc0.viewport.h = static_cast<float>(kShadowSize);
 
 		shadowDesc0.shaderBindings = {
-			MakeBinding("ShadowUniforms", Usage::UniformRead),
-			MakeBinding("BoidsParams", Usage::UniformRead),
-			MakeBinding("fishes", Usage::StorageRead) };
+			ShaderBinding::Uniform("ShadowUniforms"),
+			ShaderBinding::Uniform("BoidsParams"),
+			ShaderBinding::StorageRead("fishes") };
 		shadowDesc0.vertexStreams.push_back(VertexStreamBinding{ "FishVB", {}, 0 });
 		shadowDesc0.indexStream = IndexStreamBinding{ "FishIB", {}, 0, IndexType::UInt32 };
 	}
@@ -422,11 +391,11 @@ bool BuildFrameGraph(RenderGraph& graph, const rhi::Buffer* vb, const rhi::Buffe
 		sceneDesc.pipeline.depthStencil.depthWriteEnable = true;
 
 		sceneDesc.shaderBindings = {
-			MakeBinding("FrameUniforms", Usage::UniformRead),
-			MakeBinding("BoidsParams", Usage::UniformRead),
-			MakeBinding("fishes", Usage::StorageRead),
-			MakeBinding("AtmosphereParams", Usage::UniformRead),
-			MakeBinding("shadowMap", Usage::SampledRead, MakeSampler(false)) };
+			ShaderBinding::Uniform("FrameUniforms"),
+			ShaderBinding::Uniform("BoidsParams"),
+			ShaderBinding::StorageRead("fishes"),
+			ShaderBinding::Uniform("AtmosphereParams"),
+			ShaderBinding::Sampled("shadowMap", rhi::SamplerDesc::Nearest()) };
 		sceneDesc.vertexStreams.push_back(VertexStreamBinding{ "FishVB", {}, 0 });
 		sceneDesc.indexStream = IndexStreamBinding{ "FishIB", {}, 0, IndexType::UInt32 };
 	}
@@ -451,13 +420,13 @@ bool BuildFrameGraph(RenderGraph& graph, const rhi::Buffer* vb, const rhi::Buffe
 		backDesc.pipeline.depthStencil.depthTestEnable = false;
 
 		backDesc.shaderBindings = {
-			MakeBinding("FrameUniforms", Usage::UniformRead),
-			MakeBinding("AtmosphereParams", Usage::UniformRead),
-			MakeBinding("TransmittanceLUT", Usage::SampledRead, MakeSampler(true)),
-			MakeBinding("MultipleScatteringLUT", Usage::SampledRead, MakeSampler(true)),
-			MakeBinding("SkyAmbientLUT", Usage::SampledRead, MakeSampler(true)),
-			MakeBinding("canvas", Usage::SampledRead, MakeSampler(false)),
-			MakeBinding("depth", Usage::SampledRead, MakeSampler(false)) };
+			ShaderBinding::Uniform("FrameUniforms"),
+			ShaderBinding::Uniform("AtmosphereParams"),
+			ShaderBinding::Sampled("TransmittanceLUT", rhi::SamplerDesc::Linear()),
+			ShaderBinding::Sampled("MultipleScatteringLUT", rhi::SamplerDesc::Linear()),
+			ShaderBinding::Sampled("SkyAmbientLUT", rhi::SamplerDesc::Linear()),
+			ShaderBinding::Sampled("canvas", rhi::SamplerDesc::Nearest()),
+			ShaderBinding::Sampled("depth", rhi::SamplerDesc::Nearest()) };
 	}
 	graph.RegisterPass("Back",
 		{ "FrameUniforms", "AtmosphereParams", "TransmittanceLUT", "MultipleScatteringLUT",
@@ -475,8 +444,10 @@ bool BuildFrameGraph(RenderGraph& graph, const rhi::Buffer* vb, const rhi::Buffe
 	return true;
 }
 
-void InitBoids(RenderGraph& graph, uint32_t count, glm::vec3& firstPos) {
-	Resource* res = FindResource(graph, "fishes");
+void InitBoids(RenderGraph& graph, uint32_t count,
+	std::vector<glm::vec3>* initialPositions = nullptr,
+	std::vector<glm::vec3>* initialDirs = nullptr) {
+	Resource* res = graph.FindResourceByName("fishes");
 	if (res == nullptr || res->get_type() != Resource::Buffer) {
 		cerr << "fishes 资源缺失\n";
 		return;
@@ -486,6 +457,14 @@ void InitBoids(RenderGraph& graph, uint32_t count, glm::vec3& firstPos) {
 		return;
 
 	float* data = static_cast<float*>(buf->Map());
+	if (initialPositions != nullptr) {
+		initialPositions->clear();
+		initialPositions->reserve(count);
+	}
+	if (initialDirs != nullptr) {
+		initialDirs->clear();
+		initialDirs->reserve(count);
+	}
 	for (uint32_t i = 0; i < count; ++i) {
 		float n = static_cast<float>(i);
 		uint32_t p = i * 3;
@@ -494,6 +473,8 @@ void InitBoids(RenderGraph& graph, uint32_t count, glm::vec3& firstPos) {
 		data[p + 0] = 10.0f * std::sin(n);
 		data[p + 1] = 10.0f * std::sin(n) + 10.0f;
 		data[p + 2] = 10.0f * std::sin(n + 10.0f);
+		if (initialPositions != nullptr)
+			initialPositions->emplace_back(data[p + 0], data[p + 1], data[p + 2]);
 
 		glm::vec3 dir(std::sin(n), 0.0f, std::cos(n));
 		if (glm::length(dir) > 1e-5f) dir = glm::normalize(dir);
@@ -501,8 +482,9 @@ void InitBoids(RenderGraph& graph, uint32_t count, glm::vec3& firstPos) {
 		data[d + 1] = dir.y;
 		data[d + 2] = dir.z;
 		data[v] = 0.1f;
+		if (initialDirs != nullptr)
+			initialDirs->push_back(dir);
 	}
-	firstPos = glm::vec3(data[0], data[1], data[2]);
 	buf->Flush();
 }
 
@@ -511,13 +493,7 @@ void BarrierHostVisibility(rhi::Device& device, rhi::Buffer& buffer,
 	rhi::PipelineStage dstStage, rhi::Access dstAccess)
 {
 	rhi::CommandList cmd = device.BeginCommandList();
-	rhi::BufferBarrier barrier;
-	barrier.buffer = &buffer;
-	barrier.srcStage = srcStage;
-	barrier.srcAccess = srcAccess;
-	barrier.dstStage = dstStage;
-	barrier.dstAccess = dstAccess;
-	cmd.Barrier({}, { &barrier, 1 });
+	cmd.TransitionBuffer(buffer, srcStage, srcAccess, dstStage, dstAccess);
 	rhi::SubmitInfo submit;
 	submit.commandLists = { &cmd, 1 };
 	device.Submit(submit);
@@ -538,6 +514,10 @@ int main(int argc, char** argv) {
 					++i;
 				}
 			}
+		}
+		else if (std::strcmp(argv[i], "--boids-min-speed") == 0 && i + 1 < argc) {
+			options.boidsMinSpeed = static_cast<float>(std::atof(argv[i + 1]));
+			++i;
 		}
 	}
 
@@ -596,29 +576,21 @@ int main(int argc, char** argv) {
 	cout << "Fish mesh loaded: verts=" << mesh.vertices.size()
 	     << " indices=" << mesh.indices.size() << "\n";
 
-	rhi::BufferCreateInfo vbInfo;
-	vbInfo.size = mesh.vertices.size() * sizeof(FishVertex);
-	vbInfo.usage = rhi::BufferUsage::Vertex;
-	vbInfo.hostVisible = true;
-	auto vertexBuffer = device->CreateBuffer(vbInfo);
+	auto vertexBuffer = device->UploadBuffer(mesh.vertices.data(),
+		static_cast<uint64_t>(mesh.vertices.size() * sizeof(FishVertex)), rhi::BufferUsage::Vertex,
+		rhi::PipelineStage::VertexInput, rhi::Access::VertexAttributeRead);
 	if (vertexBuffer == nullptr) {
 		cerr << "顶点缓冲创建失败\n";
 		return 1;
 	}
-	std::memcpy(vertexBuffer->Map(), mesh.vertices.data(), static_cast<size_t>(vbInfo.size));
-	vertexBuffer->Flush();
 
-	rhi::BufferCreateInfo ibInfo;
-	ibInfo.size = mesh.indices.size() * sizeof(uint32_t);
-	ibInfo.usage = rhi::BufferUsage::Index;
-	ibInfo.hostVisible = true;
-	auto indexBuffer = device->CreateBuffer(ibInfo);
+	auto indexBuffer = device->UploadBuffer(mesh.indices.data(),
+		static_cast<uint64_t>(mesh.indices.size() * sizeof(uint32_t)), rhi::BufferUsage::Index,
+		rhi::PipelineStage::VertexInput, rhi::Access::IndexRead);
 	if (indexBuffer == nullptr) {
 		cerr << "索引缓冲创建失败\n";
 		return 1;
 	}
-	std::memcpy(indexBuffer->Map(), mesh.indices.data(), static_cast<size_t>(ibInfo.size));
-	indexBuffer->Flush();
 
 	AtmosphereParams atmosphereParams;
 	atmosphereParams.H_Rayleigh = 8500.0f;
@@ -661,11 +633,12 @@ int main(int argc, char** argv) {
 			float dy = in->lastY - static_cast<float>(ypos);
 			in->lastX = static_cast<float>(xpos);
 			in->lastY = static_cast<float>(ypos);
-			in->camera->rotate(glm::radians(-0.1f * dx), glm::radians(-0.1f * dy));
+			// Vulkan 投影翻转了 Y：鼠标上移应抬头（pitch 增大），滚轮上滚应前进
+			in->camera->rotate(glm::radians(-0.1f * dx), glm::radians(0.1f * dy));
 		});
 		glfwSetScrollCallback(window, [](GLFWwindow* w, double, double yoffset) {
 			AppInput* in = static_cast<AppInput*>(glfwGetWindowUserPointer(w));
-			in->camera->moveForward(-0.5f * static_cast<float>(yoffset) * 10.0f);
+			in->camera->moveForward(0.5f * static_cast<float>(yoffset) * 10.0f);
 		});
 		glfwSetKeyCallback(window, [](GLFWwindow* w, int key, int, int action, int) {
 			AppInput* in = static_cast<AppInput*>(glfwGetWindowUserPointer(w));
@@ -685,7 +658,8 @@ int main(int argc, char** argv) {
 	bool captured = false;
 	std::vector<unsigned char> capturedPixels;
 
-	glm::vec3 initialFirstPos(0.0f);
+	std::vector<glm::vec3> initialPositions;
+	std::vector<glm::vec3> initialDirs;
 	uint32_t renderedFrames = 0;
 
 	while (true) {
@@ -731,8 +705,8 @@ int main(int argc, char** argv) {
 				rp->SetDraw(draw);
 			}
 
-			InitBoids(*graph, kFishCount, initialFirstPos);
-			Resource* fishRes = FindResource(*graph, "fishes");
+			InitBoids(*graph, kFishCount, &initialPositions, &initialDirs);
+			Resource* fishRes = graph->FindResourceByName("fishes");
 			if (fishRes != nullptr) {
 				BarrierHostVisibility(*device,
 					*const_cast<rhi::Buffer*>(static_cast<Buffer*>(fishRes)->get_rhi()),
@@ -742,7 +716,7 @@ int main(int argc, char** argv) {
 			}
 
 			if (options.smoke) {
-				HostPass* capturePass = static_cast<HostPass*>(FindPass(*graph, "Capture"));
+				HostPass* capturePass = static_cast<HostPass*>(graph->FindPass("Capture"));
 				capturePass->SetCallback([&](HostContext& ctx) {
 					ctx.WaitForGpu();
 					if (captureRequested) {
@@ -803,8 +777,9 @@ int main(int argc, char** argv) {
 		boidsParams.boundsMin = glm::vec4(-30.0f, 10.0f, -30.0f, 0.0f);
 		boidsParams.boundsMax = glm::vec4(30.0f, 100.0f, 30.0f, 0.0f);
 		boidsParams.boundaryStrength = 0.3f;
+		boidsParams.minSpeed = options.boidsMinSpeed;
 
-		HostPass* update = static_cast<HostPass*>(FindPass(*graph, "UpdateFrame"));
+		HostPass* update = static_cast<HostPass*>(graph->FindPass("UpdateFrame"));
 		update->SetCallback([frameUniforms, shadowUniforms, boidsParams](HostContext& ctx) {
 			ctx.WaitForGpu();
 			if (rhi::Buffer* b = ctx.WriteBuffer("FrameUniforms"))
@@ -863,9 +838,12 @@ int main(int argc, char** argv) {
 			stbi_write_png(outputPath.c_str(), static_cast<int>(kWidth), static_cast<int>(kHeight),
 				4, capturedPixels.data(), static_cast<int>(kWidth) * 4);
 
-			float moved = 0.0f;
-			Resource* fishRes = FindResource(*graph, "fishes");
-			if (fishRes != nullptr) {
+			uint32_t active = 0, inactive = 0, badDir = 0, badPos = 0;
+			uint32_t zeroVel = 0, sameAsInitDir = 0;
+			double sumMove = 0.0;
+			float minMove = 1e9f, maxMove = 0.0f;
+			Resource* fishRes = graph->FindResourceByName("fishes");
+			if (fishRes != nullptr && initialPositions.size() == kFishCount) {
 				rhi::Buffer* fishBuf = const_cast<rhi::Buffer*>(static_cast<Buffer*>(fishRes)->get_rhi());
 				if (fishBuf != nullptr) {
 					BarrierHostVisibility(*device, *fishBuf,
@@ -874,11 +852,35 @@ int main(int argc, char** argv) {
 					device->WaitForFrame();
 					fishBuf->Invalidate();
 					float* data = static_cast<float*>(fishBuf->Map());
-					glm::vec3 pos(data[0], data[1], data[2]);
-					moved = glm::length(pos - initialFirstPos);
+					for (uint32_t i = 0; i < kFishCount; ++i) {
+						glm::vec3 pos(data[i * 3], data[i * 3 + 1], data[i * 3 + 2]);
+						float d = glm::length(pos - initialPositions[i]);
+						if (!(d >= 0.0f)) ++badPos;
+						if (d > 0.01f) ++active; else ++inactive;
+						sumMove += d;
+						minMove = std::min(minMove, d);
+						maxMove = std::max(maxMove, d);
+						uint32_t dirOff = kFishCount * 3 + i * 3;
+						glm::vec3 dir(data[dirOff], data[dirOff + 1], data[dirOff + 2]);
+						if (!(glm::length(dir) > 1e-6f))
+							++badDir;
+						float speedVal = data[kFishCount * 6 + i];
+						if (!(speedVal > 1e-6f))
+							++zeroVel;
+						if (initialDirs.size() == kFishCount
+							&& glm::length(dir - initialDirs[i]) < 1e-5f)
+							++sameAsInitDir;
+					}
 				}
 			}
-			cout << "Boids update ok: moved=" << moved << "\n";
+			double meanMove = initialPositions.size() == kFishCount
+				? sumMove / static_cast<double>(kFishCount) : 0.0;
+			cout << "Boids update ok: active=" << active << "/" << kFishCount
+			     << " inactive=" << inactive << " badDir=" << badDir
+			     << " badPos=" << badPos << " zeroVel=" << zeroVel
+			     << " sameAsInitDir=" << sameAsInitDir
+			     << " meanMove=" << meanMove << " minMove=" << minMove
+			     << " maxMove=" << maxMove << "\n";
 			cout << "Smoke image: min=" << minLuma << " max=" << maxLuma
 			     << " mean=" << meanLuma << "\n";
 			cout << "Retrieve smoke ok: wrote " << outputPath << "\n";

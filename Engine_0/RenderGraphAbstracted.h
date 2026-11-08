@@ -15,6 +15,32 @@
 // 渲染图抽象层：Resource / Pass 基类与 RenderGraph 本体。
 namespace dEngine {
 	class RenderGraph;
+
+	// 合并任务：声明期合并两张尚未 ProcessRegister 的图，只表达参与者、资源统表、顺序与归属。
+	enum class MergeOrder {
+		None,   // 只保留数据依赖，两图 pass 可交错
+		Append  // 基础图的汇点先于追加图的源点
+	};
+	enum class PresentOwner {
+		None,   // 合并后不含 Present，由用户在合并图之外处理
+		Base,
+		Append
+	};
+	// 两名一节点：基础图与追加图的这两个资源名解析到同一个资源节点。
+	struct ResourceUnify {
+		std::string baseName;
+		std::string appendName;
+	};
+	struct GraphMergeTask {
+		const RenderGraph* base = nullptr;    // 先执行的图
+		const RenderGraph* append = nullptr;  // 后执行的图
+		std::string appendPassPrefix = "B.";  // 仅追加图的 Pass 名加前缀；资源名保持不变
+		std::vector<ResourceUnify> unify;     // 跨图资源身份合并
+		MergeOrder order = MergeOrder::Append;
+		PresentOwner present = PresentOwner::None;
+		bool dedupIdenticalResources = true;  // 未显式 unify 的同名资源，描述完全一致时自动合并
+	};
+
 	// 图节点（定义见 RenderGraphNodes.h）：barrier 计划只保存节点身份，句柄在录制期解析
 	class Image;
 	class Buffer;
@@ -110,6 +136,7 @@ namespace dEngine {
 	struct ResourceTopology {
 		uint32_t id = static_cast<uint32_t>(-1);
 		std::string name;
+		uint32_t    version = 0;                      // 逻辑资源的版本号
 		std::set<uint32_t> readers;                   // 消费者 pass id 集
 		uint32_t writer = static_cast<uint32_t>(-1);  // -1 表示无 writer
 		bool crossFrame = false;                      // 是否跨帧存活（true=持久资源，false=仅帧内）
@@ -135,6 +162,7 @@ namespace dEngine {
 		virtual Type get_type() const = 0;
 		uint32_t get_id() const { return m_topo.id; };
 		const std::string& get_name() const { return m_topo.name; }
+		uint32_t get_version() const { return m_topo.version; }
 		const ResourceTopology& get_topology() const { return m_topo; }
 		// 类型工厂：external/externalBuffer 非空走 Borrow（不创建、不拥有），否则按 desc 走 Own
 		static std::unique_ptr<Resource> AutoAllocator(ResourceTopology&& topo, Type type, ResourceDesc desc,
@@ -174,6 +202,255 @@ namespace dEngine {
 		PassTopology m_topo;
 		bool mActive = true;
 	};
+
+	// ---- 多写者前端：逻辑声明 + 版本化 lowering ----
+	// 资源身份由 (name, version) 构成；版本对用户隐式，只在 lowering 内部出现。
+
+	struct ResourceRef {
+		std::string name;
+		uint32_t    version = 0;
+		bool operator<(const ResourceRef& o) const {
+			return std::tie(name, version) < std::tie(o.name, o.version);
+		}
+		bool operator==(const ResourceRef& o) const {
+			return name == o.name && version == o.version;
+		}
+	};
+
+	enum class BuilderSeverity { Warning, Error };
+
+	enum class BuilderDiagKind {
+		ImpliedEdgeAdded,        // 资源依赖新增了用户未声明的边
+		Contradiction,           // 用户拓扑成环 / 与资源依赖矛盾
+		WriterOrderUndetermined, // 同一资源的多个写者未被用户拓扑定序
+		ReadBeforeProducer,      // 读者排在生产者之前且资源没有可读初态
+		SamePassReadWrite,       // 同一 pass 内同一逻辑名既读又写
+		VersionAliasConflict,    // 版本别名组的寿命重叠或同 pass 触达多个成员
+		DuplicateName,
+		UnknownName,
+		EmptyName,
+		MuxMultiWriter
+	};
+
+	struct BuilderEdge {
+		std::string from;
+		std::string to;
+		bool operator<(const BuilderEdge& o) const {
+			return std::tie(from, to) < std::tie(o.from, o.to);
+		}
+		bool operator==(const BuilderEdge& o) const {
+			return from == o.from && to == o.to;
+		}
+	};
+
+	struct BuilderDiagnostic {
+		BuilderSeverity          severity = BuilderSeverity::Error;
+		BuilderDiagKind          kind = BuilderDiagKind::Contradiction;
+		std::string              message;
+		std::optional<BuilderEdge> edge;
+	};
+
+	struct BuilderTopologyReport {
+		std::vector<BuilderEdge> declared;     // 用户声明的顺序边
+		std::vector<BuilderEdge> impliedAdded; // case 1：资源依赖补出的边（带警告）
+		std::vector<BuilderEdge> orderingOnly; // case 3：纯顺序边，不改资源依赖
+		std::vector<BuilderEdge> conflicts;    // case 2：矛盾边
+	};
+
+	struct BuilderVersionInfo {
+		std::string resource;
+		uint32_t    version = 0;
+		std::string producer;      // 空 = 导入版本
+		bool        aliasPrevious = false;
+	};
+
+	struct LoweredResource {
+		ResourceRef        ref;
+		ResourceDesc       desc;
+		ImageSubresource   view {};
+		rhi::ImageFormat   viewFormat = rhi::ImageFormat::None;
+		ImageSubresourceRange barrierRange { {}, 0, 0 };
+		rhi::ImageLayout   initialLayout = rhi::ImageLayout::Undefined;
+		bool               crossFrame = false;
+		bool               external = false;
+		const rhi::Image*  externalImage = nullptr;
+		const rhi::Buffer* externalBuffer = nullptr;
+		bool               borrowedLater = false;
+	};
+
+	struct LoweredPass {
+		std::string       name;
+		Pass::Type        type = Pass::None;
+		PassDesc          desc;
+		rhi::QueueClass   queue = rhi::QueueClass::Graphics;
+		std::set<ResourceRef> reads;
+		std::set<ResourceRef> writes;
+		// 本 pass 内逻辑名 -> 版本；同一名不允许同时出现在读/写集，故单个版本即可
+		std::map<std::string, uint32_t> bindingVersions;
+	};
+
+	struct LoweredAliasGroup {
+		std::vector<ResourceRef> members;
+		bool mustAlias = true;
+	};
+
+	struct LoweredGraph {
+		std::vector<LoweredResource>    resources;
+		std::vector<LoweredPass>        passes;
+		std::vector<LoweredAliasGroup>  aliasGroups;
+		std::vector<BuilderEdge>        orderEdges; // 用户边 + 别名钉住边
+	};
+
+	struct LowerResult {
+		bool                           ok = false;
+		BuilderTopologyReport          topology;
+		std::vector<BuilderDiagnostic> diagnostics;
+		std::vector<BuilderVersionInfo> versions;
+		LoweredGraph                   graph;
+	};
+
+	// ---- 模块：逻辑声明的可复用封装，端口是已声明资源的对外视图 ----
+
+	enum class ModulePortKind { Input, Output, Inout };
+
+	struct ModulePort {
+		std::string    name;   // 模块内部逻辑名（必须先 DeclareResource）
+		ModulePortKind kind = ModulePortKind::Input;
+	};
+
+	struct ModulePortInfo {
+		ModulePort     port;
+		Resource::Type type = Resource::None;
+		ResourceDesc   desc;
+		ImageSubresource view {};
+		rhi::ImageFormat viewFormat = rhi::ImageFormat::None;
+		ImageSubresourceRange barrierRange { {}, 0, 0 };
+		bool           crossFrame = false;
+	};
+
+	struct ModuleBinding {
+		std::string port;
+		std::string parentResource;   // 父 Builder 已声明的逻辑名
+	};
+
+	struct ModuleInstance {
+		std::string tag;
+		std::vector<std::string> Entries;   // 已作用域化
+		std::vector<std::string> Exits;
+	};
+
+	class RenderGraphModule;
+
+	// 资源声明的选项聚合：默认即常用路径（锚点 mip0/layer0、全图 barrier、Undefined 初态、帧内）
+	struct ResourceOptions {
+		ImageSubresource      view {};
+		rhi::ImageFormat      viewFormat = rhi::ImageFormat::None;
+		ImageSubresourceRange barrierRange { {}, 0, 0 };
+		rhi::ImageLayout      initialLayout = rhi::ImageLayout::Undefined;
+		bool                  crossFrame = false;
+	};
+
+	// 多写者前端：只收集逻辑声明；Lower() 是纯函数，不接触 Device。
+	class RenderGraphBuilder {
+	public:
+		struct Topology {
+			std::vector<BuilderEdge> edges;
+			static Topology Sequence(std::vector<std::string> order); // 相邻成边
+			Topology& Then(const std::string& from, const std::string& to);
+			// 集合间全连接边：用于把模块实例的 Entries/Exits 接入父拓扑
+			Topology& ThenAll(const std::vector<std::string>& from,
+				const std::vector<std::string>& to);
+		};
+
+		// 前端合并：把另一份逻辑声明并入本 Builder，合并发生在 Lower 之前，不涉及版本。
+		struct ImportOptions {
+			std::string passPrefix;              // 追加图 Pass 名前缀，避免同名冲突
+			bool dedupIdenticalResources = true; // 同名且描述完全一致的资源自动合一
+		};
+
+		explicit RenderGraphBuilder(rhi::Device* device = nullptr) : m_device(device) {}
+		// 将 other 的声明并入本 Builder；失败返回 false 且本 Builder 保持原状。
+		bool ImportDeclarations(const RenderGraphBuilder& other, const ImportOptions& options = {});
+		// 把当前声明编译成模块：端口必须已声明为 owned 资源，且被至少一个 pass 引用
+		bool CompileModule(std::string name, std::vector<ModulePort> ports,
+			RenderGraphModule* out, std::vector<std::string>* errors = nullptr) const;
+		// 在父 Builder 中展开模块实例：端口显式绑定父资源，内部名加 tag 作用域
+		std::optional<ModuleInstance> Instantiate(const RenderGraphModule& module,
+			std::string tag, const std::vector<ModuleBinding>& bindings,
+			std::vector<std::string>* errors = nullptr);
+
+		void DeclareResource(std::string name, ResourceDesc desc, ResourceOptions options = {});
+		void DeclareResource(std::string name, const rhi::Image* external, ResourceOptions options = {});
+		void DeclareResource(std::string name, const rhi::Buffer* external);
+
+		// 读写集推导版：Render/Compute/Transfer 从 PassDesc 推导读写集；
+		// Host/Present/Mux 无可推导绑定（Mux 输出不在 desc 内），须用显式重载
+		void DeclarePass(std::string name, Pass::Type type, PassDesc desc = {},
+			std::optional<rhi::QueueClass> queue = std::nullopt);
+		void DeclarePass(std::string name, std::set<std::string> reads, std::set<std::string> writes,
+			Pass::Type type, PassDesc desc = {},
+			std::optional<rhi::QueueClass> queue = std::nullopt);
+
+		void DeclareTopology(Topology topology);
+		void AliasLogicalResources(std::vector<std::string> names);
+
+		LowerResult Lower() const;
+		// 把 lowering 结果注册进目标图；只写声明，ProcessRegister/RealizeAll 由调用方完成。
+		bool Build(RenderGraph& out, LowerResult* result = nullptr) const;
+		rhi::Device* Device() const { return m_device; }
+
+	private:
+		struct ResourceDecl {
+			std::string       name;
+			Resource::Type    type = Resource::None;
+			ResourceDesc      desc;
+			ImageSubresource  view {};
+			rhi::ImageFormat  viewFormat = rhi::ImageFormat::None;
+			ImageSubresourceRange barrierRange { {}, 0, 0 };
+			rhi::ImageLayout  initialLayout = rhi::ImageLayout::Undefined;
+			bool              crossFrame = false;
+			const rhi::Image*  externalImage = nullptr;
+			const rhi::Buffer* externalBuffer = nullptr;
+			bool              borrowedLater = false;
+			bool IsExternal() const { return externalImage != nullptr || externalBuffer != nullptr || borrowedLater; }
+		};
+		struct PassDecl {
+			std::string       name;
+			std::set<std::string> reads;
+			std::set<std::string> writes;
+			Pass::Type        type = Pass::None;
+			PassDesc          desc;
+			rhi::QueueClass   queue = rhi::QueueClass::Graphics;
+		};
+		static bool SameDecl(const ResourceDecl& a, const ResourceDecl& b);
+		// 把 PassDesc 内的图侧名字按映射重写；ShaderBinding 只写 graphResourceName
+		static void RewritePassBindings(PassDesc& desc,
+			const std::map<std::string, std::string>& nameMap);
+
+		rhi::Device* m_device = nullptr;
+		std::vector<ResourceDecl> m_resources;
+		std::vector<PassDecl>     m_passes;
+		std::vector<BuilderEdge>  m_edges;
+		std::vector<std::vector<std::string>> m_aliasGroups;
+		std::set<std::string>     m_instanceTags;
+	};
+
+	// 模块：只读声明快照 + 端口信息 + 内部入口/出口（内部名）
+	class RenderGraphModule {
+	public:
+		const std::string& Name() const { return mName; }
+		const std::vector<ModulePortInfo>& Ports() const { return mPorts; }
+		const std::vector<std::string>& Entries() const { return mEntryNames; }
+		const std::vector<std::string>& Exits() const { return mExitNames; }
+	private:
+		friend class RenderGraphBuilder;
+		std::string                 mName;
+		RenderGraphBuilder          mDecl;
+		std::vector<ModulePortInfo> mPorts;
+		std::vector<std::string>    mEntryNames;
+		std::vector<std::string>    mExitNames;
+	};
+
 	class RenderGraph {
 	public:
 		enum class ErrorCode {
@@ -220,7 +497,12 @@ namespace dEngine {
 			InvalidImageSubresourceRange,
 			ViewOutsideBarrierRange,
 			AccessRangeOutsideBarrierRange,
-			AttachmentLayerCountMismatch
+			AttachmentLayerCountMismatch,
+			ReservedResourceName,
+			PassIoNotDerivable,
+			ResolveAttachmentUnpaired,
+			ResolveSampleCountMismatch,
+			ResolveDescMismatch
 		};
 		RenderGraph() :pass_top_id(-1), resource_top_id(-1), m_graphicDevice(nullptr) {}
 		RenderGraph(rhi::Device* device):pass_top_id(-1),resource_top_id(-1),m_graphicDevice(device) {}
@@ -233,24 +515,33 @@ namespace dEngine {
 		void RegisterPass(std::string name, std::set<std::string> read, std::set<std::string> write,
 			Pass::Type type, PassDesc desc = {}, PassOrder order = {},
 			std::optional<rhi::QueueClass> queue = std::nullopt);
+		// 版本化 Pass：读写引用带版本，bindingVersions 用于把 desc 内的逻辑名解析到本 pass 所选版本。
+		void RegisterPass(std::string name, std::set<ResourceRef> read, std::set<ResourceRef> write,
+			Pass::Type type, PassDesc desc, PassOrder order,
+			std::optional<rhi::QueueClass> queue,
+			std::map<std::string, uint32_t> bindingVersions);
 		// view/viewFormat 声明节点视图（默认首 mip 首层、原格式）；barrierRange 为同步范围（count=0 = 整图）
 		void RegisterResource(std::string name, std::set<std::string> readers, std::string writer, Resource::Type type,ResourceDesc desc={},
 			ImageSubresource view = {}, rhi::ImageFormat viewFormat = rhi::ImageFormat::None,
-			ImageSubresourceRange barrierRange = ImageSubresourceRange{ {}, 0, 0 });
+			ImageSubresourceRange barrierRange = ImageSubresourceRange{ {}, 0, 0 },
+			rhi::ImageLayout initialLayout = rhi::ImageLayout::Undefined,
+			bool crossFrame = false, uint32_t version = 0);
 		// 借用外部原生 image：节点不创建、不拥有、不参与 usage 汇总，生命周期由外部负责。
 		void RegisterResource(std::string name, std::set<std::string> readers, std::string writer,
 			const rhi::Image* external, ImageSubresource view = {},
 			rhi::ImageLayout initialLayout = rhi::ImageLayout::Undefined,
 			rhi::ImageFormat viewFormat = rhi::ImageFormat::None,
 			ImageSubresourceRange barrierRange = ImageSubresourceRange{ {}, 0, 0 },
-			bool crossFrame = false);
+			bool crossFrame = false, uint32_t version = 0);
 		// 借用外部已创建的原生 buffer（顶点/索引/UBO 等由上传层或渲染器自管）：同 Borrow 语义
 		void RegisterResource(std::string name, std::set<std::string> readers, std::string writer,
-			const rhi::Buffer* external);
+			const rhi::Buffer* external, uint32_t version = 0);
 		// 注册静态纹理：固定 set 0/binding 0，图像须已为 ShaderReadOnly，槽位只写一次。
 		uint32_t RegisterStaticTexture(const std::string& name, const rhi::Image& image,
 			ImageSubresource view = {}, rhi::ImageFormat viewFormat = rhi::ImageFormat::None,
 			const std::optional<rhi::SamplerDesc>& sampler = std::nullopt);
+		// 声明期合并：把任务中的两张未编译图并入本图；校验失败返回 false 且本图保持为空
+		bool ApplyMergeTask(const GraphMergeTask& task);
 		// 显式顺序约束通过 RegisterPass 的 PassOrder 参数声明
 		void ProcessRegister();
 		// 执行层开关：仅允许 Render/Compute，写资源不能有活跃读者，否则拒绝切换。
@@ -261,12 +552,14 @@ namespace dEngine {
 		uint32_t FrameSlotCount() const;
 		// mux 输出资源：Borrow-later（图像或缓冲；desc 与候选严格一致）
 		void RegisterMuxOutput(std::string name, std::set<std::string> readers, std::string writer,
-			ResourceDesc desc);
+			ResourceDesc desc, uint32_t version = 0);
 		// 运行期 mux 选择：按帧槽保存，BeginFrame 时应用
 		void SetMuxSelection(const std::string& muxPass, uint32_t slot, uint32_t index);
 		void GenerateSubmitSequence();
 		// 手动分桶声明：整组校验失败时降级为非别名，须在 RealizeAll 之前调用。
 		void AliasResources(std::vector<std::string> names);
+		// 版本化分桶声明：按 (name, version) 精确指定成员。
+		void AliasResourceVersions(std::vector<ResourceRef> refs);
 		
 		void SetDevice(rhi::Device* graphic);
 		void RealizeResource(Resource* resource);
@@ -350,6 +643,10 @@ namespace dEngine {
 		// 节点池访问（id 越界返回 nullptr；实例化产物由节点自身持有，Image::get_rhi / RenderPass::get_rhi 取用）
 		Resource* GetResource(uint32_t resourceId) const;
 		Pass*     GetPass(uint32_t passId) const;
+		// 按名查找节点池：未注册返回 nullptr（FindResourceByName 避开 Win32 FindResource 宏）
+		Pass*     FindPass(const std::string& name) const;
+		Resource* FindResourceByName(const std::string& name) const;
+		Resource* FindResourceByName(const std::string& name, uint32_t version) const;
 
 		void PrintGraph();
 
@@ -357,11 +654,11 @@ namespace dEngine {
 		[[noreturn]] static void HandleError(ErrorCode code);
 	private:
 		void ResolvePassDesc(const std::set<uint32_t>& read, const std::set<uint32_t>& write,
-			RenderPassDesc& desc);
+			RenderPassDesc& desc, const std::map<std::string, uint32_t>& bindingVersions);
 		void ResolveComputePassDesc(const std::set<uint32_t>& read, const std::set<uint32_t>& write,
-			ComputePassDesc& desc);
+			ComputePassDesc& desc, const std::map<std::string, uint32_t>& bindingVersions);
 		void ResolveTransferPassDesc(const std::set<uint32_t>& read, const std::set<uint32_t>& write,
-			TransferPassDesc& desc);
+			TransferPassDesc& desc, const std::map<std::string, uint32_t>& bindingVersions);
 		void ResolvePresentPassDesc(const std::set<uint32_t>& read, const std::set<uint32_t>& write,
 			const PresentPassDesc& desc);
 		void RealizeShaderSets(rhi::Pipeline& pipeline, std::vector<ShaderBinding>& shaderBindings,
@@ -376,15 +673,19 @@ namespace dEngine {
 		void ValidateBindingConflict(const RenderPassDesc& desc);
 		struct reg_tmp_pass {
 			uint32_t id;
-			std::set<std::string> to_read_name;
+			std::set<std::string> to_read_name;  // 内部 key：逻辑名（v0）或逻辑名+分隔符+版本
 			std::set<std::string> to_write_name;
 			Pass::Type type;
 			rhi::QueueClass queue = rhi::QueueClass::Graphics;
 			PassOrder order;
 			PassDesc desc;
+			// desc 内逻辑名 -> 本 pass 选中的版本
+			std::map<std::string, uint32_t> bindingVersions;
 		};
 		struct reg_tmp_resource {
 			uint32_t id;
+			std::string name;                   // 逻辑资源名
+			uint32_t    version = 0;
 			std::set<std::string> readers_name;
 			std::string writer_name;
 			Resource::Type type;
@@ -397,6 +698,8 @@ namespace dEngine {
 			rhi::ImageLayout  initialLayout = rhi::ImageLayout::Undefined;
 			bool              borrowedLater = false;
 			bool              crossFrame = false;
+			// 非空表示本名是别名，实际解析到该规范名对应的资源节点（合并期写入）
+			std::string       canonicalName;
 		};
 		uint32_t pass_top_id;
 		uint32_t resource_top_id;
@@ -507,7 +810,7 @@ namespace dEngine {
 		rhi::ImageUsage DeriveImageUsage(uint32_t memoryBlockId) const;
 		void ResolveAliasGroups();
 
-		std::vector<std::vector<std::string>> m_aliasRequests;
+		std::vector<std::vector<ResourceRef>> m_aliasRequests;
 		bool m_aliasResolved = false;
 
 

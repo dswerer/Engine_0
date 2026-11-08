@@ -278,6 +278,11 @@ namespace dEngine::rhi {
 			Access dstAccess = Access::MemoryRead,
 			uint32_t srcQueueFamily = kQueueFamilyIgnored,
 			uint32_t dstQueueFamily = kQueueFamilyIgnored);
+		// 单个 buffer 的可见性/执行依赖转换（无布局语义）：内部构造 BufferBarrier；size 为 0 = 到末尾
+		void TransitionBuffer(Buffer& buffer, PipelineStage srcStage, Access srcAccess,
+			PipelineStage dstStage, Access dstAccess, uint64_t offset = 0, uint64_t size = 0,
+			uint32_t srcQueueFamily = kQueueFamilyIgnored,
+			uint32_t dstQueueFamily = kQueueFamilyIgnored);
 
 		// dynamic rendering
 		void BeginRendering(const RenderingInfo& info);
@@ -485,6 +490,17 @@ namespace dEngine::rhi {
 		// 资源与对象创建
 		std::unique_ptr<Image>         CreateImage(const ImageCreateInfo& info);
 		std::unique_ptr<Buffer>        CreateBuffer(const BufferCreateInfo& info);
+		// 一次性上传：host 数据经 staging 拷入整图 mip0 全层并转换到 finalLayout，提交并等待完成。
+		// info.usage 自动补 TransferDst 位；失败返回 nullptr。
+		std::unique_ptr<Image>         UploadImage(const void* data, std::uint64_t byteSize,
+			ImageCreateInfo info, ImageLayout finalLayout = ImageLayout::ShaderReadOnly,
+			PipelineStage dstStage = PipelineStage::AllCommands,
+			Access dstAccess = Access::MemoryRead);
+		// 一次性上传：host 数据拷入 hostVisible buffer，Flush 后自动补 Host→dst 可见性 barrier，提交并等待完成。
+		std::unique_ptr<Buffer>        UploadBuffer(const void* data, std::uint64_t byteSize,
+			BufferUsage usage,
+			PipelineStage dstStage = PipelineStage::AllCommands,
+			Access dstAccess = Access::MemoryRead);
 		std::unique_ptr<Sampler>       CreateSampler(const SamplerDesc& desc);
 		std::unique_ptr<Pipeline>      CreatePipeline(const GraphicsPipelineDesc& desc,
 			const DescriptorSetLayout* externalSet0 = nullptr);

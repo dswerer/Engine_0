@@ -9,6 +9,18 @@
 
 using namespace dEngine;
 
+// 版本化资源在 tmp_resources 中的内部键：v0 保持原名（兼容既有行为），v>0 追加分隔符与版本
+static constexpr char kResVersionSep = '\x1F';
+static std::string TmpResKey(const std::string& name, uint32_t version) {
+	if (version == 0) return name;
+	return name + kResVersionSep + std::to_string(version);
+}
+
+static void ValidateResourceName(const std::string& name) {
+	if (name.find(kResVersionSep) != std::string::npos)
+		RenderGraph::HandleError(RenderGraph::ErrorCode::ReservedResourceName);
+}
+
 static const char* UsageName(Usage u) {
 	switch (u) {
 	case Usage::Auto:                   return "Auto";
@@ -150,6 +162,16 @@ void RenderGraph::HandleError(ErrorCode code) {
 		std::cerr << "RenderGraph: 附件访问范围不在 barrierRange 内" << std::endl; break;
 	case ErrorCode::AttachmentLayerCountMismatch:
 		std::cerr << "RenderGraph: 同一 Pass 的附件层数不一致" << std::endl; break;
+	case ErrorCode::ReservedResourceName:
+		std::cerr << "RenderGraph: 资源名包含内部保留字符（0x1F）" << std::endl; break;
+	case ErrorCode::PassIoNotDerivable:
+		std::cerr << "RenderGraph: Host/Present/Mux 的读写集无法从 PassDesc 推导，请用显式 reads/writes 重载（或 desc 与类型不匹配）" << std::endl; break;
+	case ErrorCode::ResolveAttachmentUnpaired:
+		std::cerr << "RenderGraph: MSAA 解算附件配对无效（ResolveDst 需同 slot 的颜色附件；ResolveSrc 若声明须与颜色附件同源并配备 ResolveDst）" << std::endl; break;
+	case ErrorCode::ResolveSampleCountMismatch:
+		std::cerr << "RenderGraph: MSAA 采样数不一致（颜色附件须 samples>1、解算目标须 samples==1，且同 pass 附件采样数须相同）" << std::endl; break;
+	case ErrorCode::ResolveDescMismatch:
+		std::cerr << "RenderGraph: MSAA 解算源与目标的格式/尺寸/层数不一致" << std::endl; break;
 	default:
 		std::cerr << "RenderGraph: 未知校验错误" << std::endl; break;
 	}
@@ -157,18 +179,22 @@ void RenderGraph::HandleError(ErrorCode code) {
 }
 
 void RenderGraph::ResolvePassDesc(const std::set<uint32_t>& read, const std::set<uint32_t>& write,
-	RenderPassDesc& desc)
+	RenderPassDesc& desc, const std::map<std::string, uint32_t>& bindingVersions)
 {
+	auto keyOf = [&](const std::string& n) -> std::string {
+		auto it = bindingVersions.find(n);
+		return TmpResKey(n, it == bindingVersions.end() ? 0u : it->second);
+	};
 	auto resolve = [&](const std::string& resName) -> uint32_t {
-		auto it = tmp_resources.value().find(resName);
 		if (resName.empty())
 			throw ErrorCode::EmptyResourceName;
+		auto it = tmp_resources.value().find(keyOf(resName));
 		if (it == tmp_resources.value().end())
 			throw ErrorCode::ResourceNotRegistered;
 		return it->second.id;
 	};
 	auto formatOf = [&](const std::string& resName) -> ImageFormat {
-		auto it = tmp_resources.value().find(resName);
+		auto it = tmp_resources.value().find(keyOf(resName));
 		if (it != tmp_resources.value().end()) {
 			if (auto* img = std::get_if<ImageDesc>(&it->second.desc))
 				return img->format;
@@ -176,7 +202,7 @@ void RenderGraph::ResolvePassDesc(const std::set<uint32_t>& read, const std::set
 		return ImageFormat::None;
 	};
 	auto typeOf = [&](const std::string& resName) -> Resource::Type {
-		auto it = tmp_resources.value().find(resName);
+		auto it = tmp_resources.value().find(keyOf(resName));
 		return it != tmp_resources.value().end() ? it->second.type : Resource::None;
 	};
 
@@ -203,9 +229,11 @@ void RenderGraph::ResolvePassDesc(const std::set<uint32_t>& read, const std::set
 		}
 	}
 	for (auto& sb : desc.shaderBindings) {
-		sb.resourceId = resolve(sb.resourceName);
+		const std::string& graphName = sb.graphResourceName.empty()
+			? sb.resourceName : sb.graphResourceName;
+		sb.resourceId = resolve(graphName);
 		if (sb.usage == Usage::Auto)
-			sb.usage = (typeOf(sb.resourceName) == Resource::Buffer)
+			sb.usage = (typeOf(graphName) == Resource::Buffer)
 				? Usage::UniformRead : Usage::SampledRead;
 	}
 
@@ -220,6 +248,65 @@ void RenderGraph::ResolvePassDesc(const std::set<uint32_t>& read, const std::set
 			throw ErrorCode::ResourceTypeDescMismatch;
 	}
 
+	// MSAA 一致性：采样数（颜色/深度/解算源同 pass 必须一致，解算目标必须为 1）与解算源描述匹配
+	{
+		struct AttShape {
+			ImageFormat format = ImageFormat::None;
+			uint32_t width = 0, height = 0, layers = 1, samples = 1;
+		};
+		// 自有资源读 ImageDesc，借用资源读外部图像描述（两者字段口径一致）
+		auto shapeOf = [&](const std::string& resName) -> std::optional<AttShape> {
+			auto it = tmp_resources.value().find(keyOf(resName));
+			if (it == tmp_resources.value().end())
+				return std::nullopt;
+			if (auto* img = std::get_if<ImageDesc>(&it->second.desc))
+				return AttShape{ img->format, img->width, img->height, img->arrayLayers,
+					img->samples == 0 ? 1u : img->samples };
+			if (it->second.externalImage != nullptr) {
+				const rhi::ImageCreateInfo& d = it->second.externalImage->Desc();
+				return AttShape{ d.format, d.width, d.height, d.arrayLayers,
+					d.samples == 0 ? 1u : d.samples };
+			}
+			return std::nullopt;
+		};
+
+		std::map<uint32_t, AttShape> colorBySlot;
+		uint32_t passSamples = 1;
+		bool samplesKnown = false;
+		for (const auto& att : desc.attachments) {
+			if (att.usage == Usage::ResolveDst)
+				continue;
+			const auto shape = shapeOf(att.resourceName);
+			if (!shape.has_value())
+				throw ErrorCode::ResourceTypeDescMismatch;
+			if (att.usage == Usage::ColorAttachment)
+				colorBySlot[att.slot] = *shape;
+			if (!samplesKnown) {
+				passSamples = shape->samples;
+				samplesKnown = true;
+			}
+			else if (passSamples != shape->samples) {
+				throw ErrorCode::ResolveSampleCountMismatch;
+			}
+		}
+		for (const auto& att : desc.attachments) {
+			if (att.usage != Usage::ResolveDst)
+				continue;
+			const auto dst = shapeOf(att.resourceName);
+			if (!dst.has_value())
+				throw ErrorCode::ResourceTypeDescMismatch;
+			auto cit = colorBySlot.find(att.slot);
+			if (cit == colorBySlot.end())
+				throw ErrorCode::ResolveAttachmentUnpaired;
+			if (passSamples <= 1 || dst->samples != 1)
+				throw ErrorCode::ResolveSampleCountMismatch;
+			if (cit->second.format != dst->format
+				|| cit->second.width != dst->width || cit->second.height != dst->height
+				|| cit->second.layers != dst->layers)
+				throw ErrorCode::ResolveDescMismatch;
+		}
+	}
+
 	ValidateAttachments(read, write, desc);
 	ValidateShaderBindings(read, write, desc.shaderBindings);
 	ValidateDrawBindings(read, desc);
@@ -227,35 +314,41 @@ void RenderGraph::ResolvePassDesc(const std::set<uint32_t>& read, const std::set
 }
 
 void RenderGraph::ResolveComputePassDesc(const std::set<uint32_t>& read, const std::set<uint32_t>& write,
-	ComputePassDesc& desc)
+	ComputePassDesc& desc, const std::map<std::string, uint32_t>& bindingVersions)
 {
 	if (desc.shader.stage != rhi::ShaderStage::Compute)
 		throw ErrorCode::PassTypeDescMismatch;
 
+	auto keyOf = [&](const std::string& n) -> std::string {
+		auto it = bindingVersions.find(n);
+		return TmpResKey(n, it == bindingVersions.end() ? 0u : it->second);
+	};
 	auto resolve = [&](const std::string& resName) -> uint32_t {
-		auto it = tmp_resources.value().find(resName);
 		if (resName.empty())
 			throw ErrorCode::EmptyResourceName;
+		auto it = tmp_resources.value().find(keyOf(resName));
 		if (it == tmp_resources.value().end())
 			throw ErrorCode::ResourceNotRegistered;
 		return it->second.id;
 	};
 
 	auto typeOf = [&](const std::string& resName) -> Resource::Type {
-		auto it = tmp_resources.value().find(resName);
+		auto it = tmp_resources.value().find(keyOf(resName));
 		return it != tmp_resources.value().end() ? it->second.type : Resource::None;
 	};
 
 	for (auto& sb : desc.shaderBindings) {
-		sb.resourceId = resolve(sb.resourceName);
+		const std::string& graphName = sb.graphResourceName.empty()
+			? sb.resourceName : sb.graphResourceName;
+		sb.resourceId = resolve(graphName);
 		if (sb.usage == Usage::Auto)
-			sb.usage = (typeOf(sb.resourceName) == Resource::Buffer)
+			sb.usage = (typeOf(graphName) == Resource::Buffer)
 				? Usage::UniformRead : Usage::SampledRead;
 	}
 	ValidateShaderBindings(read, write, desc.shaderBindings);
 
 	if (!desc.indirectBuffer.empty()) {
-		auto it = tmp_resources.value().find(desc.indirectBuffer);
+		auto it = tmp_resources.value().find(keyOf(desc.indirectBuffer));
 		if (it == tmp_resources.value().end())
 			throw ErrorCode::ResourceNotRegistered;
 		if (it->second.type != Resource::Buffer)
@@ -267,22 +360,26 @@ void RenderGraph::ResolveComputePassDesc(const std::set<uint32_t>& read, const s
 }
 
 void RenderGraph::ResolveTransferPassDesc(const std::set<uint32_t>& read, const std::set<uint32_t>& write,
-	TransferPassDesc& desc)
+	TransferPassDesc& desc, const std::map<std::string, uint32_t>& bindingVersions)
 {
+	auto keyOf = [&](const std::string& n) -> std::string {
+		auto it = bindingVersions.find(n);
+		return TmpResKey(n, it == bindingVersions.end() ? 0u : it->second);
+	};
 	auto resolve = [&](const std::string& resName) -> uint32_t {
-		auto it = tmp_resources.value().find(resName);
 		if (resName.empty())
 			throw ErrorCode::EmptyResourceName;
+		auto it = tmp_resources.value().find(keyOf(resName));
 		if (it == tmp_resources.value().end())
 			throw ErrorCode::ResourceNotRegistered;
 		return it->second.id;
 	};
 	auto typeOf = [&](const std::string& resName) -> Resource::Type {
-		auto it = tmp_resources.value().find(resName);
+		auto it = tmp_resources.value().find(keyOf(resName));
 		return it != tmp_resources.value().end() ? it->second.type : Resource::None;
 	};
 	auto imageDescOf = [&](const std::string& resName) -> const ImageDesc* {
-		auto it = tmp_resources.value().find(resName);
+		auto it = tmp_resources.value().find(keyOf(resName));
 		if (it == tmp_resources.value().end())
 			return nullptr;
 		return std::get_if<ImageDesc>(&it->second.desc);
@@ -363,6 +460,9 @@ void RenderGraph::ValidateAttachments(const std::set<uint32_t>& read, const std:
 {
 	std::set<uint32_t> colorSlots;
 	uint32_t depthCount = 0;
+	std::map<uint32_t, const AttachmentBinding*> colorBySlot;
+	std::map<uint32_t, const AttachmentBinding*> resolveSrcBySlot;
+	std::set<uint32_t> resolveDstSlots;
 	for (auto& att : desc.attachments) {
 		switch (att.usage) {
 		case Usage::ColorAttachment:
@@ -379,10 +479,23 @@ void RenderGraph::ValidateAttachments(const std::set<uint32_t>& read, const std:
 				throw ErrorCode::ColorSlotOutOfRange;
 			if (!colorSlots.insert(att.slot).second)
 				throw ErrorCode::DuplicateColorSlot;
+			colorBySlot[att.slot] = &att;
 		}
 		else if (att.usage == Usage::DepthStencilAttachment) {
 			if (++depthCount > 1)
 				throw ErrorCode::MultipleDepthAttachments;
+		}
+		else if (att.usage == Usage::ResolveSrc) {
+			if (att.slot >= kMaxColorAttachments)
+				throw ErrorCode::ColorSlotOutOfRange;
+			if (!resolveSrcBySlot.emplace(att.slot, &att).second)
+				throw ErrorCode::DuplicateColorSlot;
+		}
+		else if (att.usage == Usage::ResolveDst) {
+			if (att.slot >= kMaxColorAttachments)
+				throw ErrorCode::ColorSlotOutOfRange;
+			if (!resolveDstSlots.insert(att.slot).second)
+				throw ErrorCode::DuplicateColorSlot;
 		}
 
 		uint32_t id = *att.resourceId;
@@ -397,6 +510,20 @@ void RenderGraph::ValidateAttachments(const std::set<uint32_t>& read, const std:
 
 	if (!colorSlots.empty() && *colorSlots.rbegin() + 1 != colorSlots.size())
 		throw ErrorCode::ColorSlotNotDense;
+
+	// MSAA 配对：ResolveDst 必须挂在同 slot 的颜色附件上；ResolveSrc 若声明，
+	// 必须与被解算的颜色附件同源且该 slot 配备 ResolveDst
+	for (uint32_t slot : resolveDstSlots) {
+		if (colorBySlot.count(slot) == 0)
+			throw ErrorCode::ResolveAttachmentUnpaired;
+	}
+	for (const auto& src : resolveSrcBySlot) {
+		auto cit = colorBySlot.find(src.first);
+		if (cit == colorBySlot.end() || resolveDstSlots.count(src.first) == 0)
+			throw ErrorCode::ResolveAttachmentUnpaired;
+		if (cit->second->resourceId != src.second->resourceId)
+			throw ErrorCode::ResolveAttachmentUnpaired;
+	}
 }
 
 void RenderGraph::ValidateShaderBindings(const std::set<uint32_t>& read, const std::set<uint32_t>& write,
@@ -489,14 +616,40 @@ void RenderGraph::RegisterPass(std::string name, std::set<std::string> read, std
 	tmp_passes.value()[name] = std::move(rtp);
 }
 
+void RenderGraph::RegisterPass(std::string name, std::set<ResourceRef> read, std::set<ResourceRef> write,
+	Pass::Type type, PassDesc desc, PassOrder order,
+	std::optional<rhi::QueueClass> queue,
+	std::map<std::string, uint32_t> bindingVersions) {
+	if (type == Pass::None) HandleError(ErrorCode::PassTypeUnspecified);
+	if (!tmp_passes.has_value()) {
+		tmp_passes.emplace();
+	}
+	reg_tmp_pass rtp;
+	rtp.id = ++this->pass_top_id;
+	for (const auto& r : read)
+		rtp.to_read_name.insert(TmpResKey(r.name, r.version));
+	for (const auto& r : write)
+		rtp.to_write_name.insert(TmpResKey(r.name, r.version));
+	rtp.type = type;
+	rtp.queue = queue.value_or(DefaultQueueForPass(type, desc));
+	rtp.order = std::move(order);
+	rtp.desc = std::move(desc);
+	rtp.bindingVersions = std::move(bindingVersions);
+	tmp_passes.value()[name] = std::move(rtp);
+}
+
 void RenderGraph::RegisterResource(std::string name, std::set<std::string> reader, std::string writer,Resource::Type type,ResourceDesc desc,
-	ImageSubresource view, rhi::ImageFormat viewFormat, ImageSubresourceRange barrierRange) {
+	ImageSubresource view, rhi::ImageFormat viewFormat, ImageSubresourceRange barrierRange,
+	rhi::ImageLayout initialLayout, bool crossFrame, uint32_t version) {
 	if (type == Resource::None) HandleError(ErrorCode::ResourceTypeUnspecified);
+	ValidateResourceName(name);
 	if (!tmp_resources.has_value()) {
 		tmp_resources.emplace();
 	}
 	reg_tmp_resource rtr;
 	rtr.id = ++this->resource_top_id;
+	rtr.name = name;
+	rtr.version = version;
 	rtr.readers_name = reader;
 	rtr.writer_name = writer;
 	rtr.type = type;
@@ -504,18 +657,26 @@ void RenderGraph::RegisterResource(std::string name, std::set<std::string> reade
 	rtr.view = view;
 	rtr.viewFormat = viewFormat;
 	rtr.barrierRange = barrierRange;
-	tmp_resources.value()[name] = rtr;
+	rtr.initialLayout = initialLayout;
+	// 描述里的 crossFrame 与参数取并集，与既有 Own 资源的语义保持一致
+	if (auto* id = std::get_if<ImageDesc>(&rtr.desc)) rtr.crossFrame = crossFrame || id->crossFrame;
+	else if (auto* bd = std::get_if<BufferDesc>(&rtr.desc)) rtr.crossFrame = crossFrame || bd->crossFrame;
+	else rtr.crossFrame = crossFrame;
+	tmp_resources.value()[TmpResKey(name, version)] = std::move(rtr);
 }
 
 void RenderGraph::RegisterResource(std::string name, std::set<std::string> reader, std::string writer,
 	const rhi::Image* external, ImageSubresource view, rhi::ImageLayout initialLayout,
-	rhi::ImageFormat viewFormat, ImageSubresourceRange barrierRange, bool crossFrame) {
+	rhi::ImageFormat viewFormat, ImageSubresourceRange barrierRange, bool crossFrame, uint32_t version) {
 	if (external == nullptr) HandleError(ErrorCode::ResourceNotRegistered);
+	ValidateResourceName(name);
 	if (!tmp_resources.has_value()) {
 		tmp_resources.emplace();
 	}
 	reg_tmp_resource rtr;
 	rtr.id = ++this->resource_top_id;
+	rtr.name = name;
+	rtr.version = version;
 	rtr.readers_name = reader;
 	rtr.writer_name = writer;
 	rtr.type = Resource::Image;
@@ -525,22 +686,25 @@ void RenderGraph::RegisterResource(std::string name, std::set<std::string> reade
 	rtr.externalImage = external;
 	rtr.initialLayout = initialLayout;
 	rtr.crossFrame = crossFrame;
-	tmp_resources.value()[name] = rtr;
+	tmp_resources.value()[TmpResKey(name, version)] = rtr;
 }
 
 void RenderGraph::RegisterResource(std::string name, std::set<std::string> reader, std::string writer,
-	const rhi::Buffer* external) {
+	const rhi::Buffer* external, uint32_t version) {
 	if (external == nullptr) HandleError(ErrorCode::ResourceNotRegistered);
+	ValidateResourceName(name);
 	if (!tmp_resources.has_value()) {
 		tmp_resources.emplace();
 	}
 	reg_tmp_resource rtr;
 	rtr.id = ++this->resource_top_id;
+	rtr.name = name;
+	rtr.version = version;
 	rtr.readers_name = reader;
 	rtr.writer_name = writer;
 	rtr.type = Resource::Buffer;
 	rtr.externalBuffer = external;
-	tmp_resources.value()[name] = rtr;
+	tmp_resources.value()[TmpResKey(name, version)] = rtr;
 }
 
 static uint32_t BytesPerPixel(ImageFormat f) {
@@ -596,7 +760,12 @@ void RenderGraph::ProcessRegister() {
 	if (!tmp_passes.has_value()) tmp_passes.emplace();
 	if (!tmp_resources.has_value()) tmp_resources.emplace();
 	passPool.resize(tmp_passes.value().size());
-	resourcePool.resize(tmp_resources.value().size());
+	// 别名条目只用于名字解析，不产生资源节点
+	uint32_t resourceNodeCount = 0;
+	for (const auto& r : tmp_resources.value())
+		if (r.second.canonicalName.empty())
+			++resourceNodeCount;
+	resourcePool.resize(resourceNodeCount);
 	m_extraEdges.clear();
 	m_hostImageStaging.clear();
 
@@ -624,7 +793,7 @@ void RenderGraph::ProcessRegister() {
 
 		if (auto* rpd = std::get_if<RenderPassDesc>(&desc)) {
 			try {
-				ResolvePassDesc(read, write, *rpd);
+				ResolvePassDesc(read, write, *rpd, pass.second.bindingVersions);
 			}
 			catch (const ErrorCode& code) {
 				HandleError(code);
@@ -632,7 +801,7 @@ void RenderGraph::ProcessRegister() {
 		}
 		else if (auto* cpd = std::get_if<ComputePassDesc>(&desc)) {
 			try {
-				ResolveComputePassDesc(read, write, *cpd);
+				ResolveComputePassDesc(read, write, *cpd, pass.second.bindingVersions);
 			}
 			catch (const ErrorCode& code) {
 				HandleError(code);
@@ -640,7 +809,7 @@ void RenderGraph::ProcessRegister() {
 		}
 		else if (auto* tpd = std::get_if<TransferPassDesc>(&desc)) {
 			try {
-				ResolveTransferPassDesc(read, write, *tpd);
+				ResolveTransferPassDesc(read, write, *tpd, pass.second.bindingVersions);
 			}
 			catch (const ErrorCode& code) {
 				HandleError(code);
@@ -659,12 +828,23 @@ void RenderGraph::ProcessRegister() {
 				std::cerr << "RenderGraph: Mux pass \"" << name << "\" 候选/输出数量不合法" << std::endl;
 				HandleError(ErrorCode::MuxPassInvalid);
 			}
+			mpd->alternativeIds.clear();
 			for (const auto& altName : mpd->alternatives) {
-				if (pass.second.to_read_name.find(altName) == pass.second.to_read_name.end()) {
+				auto vit = pass.second.bindingVersions.find(altName);
+				const uint32_t altVersion = vit == pass.second.bindingVersions.end() ? 0u : vit->second;
+				const std::string altKey = TmpResKey(altName, altVersion);
+				if (pass.second.to_read_name.find(altKey) == pass.second.to_read_name.end()) {
 					std::cerr << "RenderGraph: Mux pass \"" << name << "\" 的候选 \"" << altName
 						<< "\" 未在 read 集声明" << std::endl;
 					HandleError(ErrorCode::MuxPassInvalid);
 				}
+				auto rit = tmp_resources.value().find(altKey);
+				if (rit == tmp_resources.value().end()) {
+					std::cerr << "RenderGraph: Mux pass \"" << name << "\" 的候选 \"" << altName
+						<< "\" 未注册" << std::endl;
+					HandleError(ErrorCode::MuxPassInvalid);
+				}
+				mpd->alternativeIds.push_back(rit->second.id);
 			}
 		}
 
@@ -712,8 +892,10 @@ void RenderGraph::ProcessRegister() {
 	}
 
 	for (auto& resource : tmp_resources.value()) {
+		if (!resource.second.canonicalName.empty())
+			continue;
 		uint32_t id = resource.second.id;
-		std::string name = resource.first;
+		std::string name = resource.second.name;
 		Resource::Type type = resource.second.type;
 		std::set<uint32_t> reader;
 		for (auto& reader_name : resource.second.readers_name) {
@@ -734,6 +916,7 @@ void RenderGraph::ProcessRegister() {
 		ResourceTopology topo;
 		topo.id = id;
 		topo.name = name;
+		topo.version = resource.second.version;
 		topo.readers = std::move(reader);
 		topo.writer = writer_id;
 		topo.external = (resource.second.externalImage != nullptr
@@ -741,10 +924,10 @@ void RenderGraph::ProcessRegister() {
 			|| resource.second.borrowedLater);
 		topo.initialLayout = resource.second.initialLayout;
 		topo.crossFrame = resource.second.crossFrame;
-		if (auto* id = std::get_if<ImageDesc>(&resource.second.desc))
-			topo.crossFrame = id->crossFrame;
-		else if (auto* bd = std::get_if<BufferDesc>(&resource.second.desc))
-			topo.crossFrame = bd->crossFrame;
+		if (auto* d = std::get_if<ImageDesc>(&resource.second.desc))
+			topo.crossFrame = topo.crossFrame || d->crossFrame;
+		else if (auto* d = std::get_if<BufferDesc>(&resource.second.desc))
+			topo.crossFrame = topo.crossFrame || d->crossFrame;
 		topo.aliasGroup = static_cast<uint32_t>(-1);
 		topo.memoryBlockId = id;
 		resourcePool[id] = Resource::AutoAllocator(std::move(topo), type, std::move(resource.second.desc),
@@ -756,11 +939,6 @@ void RenderGraph::ProcessRegister() {
 	}
 
 	m_muxes.clear();
-	auto findResByName = [this](const std::string& n) -> Resource* {
-		for (auto& r : resourcePool)
-			if (r != nullptr && r->get_name() == n) return r.get();
-		return nullptr;
-	};
 	for (auto& holder : passPool) {
 		Pass* p = holder.get();
 		if (p == nullptr || p->get_type() != Pass::Mux)
@@ -787,8 +965,11 @@ void RenderGraph::ProcessRegister() {
 		if (entry.outputType == Resource::Image) {
 			Image* outImg = static_cast<Image*>(outRes);
 			const ImageDesc& od = outImg->get_desc();
-			for (const auto& altName : mp->get_desc().alternatives) {
-				Resource* altRes = findResByName(altName);
+			const auto& altIds = mp->get_desc().alternativeIds;
+			if (altIds.size() != mp->get_desc().alternatives.size())
+				HandleError(ErrorCode::MuxPassInvalid);
+			for (size_t ai = 0; ai < altIds.size(); ++ai) {
+				Resource* altRes = GetResource(altIds[ai]);
 				if (altRes == nullptr || altRes->get_type() != Resource::Image)
 					HandleError(ErrorCode::MuxPassInvalid);
 				Image* altImg = static_cast<Image*>(altRes);
@@ -817,8 +998,11 @@ void RenderGraph::ProcessRegister() {
 		else {
 			Buffer* outBuf = static_cast<Buffer*>(outRes);
 			const BufferDesc& od = outBuf->get_desc();
-			for (const auto& altName : mp->get_desc().alternatives) {
-				Resource* altRes = findResByName(altName);
+			const auto& altIds = mp->get_desc().alternativeIds;
+			if (altIds.size() != mp->get_desc().alternatives.size())
+				HandleError(ErrorCode::MuxPassInvalid);
+			for (size_t ai = 0; ai < altIds.size(); ++ai) {
+				Resource* altRes = GetResource(altIds[ai]);
 				if (altRes == nullptr || altRes->get_type() != Resource::Buffer)
 					HandleError(ErrorCode::MuxPassInvalid);
 				const BufferDesc& ad = static_cast<Buffer*>(altRes)->get_desc();
@@ -1056,6 +1240,7 @@ void RenderGraph::SynthesizeHostImageStaging()
 		std::string hostName;
 		uint32_t    imageId = 0;
 		std::string imageName;
+		uint32_t    imageVersion = 0;
 		bool        read = false;
 		bool        write = false;
 	};
@@ -1073,7 +1258,8 @@ void RenderGraph::SynthesizeHostImageStaging()
 				u.hostId = pe.second.id;
 				u.hostName = pe.first;
 				u.imageId = it->second.id;
-				u.imageName = n;
+				u.imageName = it->second.name;
+				u.imageVersion = it->second.version;
 				(isRead ? u.read : u.write) = true;
 			}
 		};
@@ -1112,7 +1298,8 @@ void RenderGraph::SynthesizeHostImageStaging()
 		region.imageExtentDepth = std::max(1u, (desc.depth == 0 ? 1u : desc.depth) >> range.base.mipLevel);
 
 		const uint32_t stagingId = ++resource_top_id;
-		const std::string stagingName = "__hoststage_" + u.hostName + "_" + u.imageName;
+		const std::string stagingName = "__hoststage_" + u.hostName + "_" + u.imageName
+			+ (u.imageVersion == 0 ? "" : "@v" + std::to_string(u.imageVersion));
 		ResourceTopology stTopo;
 		stTopo.id = stagingId;
 		stTopo.name = stagingName;
@@ -1278,7 +1465,15 @@ void RenderGraph::GenerateSubmitSequence() {
 }
 
 void RenderGraph::AliasResources(std::vector<std::string> names) {
-	m_aliasRequests.push_back(std::move(names));
+	std::vector<ResourceRef> refs;
+	refs.reserve(names.size());
+	for (const auto& n : names)
+		refs.push_back(ResourceRef{ n, 0 });
+	m_aliasRequests.push_back(std::move(refs));
+}
+
+void RenderGraph::AliasResourceVersions(std::vector<ResourceRef> refs) {
+	m_aliasRequests.push_back(std::move(refs));
 }
 
 void RenderGraph::ResolveAliasGroups() {
@@ -1291,12 +1486,13 @@ void RenderGraph::ResolveAliasGroups() {
 	BuildSubmitPlan();
 
 	for (size_t g = 0; g < m_aliasRequests.size(); ++g) {
-		const std::vector<std::string>& names = m_aliasRequests[g];
-		auto degrade = [&names](AliasRejectReason reason) {
+		const std::vector<ResourceRef>& refs = m_aliasRequests[g];
+		auto degrade = [&refs](AliasRejectReason reason) {
 			std::cerr << "Alias group [";
-			for (size_t i = 0; i < names.size(); ++i) {
+			for (size_t i = 0; i < refs.size(); ++i) {
 				if (i) std::cerr << ",";
-				std::cerr << names[i];
+				std::cerr << refs[i].name;
+				if (refs[i].version != 0) std::cerr << "@v" << refs[i].version;
 			}
 			std::cerr << "] degraded: " << AliasRejectText(reason) << std::endl;
 		};
@@ -1304,10 +1500,11 @@ void RenderGraph::ResolveAliasGroups() {
 		AliasRejectReason reason = AliasRejectReason::None;
 
 		std::vector<Resource*> members;
-		for (const auto& name : names) {
+		for (const auto& ref : refs) {
 			Resource* res = nullptr;
 			for (auto& r : resourcePool)
-				if (r != nullptr && r->get_name() == name) { res = r.get(); break; }
+				if (r != nullptr && r->get_name() == ref.name
+					&& r->get_version() == ref.version) { res = r.get(); break; }
 			if (res == nullptr) { reason = AliasRejectReason::NameNotFound; break; }
 			if (res->m_topo.aliasGroup != static_cast<uint32_t>(-1)) {
 				reason = AliasRejectReason::AlreadyAssigned; break;
@@ -1409,8 +1606,11 @@ void RenderGraph::ResolveAliasGroups() {
 			r->m_topo.memoryBlockId = owner;
 		}
 		std::cout << "Alias group [";
-		for (size_t i = 0; i < names.size(); ++i)
-			std::cout << (i ? "," : "") << names[i];
+		for (size_t i = 0; i < refs.size(); ++i) {
+			if (i) std::cout << ",";
+			std::cout << refs[i].name;
+			if (refs[i].version != 0) std::cout << "@v" << refs[i].version;
+		}
 		std::cout << "] ok (memory block #" << owner << ")\n";
 	}
 }
@@ -1502,8 +1702,9 @@ void RenderGraph::PrintGraph() {
 
 	std::cout << "[Resources] count=" << resourcePool.size() << "\n";
 	for (auto& r : resourcePool) {
-		std::cout << "  #" << r->get_id() << " " << r->get_name()
-			<< " type=" << ResourceType(r->get_type()) << " writer=";
+		std::cout << "  #" << r->get_id() << " " << r->get_name();
+		if (r->get_version() != 0) std::cout << "@v" << r->get_version();
+		std::cout << " type=" << ResourceType(r->get_type()) << " writer=";
 		if (r->m_topo.writer == static_cast<uint32_t>(-1))
 			std::cout << "<none>";
 		else
@@ -1714,6 +1915,7 @@ void RenderGraph::RealizePass(Pass* pass) {
 		info.vertexBindings   = desc.pipeline.vertexBindings;
 		info.vertexAttributes = desc.pipeline.vertexAttributes;
 
+		uint32_t samples = 0;
 		for (const auto& att : desc.attachments) {
 			Resource* res = GetResource(*att.resourceId);
 			if (!res)
@@ -1721,6 +1923,12 @@ void RenderGraph::RealizePass(Pass* pass) {
 			if (res->get_type() != Resource::Image)
 				HandleError(ErrorCode::ResourceTypeDescMismatch);
 			RealizeResource(res);
+			if (att.usage == Usage::ColorAttachment || att.usage == Usage::DepthStencilAttachment) {
+				const uint32_t s = static_cast<Image*>(res)->get_desc().samples;
+				if (samples == 0) samples = s == 0 ? 1 : s;
+				else if (samples != (s == 0 ? 1 : s))
+					HandleError(ErrorCode::ResolveSampleCountMismatch);
+			}
 			if (att.usage == Usage::ColorAttachment) {
 				info.colorFormats[att.slot] = static_cast<Image*>(res)->get_desc().format;
 				info.colorAttachmentCount = std::max(info.colorAttachmentCount, att.slot + 1);
@@ -1729,6 +1937,7 @@ void RenderGraph::RealizePass(Pass* pass) {
 				info.depthFormat = static_cast<Image*>(res)->get_desc().format;
 			}
 		}
+		info.samples = samples == 0 ? 1 : samples;
 
 		const rhi::DescriptorSetLayout* externalSet0 =
 			desc.bindStaticHeap ? m_staticHeapLayout.get() : nullptr;
@@ -1849,11 +2058,14 @@ uint32_t RenderGraph::RegisterStaticTexture(const std::string& name, const rhi::
 }
 
 void RenderGraph::RegisterMuxOutput(std::string name, std::set<std::string> readers, std::string writer,
-	ResourceDesc desc) {
+	ResourceDesc desc, uint32_t version) {
+	ValidateResourceName(name);
 	if (!tmp_resources.has_value())
 		tmp_resources.emplace();
 	reg_tmp_resource rtr;
 	rtr.id = ++resource_top_id;
+	rtr.name = name;
+	rtr.version = version;
 	rtr.readers_name = std::move(readers);
 	rtr.writer_name = std::move(writer);
 	if (std::get_if<ImageDesc>(&desc)) {
@@ -1868,7 +2080,1517 @@ void RenderGraph::RegisterMuxOutput(std::string name, std::set<std::string> read
 	}
 	rtr.desc = std::move(desc);
 	rtr.borrowedLater = true;
-	tmp_resources.value()[std::move(name)] = std::move(rtr);
+	tmp_resources.value()[TmpResKey(name, version)] = std::move(rtr);
+}
+
+static bool MergeReject(const std::string& reason) {
+	std::cerr << "RenderGraph: 合并任务被拒绝：" << reason << std::endl;
+	return false;
+}
+
+static bool MergeImageDescEqual(const ImageDesc& a, const ImageDesc& b) {
+	return a.width == b.width && a.height == b.height && a.depth == b.depth
+		&& a.arrayLayers == b.arrayLayers && a.mipLevels == b.mipLevels
+		&& a.samples == b.samples && a.format == b.format && a.viewType == b.viewType
+		&& a.crossFrame == b.crossFrame;
+}
+
+static bool MergeBufferDescEqual(const BufferDesc& a, const BufferDesc& b) {
+	return a.size == b.size && a.usage == b.usage
+		&& a.hostVisible == b.hostVisible && a.crossFrame == b.crossFrame;
+}
+
+static bool MergeResourceDescEqual(const ResourceDesc& a, const ResourceDesc& b) {
+	if (a.index() != b.index())
+		return false;
+	if (auto* x = std::get_if<ImageDesc>(&a))
+		return MergeImageDescEqual(*x, *std::get_if<ImageDesc>(&b));
+	if (auto* x = std::get_if<BufferDesc>(&a))
+		return MergeBufferDescEqual(*x, *std::get_if<BufferDesc>(&b));
+	return true;
+}
+
+static bool MergeSubresourceEqual(const ImageSubresource& a, const ImageSubresource& b) {
+	return a.mipLevel == b.mipLevel && a.layer == b.layer;
+}
+
+static bool MergeRangeEqual(const ImageSubresourceRange& a, const ImageSubresourceRange& b) {
+	return MergeSubresourceEqual(a.base, b.base)
+		&& a.mipLevelCount == b.mipLevelCount && a.layerCount == b.layerCount;
+}
+
+// 声明期合并：先在局部构造完整结果，全部校验通过后再替换本图状态（失败不留半成品）。
+bool RenderGraph::ApplyMergeTask(const GraphMergeTask& task) {
+	const RenderGraph* base = task.base;
+	const RenderGraph* append = task.append;
+	if (base == nullptr || append == nullptr)
+		return MergeReject("base 或 append 未指定");
+	if (base == append)
+		return MergeReject("base 与 append 指向同一张图");
+	if (base->m_graphicDevice != nullptr && append->m_graphicDevice != nullptr
+		&& base->m_graphicDevice != append->m_graphicDevice)
+		return MergeReject("两张图使用了不同的 Device");
+	if (m_graphicDevice != nullptr && base->m_graphicDevice != nullptr
+		&& m_graphicDevice != base->m_graphicDevice)
+		return MergeReject("目标图与任务图的 Device 不一致");
+	if (m_graphicDevice != nullptr && append->m_graphicDevice != nullptr
+		&& m_graphicDevice != append->m_graphicDevice)
+		return MergeReject("目标图与任务图的 Device 不一致");
+	if (!passPool.empty() || !resourcePool.empty()
+		|| !m_aliasRequests.empty()
+		|| (tmp_passes.has_value() && !tmp_passes.value().empty())
+		|| (tmp_resources.has_value() && !tmp_resources.value().empty()))
+		return MergeReject("目标图已有注册内容，合并只能写入空图");
+	if (!base->passPool.empty() || !base->resourcePool.empty())
+		return MergeReject("base 已完成 ProcessRegister，合并须在编译前进行");
+	if (!append->passPool.empty() || !append->resourcePool.empty())
+		return MergeReject("append 已完成 ProcessRegister，合并须在编译前进行");
+	if (!m_staticTextureSlots.empty()
+		|| !base->m_staticTextureSlots.empty() || !append->m_staticTextureSlots.empty())
+		return MergeReject("静态纹理堆须在合并之后注册");
+
+	static const std::map<std::string, reg_tmp_pass>     kEmptyPasses;
+	static const std::map<std::string, reg_tmp_resource> kEmptyResources;
+	const auto& basePasses = base->tmp_passes.has_value() ? base->tmp_passes.value() : kEmptyPasses;
+	const auto& baseResources = base->tmp_resources.has_value() ? base->tmp_resources.value() : kEmptyResources;
+	const auto& appendPasses = append->tmp_passes.has_value() ? append->tmp_passes.value() : kEmptyPasses;
+	const auto& appendResources = append->tmp_resources.has_value() ? append->tmp_resources.value() : kEmptyResources;
+
+	for (const auto& kv : baseResources)
+		if (kv.second.version != 0)
+			return MergeReject("版本化资源暂不支持合并：" + kv.second.name);
+	for (const auto& kv : appendResources)
+		if (kv.second.version != 0)
+			return MergeReject("版本化资源暂不支持合并：" + kv.second.name);
+
+	auto sameResource = [](const reg_tmp_resource& a, const reg_tmp_resource& b) {
+		if (a.type != b.type) return false;
+		if (!MergeResourceDescEqual(a.desc, b.desc)) return false;
+		if (!MergeSubresourceEqual(a.view, b.view)) return false;
+		if (a.viewFormat != b.viewFormat) return false;
+		if (!MergeRangeEqual(a.barrierRange, b.barrierRange)) return false;
+		if (a.initialLayout != b.initialLayout) return false;
+		if (a.crossFrame != b.crossFrame) return false;
+		if (a.borrowedLater != b.borrowedLater) return false;
+		if (a.externalImage != b.externalImage) return false;
+		if (a.externalBuffer != b.externalBuffer) return false;
+		return true;
+	};
+
+	const std::string prefix = task.appendPassPrefix;
+
+	// ---- Pass：基础图保持原名，追加图整体加前缀，名字不得冲突 ----
+	std::map<std::string, reg_tmp_pass> mergedPasses;
+	for (const auto& kv : basePasses)
+		mergedPasses.emplace(kv.first, kv.second);
+	for (const auto& kv : appendPasses) {
+		const std::string newName = prefix + kv.first;
+		if (newName.empty())
+			return MergeReject("append 存在空 Pass 名");
+		if (mergedPasses.find(newName) != mergedPasses.end())
+			return MergeReject("Pass 名冲突：" + newName);
+		reg_tmp_pass p = kv.second;
+		std::set<std::string> after, before;
+		for (const auto& n : p.order.after) after.insert(prefix + n);
+		for (const auto& n : p.order.before) before.insert(prefix + n);
+		p.order.after = std::move(after);
+		p.order.before = std::move(before);
+		mergedPasses.emplace(newName, std::move(p));
+	}
+
+	// ---- 资源：两名一节点映射（append 名 -> 规范名）----
+	std::map<std::string, std::string> appendCanonical;
+	for (const auto& kv : appendResources)
+		appendCanonical.emplace(kv.first, kv.first);
+
+	std::set<std::string> unifiedAppendNames;
+	for (const auto& u : task.unify) {
+		if (u.baseName.empty() || u.appendName.empty())
+			return MergeReject("unify 存在空资源名");
+		if (!unifiedAppendNames.insert(u.appendName).second)
+			return MergeReject("unify 重复声明 append 资源：" + u.appendName);
+		auto bi = baseResources.find(u.baseName);
+		auto ai = appendResources.find(u.appendName);
+		if (bi == baseResources.end())
+			return MergeReject("unify 的 base 资源未注册：" + u.baseName);
+		if (ai == appendResources.end())
+			return MergeReject("unify 的 append 资源未注册：" + u.appendName);
+		if (!sameResource(bi->second, ai->second))
+			return MergeReject("unify 两侧资源描述不一致：" + u.baseName + " / " + u.appendName);
+		if (baseResources.find(u.appendName) != baseResources.end() && u.baseName != u.appendName)
+			return MergeReject("append 资源名与 base 同名，必须与同名节点合并：" + u.appendName);
+		appendCanonical[u.appendName] = u.baseName;
+
+		// Mux 候选按节点名查表，别名名不会被解析，先拒绝以免运行期才暴露
+		if (u.appendName != u.baseName) {
+			for (const auto& kv : appendPasses) {
+				auto* mp = std::get_if<MuxPassDesc>(&kv.second.desc);
+				if (mp == nullptr) continue;
+				for (const auto& alt : mp->alternatives)
+					if (alt == u.appendName)
+						return MergeReject("Mux 候选不允许使用别名资源名：" + u.appendName);
+			}
+		}
+	}
+
+	// 未显式 unify 的同名资源：描述一致则自动合并，否则拒绝
+	std::map<std::string, reg_tmp_resource> mergedResources;
+	for (const auto& kv : baseResources)
+		mergedResources.emplace(kv.first, kv.second);
+	for (const auto& kv : appendResources) {
+		if (unifiedAppendNames.find(kv.first) != unifiedAppendNames.end())
+			continue;
+		auto bi = baseResources.find(kv.first);
+		if (bi == baseResources.end())
+			continue;
+		if (!task.dedupIdenticalResources)
+			return MergeReject("两图存在同名资源但未声明 dedup：" + kv.first);
+		if (!sameResource(bi->second, kv.second))
+			return MergeReject("两图同名资源描述不一致：" + kv.first);
+		appendCanonical[kv.first] = kv.first;
+	}
+
+	// 追加图资源并入：独立节点保留，别名/同名节点合并到规范节点
+	for (const auto& kv : appendResources) {
+		reg_tmp_resource r = kv.second;
+		std::set<std::string> readers;
+		for (const auto& n : r.readers_name) readers.insert(prefix + n);
+		r.readers_name = std::move(readers);
+		if (!r.writer_name.empty())
+			r.writer_name = prefix + r.writer_name;
+
+		const std::string& canonical = appendCanonical.at(kv.first);
+		if (canonical == kv.first && baseResources.find(kv.first) == baseResources.end()) {
+			mergedResources.emplace(kv.first, std::move(r));
+			continue;
+		}
+
+		auto target = mergedResources.find(canonical);
+		if (target == mergedResources.end())
+			return MergeReject("合并目标资源不存在：" + canonical);
+		target->second.readers_name.insert(r.readers_name.begin(), r.readers_name.end());
+		if (!r.writer_name.empty()) {
+			if (!target->second.writer_name.empty())
+				return MergeReject("资源被两图同时写入：" + canonical);
+			target->second.writer_name = r.writer_name;
+		}
+		if (canonical != kv.first) {
+			r.canonicalName = canonical;
+			r.readers_name.clear();
+			r.writer_name.clear();
+			mergedResources.emplace(kv.first, std::move(r));
+		}
+	}
+
+	// ---- Present 归属：合并后至多一个 Present ----
+	auto presentNames = [](const std::map<std::string, reg_tmp_pass>& passes) {
+		std::vector<std::string> names;
+		for (const auto& kv : passes)
+			if (kv.second.type == Pass::Present)
+				names.push_back(kv.first);
+		return names;
+	};
+	const auto basePresents = presentNames(basePasses);
+	const auto appendPresents = presentNames(appendPasses);
+	switch (task.present) {
+	case PresentOwner::None:
+		if (!basePresents.empty() || !appendPresents.empty())
+			return MergeReject("存在 Present 但未声明归属");
+		break;
+	case PresentOwner::Base:
+		if (basePresents.size() != 1 || !appendPresents.empty())
+			return MergeReject("Present 归属 Base 时，base 须恰有一个 Present 且 append 不得有");
+		break;
+	case PresentOwner::Append:
+		if (appendPresents.size() != 1 || !basePresents.empty())
+			return MergeReject("Present 归属 Append 时，append 须恰有一个 Present 且 base 不得有");
+		break;
+	}
+
+	// ---- 重编号：Pass 按「base 的 id 序 → append 的 id 序」稠密重排 ----
+	std::vector<std::pair<uint32_t, std::string>> basePassOrder, appendPassOrder;
+	for (const auto& kv : basePasses) basePassOrder.emplace_back(kv.second.id, kv.first);
+	for (const auto& kv : appendPasses) appendPassOrder.emplace_back(kv.second.id, prefix + kv.first);
+	std::sort(basePassOrder.begin(), basePassOrder.end());
+	std::sort(appendPassOrder.begin(), appendPassOrder.end());
+	uint32_t nextPassId = 0;
+	for (const auto& e : basePassOrder)
+		mergedPasses.at(e.second).id = nextPassId++;
+	for (const auto& e : appendPassOrder)
+		mergedPasses.at(e.second).id = nextPassId++;
+	const uint32_t passCount = nextPassId;
+
+	// ---- 重编号：资源按「base 规范节点 id 序 → append 独立节点 id 序」稠密重排 ----
+	std::vector<std::pair<uint32_t, std::string>> baseResOrder, appendResOrder;
+	for (const auto& kv : baseResources) baseResOrder.emplace_back(kv.second.id, kv.first);
+	for (const auto& kv : appendResources)
+		if (appendCanonical.at(kv.first) == kv.first
+			&& baseResources.find(kv.first) == baseResources.end())
+			appendResOrder.emplace_back(kv.second.id, kv.first);
+	std::sort(baseResOrder.begin(), baseResOrder.end());
+	std::sort(appendResOrder.begin(), appendResOrder.end());
+	std::map<std::string, uint32_t> canonicalIds;
+	uint32_t nextResId = 0;
+	for (const auto& e : baseResOrder)
+		canonicalIds.emplace(e.second, nextResId++);
+	for (const auto& e : appendResOrder)
+		canonicalIds.emplace(e.second, nextResId++);
+	const uint32_t resourceCount = nextResId;
+	for (auto& kv : mergedResources) {
+		const std::string canonical = kv.second.canonicalName.empty()
+			? kv.first : kv.second.canonicalName;
+		auto it = canonicalIds.find(canonical);
+		if (it == canonicalIds.end())
+			return MergeReject("资源规范名未建立编号：" + canonical);
+		kv.second.id = it->second;
+	}
+
+	// ---- 顺序：Append 模式补「base 汇点 → append 源点」顺序边 ----
+	if (task.order == MergeOrder::Append && passCount > 0) {
+		std::vector<std::set<uint32_t>> adj(passCount);
+		auto passIdOfName = [&](const std::string& name) -> uint32_t {
+			auto it = mergedPasses.find(name);
+			return it == mergedPasses.end() ? static_cast<uint32_t>(-1) : it->second.id;
+		};
+		for (const auto& kv : mergedResources) {
+			if (!kv.second.canonicalName.empty() || kv.second.writer_name.empty())
+				continue;
+			const uint32_t writer = passIdOfName(kv.second.writer_name);
+			if (writer == static_cast<uint32_t>(-1))
+				continue;
+			for (const auto& readerName : kv.second.readers_name) {
+				const uint32_t reader = passIdOfName(readerName);
+				if (reader != static_cast<uint32_t>(-1) && reader != writer)
+					adj[writer].insert(reader);
+			}
+		}
+
+		std::set<uint32_t> baseIds, appendIds;
+		for (const auto& kv : basePasses) baseIds.insert(mergedPasses.at(kv.first).id);
+		for (const auto& kv : appendPasses) appendIds.insert(mergedPasses.at(prefix + kv.first).id);
+
+		std::vector<bool> hasIn(passCount, false), hasOut(passCount, false);
+		for (uint32_t from = 0; from < passCount; ++from) {
+			for (uint32_t to : adj[from]) {
+				hasOut[from] = true;
+				hasIn[to] = true;
+				if (appendIds.count(from) && baseIds.count(to))
+					return MergeReject("append 对 base 存在反向数据依赖，无法按 Append 顺序合并");
+			}
+		}
+
+		std::vector<uint32_t> sinks, sources;
+		for (uint32_t id : baseIds)
+			if (!hasOut[id]) sinks.push_back(id);
+		for (uint32_t id : appendIds)
+			if (!hasIn[id]) sources.push_back(id);
+		for (uint32_t src : sources) {
+			std::string srcName;
+			for (const auto& kv : mergedPasses)
+				if (kv.second.id == src) { srcName = kv.first; break; }
+			if (srcName.empty()) continue;
+			auto& order = mergedPasses.at(srcName).order.after;
+			for (uint32_t sink : sinks) {
+				for (const auto& kv : mergedPasses)
+					if (kv.second.id == sink) { order.insert(kv.first); break; }
+			}
+		}
+	}
+
+	// ---- 提交：原子替换本图声明态 ----
+	std::vector<std::vector<ResourceRef>> mergedAliases = base->m_aliasRequests;
+	mergedAliases.insert(mergedAliases.end(), append->m_aliasRequests.begin(), append->m_aliasRequests.end());
+
+	tmp_passes = std::move(mergedPasses);
+	tmp_resources = std::move(mergedResources);
+	m_aliasRequests = std::move(mergedAliases);
+	pass_top_id = passCount == 0 ? static_cast<uint32_t>(-1) : passCount - 1;
+	resource_top_id = resourceCount == 0 ? static_cast<uint32_t>(-1) : resourceCount - 1;
+	if (m_graphicDevice == nullptr)
+		m_graphicDevice = base->m_graphicDevice != nullptr ? base->m_graphicDevice : append->m_graphicDevice;
+	return true;
+}
+
+// ================= RenderGraphBuilder：逻辑声明 + 版本化 lowering =================
+
+static bool BuilderReachable(const std::vector<std::vector<uint32_t>>& adj,
+	uint32_t from, uint32_t to) {
+	if (from == to) return true;
+	std::vector<bool> seen(adj.size(), false);
+	std::vector<uint32_t> stack{ from };
+	seen[from] = true;
+	while (!stack.empty()) {
+		const uint32_t u = stack.back();
+		stack.pop_back();
+		for (uint32_t v : adj[u]) {
+			if (v == to) return true;
+			if (!seen[v]) { seen[v] = true; stack.push_back(v); }
+		}
+	}
+	return false;
+}
+
+static bool BuilderFindCycle(const std::vector<std::vector<uint32_t>>& adj,
+	std::vector<uint32_t>& cycle) {
+	const size_t n = adj.size();
+	std::vector<int> color(n, 0);
+	std::vector<uint32_t> path;
+	bool found = false;
+	std::function<bool(uint32_t)> dfs = [&](uint32_t u) -> bool {
+		color[u] = 1;
+		path.push_back(u);
+		for (uint32_t v : adj[u]) {
+			if (color[v] == 1) {
+				cycle.clear();
+				auto it = std::find(path.begin(), path.end(), v);
+				cycle.assign(it, path.end());
+				cycle.push_back(v);
+				return true;
+			}
+			if (color[v] == 0 && dfs(v)) return true;
+		}
+		color[u] = 2;
+		path.pop_back();
+		return false;
+	};
+	for (uint32_t u = 0; u < n && !found; ++u)
+		if (color[u] == 0 && dfs(u)) found = true;
+	return found;
+}
+
+static bool BuilderWritesWithLoad(const PassDesc& desc, const std::string& name) {
+	if (auto* rp = std::get_if<RenderPassDesc>(&desc)) {
+		for (const auto& att : rp->attachments)
+			if (att.resourceName == name && att.load == LoadOp::Load)
+				return true;
+	}
+	return false;
+}
+
+RenderGraphBuilder::Topology RenderGraphBuilder::Topology::Sequence(std::vector<std::string> order) {
+	Topology t;
+	for (size_t i = 1; i < order.size(); ++i)
+		t.edges.push_back(BuilderEdge{ order[i - 1], order[i] });
+	return t;
+}
+
+RenderGraphBuilder::Topology& RenderGraphBuilder::Topology::Then(const std::string& from, const std::string& to) {
+	edges.push_back(BuilderEdge{ from, to });
+	return *this;
+}
+
+RenderGraphBuilder::Topology& RenderGraphBuilder::Topology::ThenAll(
+	const std::vector<std::string>& from, const std::vector<std::string>& to) {
+	for (const auto& a : from)
+		for (const auto& b : to)
+			if (!a.empty() && !b.empty() && a != b)
+				edges.push_back(BuilderEdge{ a, b });
+	return *this;
+}
+
+void RenderGraphBuilder::DeclareResource(std::string name, ResourceDesc desc,
+	ResourceOptions options) {
+	ResourceDecl d;
+	d.name = std::move(name);
+	if (std::get_if<ImageDesc>(&desc)) {
+		d.type = Resource::Image;
+		d.crossFrame = options.crossFrame || std::get_if<ImageDesc>(&desc)->crossFrame;
+	}
+	else if (std::get_if<BufferDesc>(&desc)) {
+		d.type = Resource::Buffer;
+		d.crossFrame = options.crossFrame || std::get_if<BufferDesc>(&desc)->crossFrame;
+	}
+	d.desc = std::move(desc);
+	d.view = options.view;
+	d.viewFormat = options.viewFormat;
+	d.barrierRange = options.barrierRange;
+	d.initialLayout = options.initialLayout;
+	m_resources.push_back(std::move(d));
+}
+
+void RenderGraphBuilder::DeclareResource(std::string name, const rhi::Image* external,
+	ResourceOptions options) {
+	ResourceDecl d;
+	d.name = std::move(name);
+	d.type = Resource::Image;
+	d.view = options.view;
+	d.initialLayout = options.initialLayout;
+	d.viewFormat = options.viewFormat;
+	d.barrierRange = options.barrierRange;
+	d.crossFrame = options.crossFrame;
+	d.externalImage = external;
+	m_resources.push_back(std::move(d));
+}
+
+void RenderGraphBuilder::DeclareResource(std::string name, const rhi::Buffer* external) {
+	ResourceDecl d;
+	d.name = std::move(name);
+	d.type = Resource::Buffer;
+	d.externalBuffer = external;
+	m_resources.push_back(std::move(d));
+}
+
+void RenderGraphBuilder::DeclarePass(std::string name, std::set<std::string> reads,
+	std::set<std::string> writes, Pass::Type type, PassDesc desc,
+	std::optional<rhi::QueueClass> queue) {
+	PassDecl p;
+	p.name = std::move(name);
+	p.reads = std::move(reads);
+	p.writes = std::move(writes);
+	p.type = type;
+	p.desc = std::move(desc);
+	p.queue = queue.value_or(DefaultQueueForPass(type, p.desc));
+	m_passes.push_back(std::move(p));
+}
+
+// 从 PassDesc 推导读写集：与后端各 *ReadSetMismatch/*WriteSetMismatch 校验同一套分类
+static bool DerivePassIo(Pass::Type type, const PassDesc& desc,
+	std::set<std::string>& reads, std::set<std::string>& writes) {
+	auto addShaderBinding = [&](const ShaderBinding& b) {
+		const std::string& n = b.graphResourceName.empty() ? b.resourceName : b.graphResourceName;
+		if (n.empty())
+			return;
+		(b.usage == Usage::StorageWrite ? writes : reads).insert(n);
+	};
+	switch (type) {
+	case Pass::Render: {
+		const auto* d = std::get_if<RenderPassDesc>(&desc);
+		if (d == nullptr)
+			return false;
+		for (const auto& att : d->attachments) {
+			if (att.resourceName.empty())
+				continue;
+			(att.usage == Usage::ResolveSrc ? reads : writes).insert(att.resourceName);
+		}
+		for (const auto& b : d->shaderBindings)
+			addShaderBinding(b);
+		for (const auto& vs : d->vertexStreams) {
+			if (!vs.resourceName.empty())
+				reads.insert(vs.resourceName);
+		}
+		if (d->indexStream.has_value() && !d->indexStream->resourceName.empty())
+			reads.insert(d->indexStream->resourceName);
+		return true;
+	}
+	case Pass::Compute: {
+		const auto* d = std::get_if<ComputePassDesc>(&desc);
+		if (d == nullptr)
+			return false;
+		for (const auto& b : d->shaderBindings)
+			addShaderBinding(b);
+		if (!d->indirectBuffer.empty())
+			reads.insert(d->indirectBuffer);
+		return true;
+	}
+	case Pass::Transfer: {
+		const auto* d = std::get_if<TransferPassDesc>(&desc);
+		if (d == nullptr)
+			return false;
+		// ClearImage 只有写端
+		if (d->kind != TransferKind::ClearImage && !d->sourceName.empty())
+			reads.insert(d->sourceName);
+		if (!d->destName.empty())
+			writes.insert(d->destName);
+		return true;
+	}
+	default:
+		return false;
+	}
+}
+
+void RenderGraphBuilder::DeclarePass(std::string name, Pass::Type type, PassDesc desc,
+	std::optional<rhi::QueueClass> queue) {
+	PassDecl p;
+	p.name = std::move(name);
+	p.type = type;
+	p.queue = queue.value_or(DefaultQueueForPass(type, desc));
+	if (!DerivePassIo(type, desc, p.reads, p.writes))
+		RenderGraph::HandleError(RenderGraph::ErrorCode::PassIoNotDerivable);
+	p.desc = std::move(desc);
+	m_passes.push_back(std::move(p));
+}
+
+void RenderGraphBuilder::DeclareTopology(Topology topology) {
+	for (const auto& e : topology.edges)
+		m_edges.push_back(e);
+}
+
+void RenderGraphBuilder::AliasLogicalResources(std::vector<std::string> names) {
+	m_aliasGroups.push_back(std::move(names));
+}
+
+bool RenderGraphBuilder::SameDecl(const ResourceDecl& a, const ResourceDecl& b) {
+	if (a.type != b.type) return false;
+	if (!MergeResourceDescEqual(a.desc, b.desc)) return false;
+	if (!MergeSubresourceEqual(a.view, b.view)) return false;
+	if (a.viewFormat != b.viewFormat) return false;
+	if (!MergeRangeEqual(a.barrierRange, b.barrierRange)) return false;
+	if (a.initialLayout != b.initialLayout) return false;
+	if (a.crossFrame != b.crossFrame) return false;
+	if (a.externalImage != b.externalImage) return false;
+	if (a.externalBuffer != b.externalBuffer) return false;
+	if (a.borrowedLater != b.borrowedLater) return false;
+	return true;
+}
+
+void RenderGraphBuilder::RewritePassBindings(PassDesc& desc,
+	const std::map<std::string, std::string>& nameMap) {
+	auto mapped = [&](const std::string& n) -> std::string {
+		auto it = nameMap.find(n);
+		return it == nameMap.end() ? n : it->second;
+	};
+	auto mapShader = [&](ShaderBinding& sb) {
+		const std::string graph = sb.graphResourceName.empty()
+			? sb.resourceName : sb.graphResourceName;
+		auto it = nameMap.find(graph);
+		if (it != nameMap.end())
+			sb.graphResourceName = it->second;
+	};
+
+	if (auto* rp = std::get_if<RenderPassDesc>(&desc)) {
+		for (auto& att : rp->attachments)
+			att.resourceName = mapped(att.resourceName);
+		for (auto& sb : rp->shaderBindings)
+			mapShader(sb);
+		for (auto& vs : rp->vertexStreams)
+			vs.resourceName = mapped(vs.resourceName);
+		if (rp->indexStream.has_value())
+			rp->indexStream->resourceName = mapped(rp->indexStream->resourceName);
+	}
+	else if (auto* cp = std::get_if<ComputePassDesc>(&desc)) {
+		for (auto& sb : cp->shaderBindings)
+			mapShader(sb);
+		if (!cp->indirectBuffer.empty())
+			cp->indirectBuffer = mapped(cp->indirectBuffer);
+	}
+	else if (auto* tp = std::get_if<TransferPassDesc>(&desc)) {
+		if (!tp->sourceName.empty())
+			tp->sourceName = mapped(tp->sourceName);
+		if (!tp->destName.empty())
+			tp->destName = mapped(tp->destName);
+	}
+	else if (auto* mp = std::get_if<MuxPassDesc>(&desc)) {
+		for (auto& alt : mp->alternatives)
+			alt = mapped(alt);
+	}
+}
+
+bool RenderGraphBuilder::ImportDeclarations(const RenderGraphBuilder& other, const ImportOptions& options) {
+	if (&other == this) {
+		std::cerr << "RenderGraphBuilder: 不能导入自身的声明" << std::endl;
+		return false;
+	}
+	const std::string prefix = options.passPrefix;
+
+	// ---- 预检，失败不改动本 Builder ----
+	for (const ResourceDecl& r : other.m_resources) {
+		if (r.name.empty()) {
+			std::cerr << "RenderGraphBuilder: 导入的资源名为空" << std::endl;
+			return false;
+		}
+		const auto it = std::find_if(m_resources.begin(), m_resources.end(),
+			[&r](const ResourceDecl& x) { return x.name == r.name; });
+		if (it == m_resources.end())
+			continue;
+		if (!options.dedupIdenticalResources) {
+			std::cerr << "RenderGraphBuilder: 资源名重复且未开启 dedup："
+				<< r.name << std::endl;
+			return false;
+		}
+		if (!SameDecl(*it, r)) {
+			std::cerr << "RenderGraphBuilder: 同名资源声明不一致：" << r.name << std::endl;
+			return false;
+		}
+	}
+
+	std::set<std::string> passNames;
+	for (const PassDecl& p : m_passes)
+		passNames.insert(p.name);
+	for (const PassDecl& p : other.m_passes) {
+		if (p.name.empty()) {
+			std::cerr << "RenderGraphBuilder: 导入的 Pass 名为空" << std::endl;
+			return false;
+		}
+		const std::string newName = prefix + p.name;
+		if (!passNames.insert(newName).second) {
+			std::cerr << "RenderGraphBuilder: 导入后 Pass 名冲突：" << newName
+				<< "（可通过 ImportOptions::passPrefix 消除）" << std::endl;
+			return false;
+		}
+	}
+
+	// ---- 提交：资源同名合一，Pass 名加前缀，顺序边与别名组一并合并 ----
+	for (const ResourceDecl& r : other.m_resources) {
+		const auto it = std::find_if(m_resources.begin(), m_resources.end(),
+			[&r](const ResourceDecl& x) { return x.name == r.name; });
+		if (it == m_resources.end())
+			m_resources.push_back(r);
+	}
+	for (const PassDecl& p : other.m_passes) {
+		PassDecl np = p;
+		np.name = prefix + p.name;
+		m_passes.push_back(std::move(np));
+	}
+	for (const BuilderEdge& e : other.m_edges)
+		m_edges.push_back(BuilderEdge{ prefix + e.from, prefix + e.to });
+	for (const auto& group : other.m_aliasGroups)
+		m_aliasGroups.push_back(group);
+	return true;
+}
+
+bool RenderGraphBuilder::CompileModule(std::string name, std::vector<ModulePort> ports,
+	RenderGraphModule* out, std::vector<std::string>* errors) const {
+	if (out == nullptr)
+		return false;
+
+	bool bad = false;
+	auto addErr = [&](std::string msg) {
+		bad = true;
+		if (errors != nullptr) errors->push_back(std::move(msg));
+		else std::cerr << "RenderGraphBuilder: " << msg << std::endl;
+	};
+
+	if (name.empty()) addErr("模块名为空");
+	if (ports.empty()) addErr("模块至少需要一个端口");
+
+	std::set<std::string> portNames;
+	for (const ModulePort& p : ports) {
+		if (p.name.empty()) addErr("模块端口名为空");
+		else if (!portNames.insert(p.name).second) addErr("模块端口名重复：" + p.name);
+	}
+
+	std::map<std::string, size_t> resIndex, passIndex;
+	for (size_t i = 0; i < m_resources.size(); ++i) {
+		const ResourceDecl& r = m_resources[i];
+		if (r.name.empty()) { addErr("模块资源名为空"); continue; }
+		if (!resIndex.emplace(r.name, i).second)
+			addErr("模块资源名重复：" + r.name);
+	}
+	for (size_t i = 0; i < m_passes.size(); ++i) {
+		const PassDecl& p = m_passes[i];
+		if (p.name.empty()) { addErr("模块 Pass 名为空"); continue; }
+		else if (!passIndex.emplace(p.name, i).second)
+			addErr("模块 Pass 名重复：" + p.name);
+		if (p.type == Pass::None) addErr("模块 Pass 类型未指定：" + p.name);
+		else if (p.type == Pass::Present) addErr("模块内不允许 Present：" + p.name);
+		else if (p.type == Pass::Mux) addErr("模块内不允许 Mux：" + p.name);
+	}
+
+	for (const PassDecl& p : m_passes) {
+		for (const auto& n : p.reads)
+			if (resIndex.find(n) == resIndex.end())
+				addErr("pass \"" + p.name + "\" 读取未声明资源：" + n);
+		for (const auto& n : p.writes)
+			if (resIndex.find(n) == resIndex.end())
+				addErr("pass \"" + p.name + "\" 写入未声明资源：" + n);
+		for (const auto& n : p.reads)
+			if (p.writes.find(n) != p.writes.end())
+				addErr("pass \"" + p.name + "\" 同时读写同一资源：" + n);
+	}
+
+	std::vector<ModulePortInfo> infos;
+	for (const ModulePort& p : ports) {
+		auto it = resIndex.find(p.name);
+		if (it == resIndex.end()) {
+			addErr("端口未在模块中声明：" + p.name);
+			continue;
+		}
+		const ResourceDecl& rd = m_resources[it->second];
+		if (rd.IsExternal())
+			addErr("端口不能使用借用资源声明：" + p.name);
+		bool referenced = false;
+		for (const PassDecl& pass : m_passes) {
+			if (pass.reads.find(p.name) != pass.reads.end()
+				|| pass.writes.find(p.name) != pass.writes.end()) {
+				referenced = true;
+				break;
+			}
+		}
+		if (!referenced)
+			addErr("端口未被任何 pass 引用：" + p.name);
+		for (const auto& group : m_aliasGroups)
+			if (std::find(group.begin(), group.end(), p.name) != group.end())
+				addErr("端口不能进入模块级别名组：" + p.name);
+
+		ModulePortInfo info;
+		info.port = p;
+		info.type = rd.type;
+		info.desc = rd.desc;
+		info.view = rd.view;
+		info.viewFormat = rd.viewFormat;
+		info.barrierRange = rd.barrierRange;
+		info.crossFrame = rd.crossFrame;
+		infos.push_back(std::move(info));
+	}
+
+	// 声明边 + 资源数据边合成模块内部图
+	const size_t n = m_passes.size();
+	std::vector<std::vector<uint32_t>> declAdj(n);
+	auto pushAdj = [](std::vector<std::vector<uint32_t>>& a, uint32_t u, uint32_t v) {
+		if (std::find(a[u].begin(), a[u].end(), v) == a[u].end())
+			a[u].push_back(v);
+	};
+	for (const BuilderEdge& e : m_edges) {
+		auto ia = passIndex.find(e.from);
+		auto ib = passIndex.find(e.to);
+		if (ia == passIndex.end() || ib == passIndex.end()) {
+			addErr("顺序边引用未声明的 pass：" + e.from + " -> " + e.to);
+			continue;
+		}
+		const uint32_t a = static_cast<uint32_t>(ia->second);
+		const uint32_t b = static_cast<uint32_t>(ib->second);
+		if (a == b) {
+			addErr("模块内禁止 Pass 自环：" + e.from);
+			continue;
+		}
+		pushAdj(declAdj, a, b);
+	}
+
+	std::set<std::pair<uint32_t, uint32_t>> edges;
+	for (uint32_t u = 0; u < n; ++u)
+		for (uint32_t v : declAdj[u])
+			edges.insert({ u, v });
+
+	// 资源数据边：按 pass 的读写集推导 writer -> readers
+	std::map<std::string, std::vector<uint32_t>> writersByRes, readersByRes;
+	for (size_t i = 0; i < m_passes.size(); ++i) {
+		for (const auto& w : m_passes[i].writes)
+			writersByRes[w].push_back(static_cast<uint32_t>(i));
+		for (const auto& r : m_passes[i].reads)
+			readersByRes[r].push_back(static_cast<uint32_t>(i));
+	}
+	for (const auto& kv : writersByRes) {
+		auto rit = readersByRes.find(kv.first);
+		if (rit == readersByRes.end())
+			continue;
+		for (uint32_t writer : kv.second)
+			for (uint32_t reader : rit->second)
+				if (writer != reader)
+					edges.insert({ writer, reader });
+	}
+	std::vector<std::vector<uint32_t>> adj(n);
+	std::vector<uint32_t> indeg(n, 0), outdeg(n, 0);
+	for (const auto& e : edges) {
+		adj[e.first].push_back(e.second);
+		++indeg[e.second];
+		++outdeg[e.first];
+	}
+
+	// 成环检测
+	{
+		std::vector<uint32_t> deg = indeg;
+		std::queue<uint32_t> q;
+		for (uint32_t i = 0; i < n; ++i)
+			if (deg[i] == 0) q.push(i);
+		uint32_t visited = 0;
+		while (!q.empty()) {
+			const uint32_t u = q.front();
+			q.pop();
+			++visited;
+			for (uint32_t v : adj[u])
+				if (--deg[v] == 0) q.push(v);
+		}
+		if (visited != n)
+			addErr("模块内部拓扑/数据依赖成环");
+	}
+
+	// 模块内多写者必须被声明拓扑定序
+	for (const auto& kv : writersByRes) {
+		const std::vector<uint32_t>& ws = kv.second;
+		for (size_t i = 0; i < ws.size(); ++i) {
+			for (size_t j = i + 1; j < ws.size(); ++j) {
+				if (!BuilderReachable(declAdj, ws[i], ws[j])
+					&& !BuilderReachable(declAdj, ws[j], ws[i])) {
+					addErr("模块内资源 \"" + kv.first + "\" 的写者 \""
+						+ m_passes[ws[i]].name + "\" 与 \"" + m_passes[ws[j]].name
+						+ "\" 未在拓扑中定序");
+				}
+			}
+		}
+	}
+
+	// 入口/出口：入度 / 出度为 0
+	std::vector<std::string> entries, exits;
+	for (uint32_t i = 0; i < n; ++i) {
+		if (indeg[i] == 0) entries.push_back(m_passes[i].name);
+		if (outdeg[i] == 0) exits.push_back(m_passes[i].name);
+	}
+	if (entries.empty() || exits.empty())
+		addErr("模块没有入口或出口");
+
+	if (bad)
+		return false;
+
+	out->mName = std::move(name);
+	out->mDecl = *this;
+	out->mPorts = std::move(infos);
+	out->mEntryNames = std::move(entries);
+	out->mExitNames = std::move(exits);
+	return true;
+}
+
+std::optional<ModuleInstance> RenderGraphBuilder::Instantiate(
+	const RenderGraphModule& module, std::string tag,
+	const std::vector<ModuleBinding>& bindings, std::vector<std::string>* errors) {
+	bool bad = false;
+	auto addErr = [&](std::string msg) {
+		bad = true;
+		if (errors != nullptr) errors->push_back(std::move(msg));
+		else std::cerr << "RenderGraphBuilder: " << msg << std::endl;
+	};
+
+	if (module.mName.empty()) addErr("模块尚未编译");
+	if (tag.empty()) addErr("模块实例 tag 为空");
+	else if (tag.find('/') != std::string::npos) addErr("模块实例 tag 不能包含 '/'");
+	if (m_instanceTags.find(tag) != m_instanceTags.end())
+		addErr("模块实例 tag 重复：" + tag);
+
+	std::set<std::string> portNames;
+	for (const auto& info : module.mPorts)
+		portNames.insert(info.port.name);
+
+	std::map<std::string, std::string> portToParent;
+	for (const auto& b : bindings) {
+		if (portNames.find(b.port) == portNames.end()) {
+			addErr("未知端口绑定：" + b.port);
+			continue;
+		}
+		if (b.parentResource.empty()) {
+			addErr("端口 \"" + b.port + "\" 未指定父资源");
+			continue;
+		}
+		if (!portToParent.emplace(b.port, b.parentResource).second)
+			addErr("端口重复绑定：" + b.port);
+	}
+	for (const auto& info : module.mPorts)
+		if (portToParent.find(info.port.name) == portToParent.end())
+			addErr("端口未绑定：" + info.port.name);
+
+	std::map<std::string, const ResourceDecl*> parentRes;
+	for (const auto& r : m_resources)
+		if (parentRes.find(r.name) == parentRes.end())
+			parentRes.emplace(r.name, &r);
+
+	for (const auto& info : module.mPorts) {
+		auto bit = portToParent.find(info.port.name);
+		if (bit == portToParent.end())
+			continue;
+		auto pit = parentRes.find(bit->second);
+		if (pit == parentRes.end()) {
+			addErr("绑定父资源未声明：" + bit->second);
+			continue;
+		}
+		const ResourceDecl& pd = *pit->second;
+		if (pd.type != info.type)
+			addErr("端口 \"" + info.port.name + "\" 与父资源 \"" + bit->second + "\" 类型不一致");
+		if (!MergeResourceDescEqual(pd.desc, info.desc))
+			addErr("端口 \"" + info.port.name + "\" 与父资源 \"" + bit->second + "\" 描述不一致");
+		if (!MergeSubresourceEqual(pd.view, info.view)
+			|| pd.viewFormat != info.viewFormat
+			|| !MergeRangeEqual(pd.barrierRange, info.barrierRange))
+			addErr("端口 \"" + info.port.name + "\" 与父资源 \"" + bit->second + "\" 视图/同步范围不一致");
+		if (info.crossFrame && !pd.crossFrame)
+			addErr("端口 \"" + info.port.name + "\" 要求 crossFrame，父资源不满足");
+	}
+
+	// 名称映射：端口 -> 父资源；内部资源/Pass -> tag/name
+	std::map<std::string, std::string> nameMap;
+	for (const auto& info : module.mPorts) {
+		auto bit = portToParent.find(info.port.name);
+		if (bit != portToParent.end())
+			nameMap[info.port.name] = bit->second;
+	}
+	for (const auto& r : module.mDecl.m_resources) {
+		if (portNames.find(r.name) != portNames.end())
+			continue;
+		nameMap[r.name] = tag + "/" + r.name;
+	}
+
+	std::set<std::string> existingRes, existingPass;
+	for (const auto& r : m_resources)
+		existingRes.insert(r.name);
+	for (const auto& p : m_passes)
+		existingPass.insert(p.name);
+	for (const auto& r : module.mDecl.m_resources) {
+		if (portNames.find(r.name) != portNames.end())
+			continue;
+		const std::string nn = nameMap[r.name];
+		if (!existingRes.insert(nn).second)
+			addErr("实例资源名冲突：" + nn);
+	}
+	for (const auto& p : module.mDecl.m_passes) {
+		const std::string nn = tag + "/" + p.name;
+		if (!existingPass.insert(nn).second)
+			addErr("实例 Pass 名冲突：" + nn);
+	}
+
+	for (const auto& p : module.mDecl.m_passes) {
+		for (const auto& n : p.reads)
+			if (nameMap.find(n) == nameMap.end())
+				addErr("模块 pass \"" + p.name + "\" 读取未知资源：" + n);
+		for (const auto& n : p.writes)
+			if (nameMap.find(n) == nameMap.end())
+				addErr("模块 pass \"" + p.name + "\" 写入未知资源：" + n);
+	}
+
+	if (bad)
+		return std::nullopt;
+
+	for (const auto& r : module.mDecl.m_resources) {
+		if (portNames.find(r.name) != portNames.end())
+			continue;
+		ResourceDecl nr = r;
+		nr.name = nameMap.at(r.name);
+		m_resources.push_back(std::move(nr));
+	}
+	for (const auto& p : module.mDecl.m_passes) {
+		PassDecl np = p;
+		np.name = tag + "/" + p.name;
+		std::set<std::string> reads, writes;
+		for (const auto& n : p.reads)
+			reads.insert(nameMap.at(n));
+		for (const auto& n : p.writes)
+			writes.insert(nameMap.at(n));
+		np.reads = std::move(reads);
+		np.writes = std::move(writes);
+		RewritePassBindings(np.desc, nameMap);
+		m_passes.push_back(std::move(np));
+	}
+	for (const auto& e : module.mDecl.m_edges)
+		m_edges.push_back(BuilderEdge{ tag + "/" + e.from, tag + "/" + e.to });
+	for (const auto& g : module.mDecl.m_aliasGroups) {
+		std::vector<std::string> ng;
+		ng.reserve(g.size());
+		for (const auto& n : g) {
+			auto it = nameMap.find(n);
+			if (it != nameMap.end())
+				ng.push_back(it->second);
+		}
+		m_aliasGroups.push_back(std::move(ng));
+	}
+
+	m_instanceTags.insert(tag);
+
+	ModuleInstance inst;
+	inst.tag = tag;
+	for (const auto& e : module.mEntryNames)
+		inst.Entries.push_back(tag + "/" + e);
+	for (const auto& e : module.mExitNames)
+		inst.Exits.push_back(tag + "/" + e);
+	return inst;
+}
+
+LowerResult RenderGraphBuilder::Lower() const {
+	LowerResult out;
+	uint32_t errorCount = 0;
+
+	auto addDiag = [&](BuilderSeverity sev, BuilderDiagKind kind, std::string msg,
+		std::optional<BuilderEdge> edge = std::nullopt) {
+		BuilderDiagnostic d;
+		d.severity = sev;
+		d.kind = kind;
+		d.message = std::move(msg);
+		d.edge = std::move(edge);
+		if (sev == BuilderSeverity::Error) ++errorCount;
+		out.diagnostics.push_back(std::move(d));
+	};
+
+	// ---- 名称与引用校验 ----
+	std::map<std::string, size_t> resMap, passMap;
+	for (size_t i = 0; i < m_resources.size(); ++i) {
+		const ResourceDecl& r = m_resources[i];
+		if (r.name.empty()) { addDiag(BuilderSeverity::Error, BuilderDiagKind::EmptyName, "资源名为空"); continue; }
+		if (resMap.find(r.name) != resMap.end()) {
+			addDiag(BuilderSeverity::Error, BuilderDiagKind::DuplicateName, "资源名重复：" + r.name);
+			continue;
+		}
+		resMap.emplace(r.name, i);
+	}
+	for (size_t i = 0; i < m_passes.size(); ++i) {
+		const PassDecl& p = m_passes[i];
+		if (p.name.empty()) { addDiag(BuilderSeverity::Error, BuilderDiagKind::EmptyName, "Pass 名为空"); continue; }
+		if (passMap.find(p.name) != passMap.end()) {
+			addDiag(BuilderSeverity::Error, BuilderDiagKind::DuplicateName, "Pass 名重复：" + p.name);
+			continue;
+		}
+		passMap.emplace(p.name, i);
+	}
+	for (const auto& p : m_passes) {
+		for (const auto& n : p.reads)
+			if (resMap.find(n) == resMap.end())
+				addDiag(BuilderSeverity::Error, BuilderDiagKind::UnknownName,
+					"pass \"" + p.name + "\" 读取未声明资源：" + n);
+		for (const auto& n : p.writes)
+			if (resMap.find(n) == resMap.end())
+				addDiag(BuilderSeverity::Error, BuilderDiagKind::UnknownName,
+					"pass \"" + p.name + "\" 写入未声明资源：" + n);
+	}
+
+	// ---- 同 pass 读写、写者收集、Mux 多写 ----
+	std::map<std::string, std::vector<uint32_t>> writers;
+	std::set<std::string> muxOutputs;
+	for (size_t i = 0; i < m_passes.size(); ++i) {
+		const PassDecl& p = m_passes[i];
+		for (const auto& n : p.writes) {
+			if (p.reads.find(n) != p.reads.end())
+				addDiag(BuilderSeverity::Error, BuilderDiagKind::SamePassReadWrite,
+					"pass \"" + p.name + "\" 同时读写同一逻辑资源：" + n);
+			writers[n].push_back(static_cast<uint32_t>(i));
+			if (p.type == Pass::Mux)
+				muxOutputs.insert(n);
+		}
+	}
+	for (const auto& name : muxOutputs) {
+		if (writers[name].size() > 1)
+			addDiag(BuilderSeverity::Error, BuilderDiagKind::MuxMultiWriter,
+				"Mux 输出不允许存在多个写者：" + name);
+	}
+
+	// ---- 用户拓扑边 ----
+	std::set<BuilderEdge> userEdges;
+	for (const auto& e : m_edges) {
+		if (passMap.find(e.from) == passMap.end() || passMap.find(e.to) == passMap.end()) {
+			addDiag(BuilderSeverity::Error, BuilderDiagKind::UnknownName,
+				"顺序边引用未声明的 pass：" + e.from + " -> " + e.to, e);
+			continue;
+		}
+		if (e.from == e.to) {
+			addDiag(BuilderSeverity::Error, BuilderDiagKind::Contradiction,
+				"顺序边自引用：" + e.from, e);
+			out.topology.conflicts.push_back(e);
+			continue;
+		}
+		userEdges.insert(e);
+	}
+	out.topology.declared.assign(userEdges.begin(), userEdges.end());
+
+	const size_t n = m_passes.size();
+	std::vector<std::vector<uint32_t>> userAdj(n);
+	std::vector<uint32_t> indeg(n, 0);
+	for (const auto& e : userEdges) {
+		const uint32_t a = static_cast<uint32_t>(passMap.at(e.from));
+		const uint32_t b = static_cast<uint32_t>(passMap.at(e.to));
+		auto& adj = userAdj[a];
+		if (std::find(adj.begin(), adj.end(), b) == adj.end()) {
+			adj.push_back(b);
+			++indeg[b];
+		}
+	}
+
+	// ---- 多写者必须被用户拓扑定序 ----
+	for (const auto& kv : writers) {
+		const std::vector<uint32_t>& ws = kv.second;
+		for (size_t i = 0; i < ws.size(); ++i) {
+			for (size_t j = i + 1; j < ws.size(); ++j) {
+				if (!BuilderReachable(userAdj, ws[i], ws[j])
+					&& !BuilderReachable(userAdj, ws[j], ws[i])) {
+					addDiag(BuilderSeverity::Error, BuilderDiagKind::WriterOrderUndetermined,
+						"资源 \"" + kv.first + "\" 的写者 \"" + m_passes[ws[i]].name
+						+ "\" 与 \"" + m_passes[ws[j]].name + "\" 未在拓扑中定序");
+				}
+			}
+		}
+	}
+
+	if (errorCount > 0) return out;
+
+	// ---- 用户拓扑排序（同层按声明顺序）----
+	std::vector<uint32_t> order;
+	{
+		std::vector<uint32_t> deg = indeg;
+		std::priority_queue<uint32_t, std::vector<uint32_t>, std::greater<uint32_t>> pq;
+		for (uint32_t i = 0; i < n; ++i)
+			if (deg[i] == 0) pq.push(i);
+		while (!pq.empty()) {
+			const uint32_t u = pq.top();
+			pq.pop();
+			order.push_back(u);
+			for (uint32_t v : userAdj[u])
+				if (--deg[v] == 0) pq.push(v);
+		}
+	}
+	if (order.size() != n) {
+		std::vector<uint32_t> cycle;
+		if (BuilderFindCycle(userAdj, cycle)) {
+			std::string path;
+			for (size_t i = 0; i < cycle.size(); ++i) {
+				if (i) path += " -> ";
+				path += m_passes[cycle[i]].name;
+			}
+			addDiag(BuilderSeverity::Error, BuilderDiagKind::Contradiction, "用户拓扑成环：" + path);
+			for (size_t i = 1; i < cycle.size(); ++i)
+				out.topology.conflicts.push_back(BuilderEdge{
+					m_passes[cycle[i - 1]].name, m_passes[cycle[i]].name });
+		}
+		else {
+			addDiag(BuilderSeverity::Error, BuilderDiagKind::Contradiction, "用户拓扑成环");
+		}
+		return out;
+	}
+
+	// ---- 版本分配：读当前版本，写下一版本 ----
+	struct ResState { uint32_t current = 0; uint32_t next = 1; };
+	std::map<std::string, ResState> state;
+	struct VerRecord {
+		std::string resource;
+		uint32_t    version = 0;
+		std::string producer;
+		std::vector<std::string> readers;
+		bool        used = false;
+		uint32_t    firstUse = static_cast<uint32_t>(-1);
+		uint32_t    lastUse = 0;
+	};
+	std::map<ResourceRef, VerRecord> recs;
+	auto ensureVersion = [&](const std::string& name, uint32_t v) -> ResourceRef {
+		ResourceRef ref{ name, v };
+		auto it = recs.find(ref);
+		if (it == recs.end()) {
+			VerRecord r;
+			r.resource = name;
+			r.version = v;
+			recs.emplace(ref, std::move(r));
+		}
+		return ref;
+	};
+	auto touch = [&](const ResourceRef& ref, uint32_t index) {
+		VerRecord& r = recs.at(ref);
+		r.used = true;
+		r.firstUse = std::min(r.firstUse, index);
+		r.lastUse = std::max(r.lastUse, index);
+	};
+
+	std::vector<LoweredPass> lowered;
+	lowered.reserve(order.size());
+	for (uint32_t idx = 0; idx < order.size(); ++idx) {
+		const PassDecl& pd = m_passes[order[idx]];
+		LoweredPass lp;
+		lp.name = pd.name;
+		lp.type = pd.type;
+		lp.desc = pd.desc;
+		lp.queue = pd.queue;
+
+		for (const auto& name : pd.reads) {
+			const uint32_t v = state[name].current;
+			const ResourceRef ref = ensureVersion(name, v);
+			recs.at(ref).readers.push_back(pd.name);
+			touch(ref, idx);
+			lp.reads.insert(ref);
+			lp.bindingVersions[name] = v;
+
+			const ResourceDecl& rd = m_resources[resMap.at(name)];
+			const bool hasInitial = rd.IsExternal() || rd.crossFrame
+				|| rd.initialLayout != rhi::ImageLayout::Undefined;
+			if (v == 0 && !hasInitial) {
+				addDiag(BuilderSeverity::Error, BuilderDiagKind::ReadBeforeProducer,
+					"pass \"" + pd.name + "\" 读取资源 \"" + name
+					+ "\" 的导入版本，但该资源没有外部句柄且 initialLayout 为 Undefined");
+			}
+		}
+
+		for (const auto& name : pd.writes) {
+			const uint32_t v = state[name].next++;
+			state[name].current = v;
+			const ResourceRef ref = ensureVersion(name, v);
+			VerRecord& rec = recs.at(ref);
+			rec.producer = pd.name;
+			touch(ref, idx);
+			lp.writes.insert(ref);
+			lp.bindingVersions[name] = v;
+		}
+
+		lowered.push_back(std::move(lp));
+	}
+
+	// ---- 别名计划：Load 原地链、跨帧整链、用户声明桶 ----
+	std::vector<std::pair<ResourceRef, ResourceRef>> unions;
+	for (const LoweredPass& lp : lowered) {
+		for (const ResourceRef& wref : lp.writes) {
+			if (!BuilderWritesWithLoad(lp.desc, wref.name))
+				continue;
+			const ResourceRef prev{ wref.name, wref.version - 1 };
+			ensureVersion(prev.name, prev.version);
+			unions.emplace_back(prev, wref);
+		}
+	}
+	for (const ResourceDecl& rd : m_resources) {
+		if (!rd.crossFrame) continue;
+		std::vector<ResourceRef> versions;
+		for (const auto& kv : recs)
+			if (kv.first.name == rd.name)
+				versions.push_back(kv.first);
+		for (size_t i = 1; i < versions.size(); ++i)
+			unions.emplace_back(versions[0], versions[i]);
+	}
+
+	for (const auto& group : m_aliasGroups) {
+		std::set<std::string> unique;
+		const ResourceDecl* first = nullptr;
+		bool okGroup = true;
+		for (const auto& name : group) {
+			auto it = resMap.find(name);
+			if (it == resMap.end()) {
+				addDiag(BuilderSeverity::Error, BuilderDiagKind::VersionAliasConflict,
+					"别名组引用未声明资源：" + name);
+				okGroup = false;
+				continue;
+			}
+			unique.insert(name);
+			const ResourceDecl& rd = m_resources[it->second];
+			if (first == nullptr) first = &rd;
+			else if (!SameDecl(*first, rd)) {
+				addDiag(BuilderSeverity::Error, BuilderDiagKind::VersionAliasConflict,
+					"别名组成员声明不一致：" + name);
+				okGroup = false;
+			}
+		}
+		if (unique.size() < 2) {
+			addDiag(BuilderSeverity::Error, BuilderDiagKind::VersionAliasConflict,
+				"别名组至少需要两个资源");
+			okGroup = false;
+		}
+		if (!okGroup) continue;
+		std::vector<ResourceRef> versions;
+		for (const auto& kv : recs)
+			if (unique.find(kv.first.name) != unique.end())
+				versions.push_back(kv.first);
+		for (size_t i = 1; i < versions.size(); ++i)
+			unions.emplace_back(versions[0], versions[i]);
+	}
+
+	// ---- 并查集汇总别名块 ----
+	std::vector<ResourceRef> refs;
+	for (const auto& kv : recs) refs.push_back(kv.first);
+	std::map<ResourceRef, uint32_t> refIndex;
+	for (uint32_t i = 0; i < refs.size(); ++i) refIndex.emplace(refs[i], i);
+	std::vector<uint32_t> dsuParent(refs.size());
+	for (uint32_t i = 0; i < refs.size(); ++i) dsuParent[i] = i;
+	std::function<uint32_t(uint32_t)> findRoot = [&](uint32_t x) -> uint32_t {
+		while (dsuParent[x] != x) { dsuParent[x] = dsuParent[dsuParent[x]]; x = dsuParent[x]; }
+		return x;
+	};
+	for (const auto& u : unions) {
+		auto ia = refIndex.find(u.first);
+		auto ib = refIndex.find(u.second);
+		if (ia == refIndex.end() || ib == refIndex.end()) continue;
+		const uint32_t ra = findRoot(ia->second);
+		const uint32_t rb = findRoot(ib->second);
+		if (ra != rb) dsuParent[rb] = ra;
+	}
+	std::map<uint32_t, std::vector<ResourceRef>> groups;
+	for (uint32_t i = 0; i < refs.size(); ++i)
+		groups[findRoot(i)].push_back(refs[i]);
+
+	// ---- 别名块校验：同 pass 多触达、寿命重叠 ----
+	for (auto& kv : groups) {
+		const std::vector<ResourceRef>& members = kv.second;
+		if (members.size() < 2) continue;
+		for (const LoweredPass& lp : lowered) {
+			uint32_t touched = 0;
+			for (const ResourceRef& m : members)
+				if (lp.reads.count(m) || lp.writes.count(m)) ++touched;
+			if (touched > 1)
+				addDiag(BuilderSeverity::Error, BuilderDiagKind::VersionAliasConflict,
+					"pass \"" + lp.name + "\" 同时触达同一别名块的多个版本");
+		}
+		std::vector<uint32_t> firsts, lasts;
+		for (const ResourceRef& m : members) {
+			const VerRecord& r = recs.at(m);
+			if (!r.used) continue;
+			firsts.push_back(r.firstUse);
+			lasts.push_back(r.lastUse);
+		}
+		for (size_t i = 0; i < firsts.size(); ++i)
+			for (size_t j = i + 1; j < firsts.size(); ++j)
+				if (std::max(firsts[i], firsts[j]) <= std::min(lasts[i], lasts[j]))
+					addDiag(BuilderSeverity::Error, BuilderDiagKind::VersionAliasConflict,
+						"别名块内版本寿命重叠：" + members.front().name);
+	}
+
+	// ---- 输出别名组与版本表 ----
+	for (auto& kv : groups) {
+		if (kv.second.size() < 2) continue;
+		LoweredAliasGroup g;
+		g.members = kv.second;
+		g.mustAlias = true;
+		out.graph.aliasGroups.push_back(std::move(g));
+	}
+	for (const auto& kv : recs) {
+		BuilderVersionInfo vi;
+		vi.resource = kv.first.name;
+		vi.version = kv.first.version;
+		vi.producer = kv.second.producer;
+		if (kv.first.version > 0) {
+			const ResourceRef prev{ kv.first.name, kv.first.version - 1 };
+			auto pit = refIndex.find(prev);
+			if (pit != refIndex.end()
+				&& findRoot(pit->second) == findRoot(refIndex.at(kv.first)))
+				vi.aliasPrevious = true;
+		}
+		out.versions.push_back(std::move(vi));
+	}
+
+	// ---- 顺序边：用户边 + 别名块钉住边 ----
+	std::set<BuilderEdge> finalEdges = userEdges;
+	for (auto& kv : groups) {
+		const std::vector<ResourceRef>& members = kv.second;
+		if (members.size() < 2) continue;
+		std::vector<const VerRecord*> used;
+		for (const ResourceRef& m : members) {
+			const VerRecord& r = recs.at(m);
+			if (r.used) used.push_back(&r);
+		}
+		std::sort(used.begin(), used.end(), [](const VerRecord* a, const VerRecord* b) {
+			return a->firstUse < b->firstUse;
+		});
+		std::vector<std::vector<std::string>> levels;
+		for (const VerRecord* r : used) {
+			if (!r->producer.empty())
+				levels.push_back(std::vector<std::string>{ r->producer });
+			if (!r->readers.empty())
+				levels.push_back(r->readers);
+		}
+		for (size_t i = 1; i < levels.size(); ++i)
+			for (const auto& a : levels[i - 1])
+				for (const auto& b : levels[i])
+					if (a != b) finalEdges.insert(BuilderEdge{ a, b });
+	}
+	out.graph.orderEdges.assign(finalEdges.begin(), finalEdges.end());
+
+	// ---- 三情况报告：资源依赖补边 / 纯顺序边 ----
+	std::set<BuilderEdge> resEdges;
+	for (const auto& kv : recs) {
+		const VerRecord& r = kv.second;
+		if (r.producer.empty()) continue;
+		for (const auto& reader : r.readers)
+			if (reader != r.producer)
+				resEdges.insert(BuilderEdge{ r.producer, reader });
+	}
+	std::vector<std::vector<uint32_t>> resAdj(n);
+	for (const auto& e : resEdges) {
+		if (passMap.find(e.from) == passMap.end() || passMap.find(e.to) == passMap.end())
+			continue;
+		const uint32_t a = static_cast<uint32_t>(passMap.at(e.from));
+		const uint32_t b = static_cast<uint32_t>(passMap.at(e.to));
+		auto& adj = resAdj[a];
+		if (std::find(adj.begin(), adj.end(), b) == adj.end())
+			adj.push_back(b);
+	}
+	auto reach = [](const std::map<std::string, size_t>& pm,
+		const std::vector<std::vector<uint32_t>>& adj,
+		const BuilderEdge& e) {
+		auto ia = pm.find(e.from);
+		auto ib = pm.find(e.to);
+		if (ia == pm.end() || ib == pm.end()) return false;
+		return BuilderReachable(adj, static_cast<uint32_t>(ia->second),
+			static_cast<uint32_t>(ib->second));
+	};
+	for (const auto& e : resEdges) {
+		if (!reach(passMap, userAdj, e)) {
+			out.topology.impliedAdded.push_back(e);
+			addDiag(BuilderSeverity::Warning, BuilderDiagKind::ImpliedEdgeAdded,
+				"资源依赖补出顺序边：" + e.from + " -> " + e.to, e);
+		}
+	}
+	for (const auto& e : userEdges)
+		if (!reach(passMap, resAdj, e))
+			out.topology.orderingOnly.push_back(e);
+
+	// ---- 依据版本化声明重建资源 ----
+	for (const auto& kv : recs) {
+		auto ri = resMap.find(kv.first.name);
+		if (ri == resMap.end()) continue;
+		const ResourceDecl& rd = m_resources[ri->second];
+		LoweredResource lr;
+		lr.ref = kv.first;
+		lr.desc = rd.desc;
+		lr.view = rd.view;
+		lr.viewFormat = rd.viewFormat;
+		lr.barrierRange = rd.barrierRange;
+		lr.initialLayout = rd.initialLayout;
+		lr.crossFrame = rd.crossFrame;
+		lr.external = rd.IsExternal();
+		lr.externalImage = rd.externalImage;
+		lr.externalBuffer = rd.externalBuffer;
+		lr.borrowedLater = rd.borrowedLater;
+		out.graph.resources.push_back(std::move(lr));
+	}
+	out.graph.passes = std::move(lowered);
+	out.ok = errorCount == 0;
+	return out;
+}
+
+bool RenderGraphBuilder::Build(RenderGraph& out, LowerResult* result) const {
+	LowerResult r = Lower();
+	if (result != nullptr)
+		*result = r;
+	if (!r.ok)
+		return false;
+
+	// 每个版本引用对应的写者 / 读者（pass 名）
+	std::map<ResourceRef, std::string> writerOf;
+	std::map<ResourceRef, std::set<std::string>> readersOf;
+	std::map<std::string, Pass::Type> passType;
+	for (const LoweredPass& p : r.graph.passes) {
+		passType[p.name] = p.type;
+		for (const ResourceRef& w : p.writes)
+			writerOf[w] = p.name;
+		for (const ResourceRef& rd : p.reads)
+			readersOf[rd].insert(p.name);
+	}
+
+	for (const LoweredResource& lr : r.graph.resources) {
+		std::string writer;
+		auto wit = writerOf.find(lr.ref);
+		if (wit != writerOf.end())
+			writer = wit->second;
+		std::set<std::string> readers;
+		auto rit = readersOf.find(lr.ref);
+		if (rit != readersOf.end())
+			readers = rit->second;
+
+		const bool muxOutput = !writer.empty()
+			&& passType.find(writer) != passType.end()
+			&& passType.at(writer) == Pass::Mux;
+
+		if (lr.externalImage != nullptr) {
+			out.RegisterResource(lr.ref.name, readers, writer, lr.externalImage,
+				lr.view, lr.initialLayout, lr.viewFormat, lr.barrierRange,
+				lr.crossFrame, lr.ref.version);
+		}
+		else if (lr.externalBuffer != nullptr) {
+			out.RegisterResource(lr.ref.name, readers, writer, lr.externalBuffer, lr.ref.version);
+		}
+		else if (muxOutput) {
+			out.RegisterMuxOutput(lr.ref.name, readers, writer, lr.desc, lr.ref.version);
+		}
+		else {
+			Resource::Type type = Resource::None;
+			if (std::get_if<ImageDesc>(&lr.desc)) type = Resource::Image;
+			else if (std::get_if<BufferDesc>(&lr.desc)) type = Resource::Buffer;
+			out.RegisterResource(lr.ref.name, readers, writer, type, lr.desc,
+				lr.view, lr.viewFormat, lr.barrierRange,
+				lr.initialLayout, lr.crossFrame, lr.ref.version);
+		}
+	}
+
+	// 顺序边按目标 pass 聚合成 PassOrder.after
+	std::map<std::string, std::set<std::string>> after;
+	for (const BuilderEdge& e : r.graph.orderEdges)
+		after[e.to].insert(e.from);
+
+	for (const LoweredPass& p : r.graph.passes) {
+		RenderGraph::PassOrder order;
+		auto ait = after.find(p.name);
+		if (ait != after.end())
+			order.after = ait->second;
+		out.RegisterPass(p.name, p.reads, p.writes, p.type, p.desc,
+			std::move(order), p.queue, p.bindingVersions);
+	}
+
+	for (const LoweredAliasGroup& g : r.graph.aliasGroups)
+		out.AliasResourceVersions(g.members);
+
+	return true;
 }
 
 void RenderGraph::RealizeShaderSets(rhi::Pipeline& pipeline, std::vector<ShaderBinding>& shaderBindings,
@@ -2063,6 +3785,31 @@ void RenderGraph::RecordPass(rhi::CommandList& cmd, Pass* pass) {
 				depth = ra;
 				hasDepth = true;
 			}
+		}
+
+		// MSAA 解算：ResolveDst 按 slot 挂到同 slot 的颜色附件上（源即该颜色附件）
+		for (const auto& att : d.attachments) {
+			if (att.usage != Usage::ResolveDst)
+				continue;
+			Resource* res = GetResource(*att.resourceId);
+			if (res == nullptr || res->get_type() != Resource::Image)
+				HandleError(ErrorCode::ResourceNotRegistered);
+			RealizeResource(res);
+			Image* img = static_cast<Image*>(res);
+			const rhi::Image* raw = img->get_rhi();
+			if (raw == nullptr)
+				HandleError(ErrorCode::ResourceNotRegistered);
+			rhi::ImageSubresourceRange range{ img->get_view(), 1, 1 };
+			if (att.range.has_value())
+				range = *att.range;
+			if (!rhi::NormalizeImageSubresourceRange(range, img->get_desc().mipLevels,
+					img->get_desc().arrayLayers))
+				HandleError(ErrorCode::InvalidImageSubresourceRange);
+			if (att.slot >= kMaxColorAttachments || colors[att.slot].image == nullptr)
+				HandleError(ErrorCode::ResolveAttachmentUnpaired);
+			colors[att.slot].resolveImage = const_cast<rhi::Image*>(raw);
+			colors[att.slot].resolveRange = range;
+			colors[att.slot].resolveLayout = rhi::ImageLayout::ColorAttachment;
 		}
 
 		const rhi::Image* sized = nullptr;
@@ -3769,6 +5516,30 @@ Pass* RenderGraph::GetPass(uint32_t passId) const {
 	if (passId >= passPool.size())
 		return nullptr;
 	return passPool[passId].get();
+}
+
+Pass* RenderGraph::FindPass(const std::string& name) const {
+	for (const auto& p : passPool) {
+		if (p != nullptr && p->get_name() == name)
+			return p.get();
+	}
+	return nullptr;
+}
+
+Resource* RenderGraph::FindResourceByName(const std::string& name) const {
+	for (const auto& r : resourcePool) {
+		if (r != nullptr && r->get_name() == name)
+			return r.get();
+	}
+	return nullptr;
+}
+
+Resource* RenderGraph::FindResourceByName(const std::string& name, uint32_t version) const {
+	for (const auto& r : resourcePool) {
+		if (r != nullptr && r->get_name() == name && r->get_version() == version)
+			return r.get();
+	}
+	return nullptr;
 }
 
 #pragma endregion

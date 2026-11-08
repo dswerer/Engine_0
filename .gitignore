@@ -365,3 +365,6 @@ FodyWeavers.xsd
 # trae docs
 .trae
 .trae/
+
+# runtime logs
+run_log.txt

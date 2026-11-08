@@ -66,9 +66,9 @@ float ShadowCalculation(vec4 worldPos, vec3 normal) {
             shadow += currentDepth - bias > pcfDepth ? 0.5 : 0.0;
         }
     }
-    shadow /= 9.0;
+    shadow /= 6.0;
 
-    shadow *= smoothstep(0.07, 0.15, NdotL);
+    //shadow *= smoothstep(0.07, 0.15, NdotL);
     return shadow;
 }
 

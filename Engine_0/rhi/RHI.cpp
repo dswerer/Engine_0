@@ -1246,6 +1246,76 @@ std::unique_ptr<Image> Device::CreateImage(const ImageCreateInfo& info)
 	return std::unique_ptr<Image>(new Image(m_device, imageCI.format, m_allocator, image, allocation, info, false));
 }
 
+std::unique_ptr<Image> Device::UploadImage(const void* data, std::uint64_t byteSize,
+	ImageCreateInfo info, ImageLayout finalLayout, PipelineStage dstStage, Access dstAccess)
+{
+	if (data == nullptr || byteSize == 0 || info.width == 0 || info.height == 0) {
+		std::cerr << "[RHI] UploadImage 参数非法\n";
+		return nullptr;
+	}
+	info.usage = info.usage | ImageUsage::TransferDst;
+	auto image = CreateImage(info);
+	if (!image) return nullptr;
+
+	BufferCreateInfo stagingInfo;
+	stagingInfo.size = byteSize;
+	stagingInfo.usage = BufferUsage::TransferSrc;
+	stagingInfo.hostVisible = true;
+	auto staging = CreateBuffer(stagingInfo);
+	if (!staging) return nullptr;
+	std::memcpy(staging->Map(), data, static_cast<size_t>(byteSize));
+	staging->Flush();
+
+	CommandList cmd = BeginCommandList();
+	ImageBarrier toDst;
+	toDst.image = image.get();
+	toDst.oldLayout = ImageLayout::Undefined;
+	toDst.newLayout = ImageLayout::TransferDst;
+	toDst.dstStage = PipelineStage::Transfer;
+	toDst.dstAccess = Access::TransferWrite;
+	cmd.Barrier({ &toDst, 1 }, {});
+	cmd.CopyBufferToImage(*staging, *image, ImageLayout::TransferDst, 0);
+	ImageBarrier toFinal;
+	toFinal.image = image.get();
+	toFinal.oldLayout = ImageLayout::TransferDst;
+	toFinal.newLayout = finalLayout;
+	toFinal.srcStage = PipelineStage::Transfer;
+	toFinal.srcAccess = Access::TransferWrite;
+	toFinal.dstStage = dstStage;
+	toFinal.dstAccess = dstAccess;
+	cmd.Barrier({ &toFinal, 1 }, {});
+	SubmitInfo submit;
+	submit.commandLists = { &cmd, 1 };
+	Submit(submit);
+	WaitForFrame();
+	return image;
+}
+
+std::unique_ptr<Buffer> Device::UploadBuffer(const void* data, std::uint64_t byteSize,
+	BufferUsage usage, PipelineStage dstStage, Access dstAccess)
+{
+	if (data == nullptr || byteSize == 0) {
+		std::cerr << "[RHI] UploadBuffer 参数非法\n";
+		return nullptr;
+	}
+	BufferCreateInfo info;
+	info.size = byteSize;
+	info.usage = usage;
+	info.hostVisible = true;
+	auto buffer = CreateBuffer(info);
+	if (!buffer) return nullptr;
+	std::memcpy(buffer->Map(), data, static_cast<size_t>(byteSize));
+	buffer->Flush();
+
+	CommandList cmd = BeginCommandList();
+	cmd.TransitionBuffer(*buffer, PipelineStage::Host, Access::HostWrite, dstStage, dstAccess);
+	SubmitInfo submit;
+	submit.commandLists = { &cmd, 1 };
+	Submit(submit);
+	WaitForFrame();
+	return buffer;
+}
+
 VkImage                Image::NativeHandle() const { return m_image; }
 VkFormat               Image::NativeFormat() const { return m_format; }
 const ImageCreateInfo& Image::Desc() const { return m_desc; }
@@ -2245,7 +2315,7 @@ std::unique_ptr<Pipeline> Device::CreatePipeline(const GraphicsPipelineDesc& des
 
 	VkPipelineMultisampleStateCreateInfo multisample{};
 	multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-	multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+	multisample.rasterizationSamples = static_cast<VkSampleCountFlagBits>(desc.samples == 0 ? 1u : desc.samples);
 
 	const bool hasDepth = desc.depthFormat != ImageFormat::None;
 	const bool hasStencil = desc.depthFormat == ImageFormat::D24S8;
@@ -2665,6 +2735,23 @@ void CommandList::TransitionImage(Image& image, ImageLayout oldLayout, ImageLayo
 	Barrier({ &barrier, 1 }, {});
 }
 
+void CommandList::TransitionBuffer(Buffer& buffer, PipelineStage srcStage, Access srcAccess,
+	PipelineStage dstStage, Access dstAccess, uint64_t offset, uint64_t size,
+	uint32_t srcQueueFamily, uint32_t dstQueueFamily)
+{
+	BufferBarrier barrier;
+	barrier.buffer = &buffer;
+	barrier.offset = offset;
+	barrier.size = size;
+	barrier.srcStage = srcStage;
+	barrier.dstStage = dstStage;
+	barrier.srcAccess = srcAccess;
+	barrier.dstAccess = dstAccess;
+	barrier.srcQueueFamily = srcQueueFamily;
+	barrier.dstQueueFamily = dstQueueFamily;
+	Barrier({}, { &barrier, 1 });
+}
+
 void CommandList::BeginRendering(const RenderingInfo& info)
 {
 	if (m_commandBuffer == VK_NULL_HANDLE) return;
@@ -2684,6 +2771,15 @@ void CommandList::BeginRendering(const RenderingInfo& info)
 		vk.loadOp = ToVkLoadOp(att.load);
 		vk.storeOp = ToVkStoreOp(att.store);
 		vk.clearValue = ToVkClearValue(att.clear);
+		// Vulkan 1.4 起解算是逐附件字段（取代旧的 pResolveAttachments 数组）
+		vk.resolveMode = VK_RESOLVE_MODE_NONE;
+		if (att.resolveImage != nullptr) {
+			ImageViewDesc resolveDesc;
+			resolveDesc.range = att.resolveRange;
+			vk.resolveImageView = att.resolveImage->CreateView(resolveDesc).NativeHandle();
+			vk.resolveImageLayout = ToVkImageLayout(att.resolveLayout);
+			vk.resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT;
+		}
 		colors.push_back(vk);
 	}
 

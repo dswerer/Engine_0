@@ -68,34 +68,6 @@ struct CubeVertex {
 	glm::vec3 normal;
 };
 
-Pass* FindPass(RenderGraph& graph, const string& name) {
-	for (uint32_t i = 0; graph.GetPass(i) != nullptr; ++i)
-		if (graph.GetPass(i)->get_name() == name)
-			return graph.GetPass(i);
-	return nullptr;
-}
-
-rhi::SamplerDesc MakeSampler(bool linear, rhi::SamplerAddressMode addressU,
-	rhi::SamplerAddressMode addressV) {
-	rhi::SamplerDesc s;
-	s.magFilter = linear ? rhi::Filter::Linear : rhi::Filter::Nearest;
-	s.minFilter = s.magFilter;
-	s.mipmapMode = rhi::SamplerMipmapMode::Nearest;
-	s.addressU = addressU;
-	s.addressV = addressV;
-	s.addressW = rhi::SamplerAddressMode::ClampToEdge;
-	return s;
-}
-
-ShaderBinding MakeBinding(const string& name, Usage usage,
-	const optional<rhi::SamplerDesc>& sampler = nullopt) {
-	ShaderBinding b;
-	b.resourceName = name;
-	b.usage = usage;
-	b.sampler = sampler;
-	return b;
-}
-
 // 单位立方体：每面 4 个顶点，法线逐面显式给出
 void BuildCube(vector<CubeVertex>& vertices, vector<uint32_t>& indices) {
 	struct Face {
@@ -143,54 +115,15 @@ unique_ptr<rhi::Image> UploadEnvironment(rhi::Device& device, const string& path
 	}
 	const uint64_t bytes = static_cast<uint64_t>(texW) * static_cast<uint64_t>(texH) * 4ull;
 
-	rhi::BufferCreateInfo stagingInfo;
-	stagingInfo.size = bytes;
-	stagingInfo.usage = rhi::BufferUsage::TransferSrc;
-	stagingInfo.hostVisible = true;
-	auto staging = device.CreateBuffer(stagingInfo);
-	if (staging == nullptr) {
-		stbi_image_free(pixels);
-		return nullptr;
-	}
-	std::memcpy(staging->Map(), pixels, static_cast<size_t>(bytes));
-	staging->Flush();
-	stbi_image_free(pixels);
-
 	rhi::ImageCreateInfo envInfo;
 	envInfo.width = static_cast<uint32_t>(texW);
 	envInfo.height = static_cast<uint32_t>(texH);
 	envInfo.format = rhi::ImageFormat::RGBA8;
-	envInfo.usage = rhi::ImageUsage::Sampled | rhi::ImageUsage::TransferDst;
-	auto env = device.CreateImage(envInfo);
+	envInfo.usage = rhi::ImageUsage::Sampled;
+	auto env = device.UploadImage(pixels, bytes, envInfo);
+	stbi_image_free(pixels);
 	if (env == nullptr)
 		return nullptr;
-
-	rhi::CommandList cmd = device.BeginCommandList();
-
-	rhi::ImageBarrier toDst;
-	toDst.image = env.get();
-	toDst.oldLayout = rhi::ImageLayout::Undefined;
-	toDst.newLayout = rhi::ImageLayout::TransferDst;
-	toDst.dstStage = rhi::PipelineStage::Transfer;
-	toDst.dstAccess = rhi::Access::TransferWrite;
-	cmd.Barrier({ &toDst, 1 }, {});
-
-	cmd.CopyBufferToImage(*staging, *env, rhi::ImageLayout::TransferDst, 0);
-
-	rhi::ImageBarrier toRead;
-	toRead.image = env.get();
-	toRead.oldLayout = rhi::ImageLayout::TransferDst;
-	toRead.newLayout = rhi::ImageLayout::ShaderReadOnly;
-	toRead.srcStage = rhi::PipelineStage::Transfer;
-	toRead.srcAccess = rhi::Access::TransferWrite;
-	toRead.dstStage = rhi::PipelineStage::FragmentShader;
-	toRead.dstAccess = rhi::Access::ShaderRead;
-	cmd.Barrier({ &toRead, 1 }, {});
-
-	rhi::SubmitInfo submit;
-	submit.commandLists = { &cmd, 1 };
-	device.Submit(submit);
-	device.WaitForFrame();
 
 	cout << "Environment texture uploaded: " << path << " " << texW << "x" << texH
 	     << " ch=" << texChannels << "\n";
@@ -240,8 +173,9 @@ bool BuildFrameGraph(RenderGraph& graph, const string& shaderDir,
 
 	graph.RegisterPass("UpdateScene", {}, { "SceneUniforms" }, Pass::Host, HostPassDesc{});
 
-	const rhi::SamplerDesc envSampler = MakeSampler(true,
-		rhi::SamplerAddressMode::Repeat, rhi::SamplerAddressMode::ClampToEdge);
+	rhi::SamplerDesc envSampler = rhi::SamplerDesc::Linear(rhi::SamplerAddressMode::Repeat);
+	envSampler.addressV = rhi::SamplerAddressMode::ClampToEdge;
+	envSampler.addressW = rhi::SamplerAddressMode::ClampToEdge;
 
 	RenderPassDesc cubeDesc;
 	{
@@ -270,8 +204,8 @@ bool BuildFrameGraph(RenderGraph& graph, const string& shaderDir,
 		cubeDesc.pipeline.depthStencil.depthCompareOp = CompareOp::LessEqual;
 
 		cubeDesc.shaderBindings = {
-			MakeBinding("SceneUniforms", Usage::UniformRead),
-			MakeBinding("EnvTexture", Usage::SampledRead, envSampler) };
+			ShaderBinding::Uniform("SceneUniforms"),
+			ShaderBinding::Sampled("EnvTexture", envSampler) };
 		cubeDesc.vertexStreams.push_back(VertexStreamBinding{ "CubeVB", {}, 0 });
 		cubeDesc.indexStream = IndexStreamBinding{ "CubeIB", {}, 0, IndexType::UInt32 };
 	}
@@ -295,10 +229,9 @@ bool BuildFrameGraph(RenderGraph& graph, const string& shaderDir,
 		compositeDesc.pipeline.depthStencil.depthTestEnable = false;
 
 		compositeDesc.shaderBindings = {
-			MakeBinding("SceneUniforms", Usage::UniformRead),
-			MakeBinding("SceneColor", Usage::SampledRead,
-				MakeSampler(false, rhi::SamplerAddressMode::ClampToEdge, rhi::SamplerAddressMode::ClampToEdge)),
-			MakeBinding("EnvTexture", Usage::SampledRead, envSampler) };
+			ShaderBinding::Uniform("SceneUniforms"),
+			ShaderBinding::Sampled("SceneColor", rhi::SamplerDesc::Nearest()),
+			ShaderBinding::Sampled("EnvTexture", envSampler) };
 	}
 	graph.RegisterPass("Composite", { "SceneUniforms", "SceneColor", "EnvTexture" },
 		{ "Backbuffer" }, Pass::Render, compositeDesc);
@@ -400,29 +333,20 @@ int main(int argc, char** argv) {
 	vector<uint32_t> indices;
 	BuildCube(vertices, indices);
 
-	rhi::BufferCreateInfo vbInfo;
-	vbInfo.size = vertices.size() * sizeof(CubeVertex);
-	vbInfo.usage = rhi::BufferUsage::Vertex;
-	vbInfo.hostVisible = true;
-	auto vertexBuffer = device->CreateBuffer(vbInfo);
+	auto vertexBuffer = device->UploadBuffer(vertices.data(),
+		static_cast<uint64_t>(vertices.size() * sizeof(CubeVertex)), rhi::BufferUsage::Vertex,
+		rhi::PipelineStage::VertexInput, rhi::Access::VertexAttributeRead);
 	if (!vertexBuffer) {
 		cerr << "顶点缓冲创建失败\n";
 		return 1;
 	}
-	std::memcpy(vertexBuffer->Map(), vertices.data(), static_cast<size_t>(vbInfo.size));
-	vertexBuffer->Flush();
-
-	rhi::BufferCreateInfo ibInfo;
-	ibInfo.size = indices.size() * sizeof(uint32_t);
-	ibInfo.usage = rhi::BufferUsage::Index;
-	ibInfo.hostVisible = true;
-	auto indexBuffer = device->CreateBuffer(ibInfo);
+	auto indexBuffer = device->UploadBuffer(indices.data(),
+		static_cast<uint64_t>(indices.size() * sizeof(uint32_t)), rhi::BufferUsage::Index,
+		rhi::PipelineStage::VertexInput, rhi::Access::IndexRead);
 	if (!indexBuffer) {
 		cerr << "索引缓冲创建失败\n";
 		return 1;
 	}
-	std::memcpy(indexBuffer->Map(), indices.data(), static_cast<size_t>(ibInfo.size));
-	indexBuffer->Flush();
 
 	// 俯视相机：从斜上方看向原点，画面中同时可见顶面与两个侧面
 	const glm::vec3 eye(0.0f, 3.3f, 2.0f);
@@ -482,7 +406,7 @@ int main(int argc, char** argv) {
 			}
 
 			if (options.smoke) {
-				HostPass* capturePass = static_cast<HostPass*>(FindPass(*graph, "Capture"));
+				HostPass* capturePass = static_cast<HostPass*>(graph->FindPass("Capture"));
 				capturePass->SetCallback([&](HostContext& ctx) {
 					ctx.WaitForGpu();
 					if (captureRequested) {
@@ -516,7 +440,7 @@ int main(int argc, char** argv) {
 		uniforms.resolution = glm::vec4(static_cast<float>(kWidth), static_cast<float>(kHeight),
 			std::tan(glm::radians(kFovY) * 0.5f), 0.0f);
 
-		HostPass* update = static_cast<HostPass*>(FindPass(*graph, "UpdateScene"));
+		HostPass* update = static_cast<HostPass*>(graph->FindPass("UpdateScene"));
 		update->SetCallback([uniforms](HostContext& ctx) {
 			ctx.WaitForGpu();
 			if (rhi::Buffer* b = ctx.WriteBuffer("SceneUniforms"))

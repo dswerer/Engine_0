@@ -17,6 +17,870 @@ using namespace dEngine;
 
 int main()
 {
+	// 声明期合并任务冒烟：不依赖 Device，验证资源统表、Pass 前缀与失败回滚
+	{
+		BufferDesc mergeBufDesc;
+		mergeBufDesc.size = 256;
+		mergeBufDesc.usage = BufferUsage::Storage;
+		mergeBufDesc.hostVisible = true;
+
+		RenderGraph mergeBase;
+		mergeBase.RegisterResource("Data", {}, "WriteData", Resource::Buffer, mergeBufDesc);
+		mergeBase.RegisterPass("WriteData", {}, { "Data" }, Pass::Host, HostPassDesc{});
+
+		RenderGraph mergeAppend;
+		mergeAppend.RegisterResource("SharedData", { "ReadData" }, "", Resource::Buffer, mergeBufDesc);
+		mergeAppend.RegisterPass("ReadData", { "SharedData" }, {}, Pass::Host, HostPassDesc{});
+
+		GraphMergeTask mergeTask;
+		mergeTask.base = &mergeBase;
+		mergeTask.append = &mergeAppend;
+		mergeTask.unify = { { "Data", "SharedData" } };
+		mergeTask.order = MergeOrder::Append;
+
+		RenderGraph merged;
+		if (!merged.ApplyMergeTask(mergeTask)) {
+			cerr << "Merge task smoke failed: valid task rejected\n";
+			return 1;
+		}
+		merged.ProcessRegister();
+		merged.GenerateSubmitSequence();
+
+		uint32_t mergedResources = 0, mergedPasses = 0;
+		for (uint32_t i = 0; merged.GetResource(i) != nullptr; ++i) ++mergedResources;
+		for (uint32_t i = 0; merged.GetPass(i) != nullptr; ++i) ++mergedPasses;
+		Resource* unified = merged.FindResourceByName("Data");
+		Pass* appended = merged.FindPass("B.ReadData");
+		if (mergedResources != 1 || mergedPasses != 2 || unified == nullptr || appended == nullptr) {
+			cerr << "Merge task smoke failed: unexpected merged shape\n";
+			return 1;
+		}
+		const ResourceTopology& unifiedTopo = unified->get_topology();
+		if (unifiedTopo.writer >= mergedPasses || unifiedTopo.readers.size() != 1
+			|| *unifiedTopo.readers.begin() != 1) {
+			cerr << "Merge task smoke failed: unified resource edges wrong\n";
+			return 1;
+		}
+
+		BufferDesc otherDesc = mergeBufDesc;
+		otherDesc.size = 512;
+		RenderGraph badAppend;
+		badAppend.RegisterResource("OtherData", { "ReadOther" }, "", Resource::Buffer, otherDesc);
+		badAppend.RegisterPass("ReadOther", { "OtherData" }, {}, Pass::Host, HostPassDesc{});
+
+		GraphMergeTask badTask;
+		badTask.base = &mergeBase;
+		badTask.append = &badAppend;
+		badTask.unify = { { "Data", "OtherData" } };
+
+		RenderGraph rejected;
+		if (rejected.ApplyMergeTask(badTask) || rejected.GetPass(0) != nullptr
+			|| rejected.GetResource(0) != nullptr) {
+			cerr << "Merge task smoke failed: desc mismatch not rejected\n";
+			return 1;
+		}
+		cout << "Merge task ok: 2 passes -> 1 unified buffer, alias + fail-closed verified\n";
+	}
+
+	// 多写者前端 lowering 冒烟：纯声明，不依赖 Device
+	{
+		auto hasDiag = [](const LowerResult& r, BuilderDiagKind kind) {
+			for (const auto& d : r.diagnostics)
+				if (d.kind == kind) return true;
+			return false;
+		};
+		auto findVersion = [](const LowerResult& r, const std::string& name, uint32_t v)
+			-> const BuilderVersionInfo* {
+			for (const auto& vi : r.versions)
+				if (vi.resource == name && vi.version == v) return &vi;
+			return nullptr;
+		};
+
+		// 1) 版本链：P1 写 v1 -> P2 读 v1 -> P3 写 v2
+		BufferDesc dataDesc;
+		dataDesc.size = 256;
+		dataDesc.usage = BufferUsage::Storage;
+		dataDesc.hostVisible = true;
+
+		RenderGraphBuilder b1;
+		b1.DeclareResource("Data", dataDesc);
+		b1.DeclarePass("P1", {}, { "Data" }, Pass::Host, HostPassDesc{});
+		b1.DeclarePass("P2", { "Data" }, {}, Pass::Host, HostPassDesc{});
+		b1.DeclarePass("P3", {}, { "Data" }, Pass::Host, HostPassDesc{});
+		b1.DeclareTopology(RenderGraphBuilder::Topology::Sequence({ "P1", "P2", "P3" }));
+		LowerResult r1 = b1.Lower();
+		if (!r1.ok || r1.versions.size() != 2
+			|| !findVersion(r1, "Data", 1) || !findVersion(r1, "Data", 2)
+			|| findVersion(r1, "Data", 1)->producer != "P1"
+			|| findVersion(r1, "Data", 2)->producer != "P3") {
+			cerr << "Lower smoke failed: basic version chain\n";
+			return 1;
+		}
+		if (r1.graph.passes.size() != 3
+			|| r1.graph.passes[1].bindingVersions.at("Data") != 1
+			|| r1.graph.passes[2].bindingVersions.at("Data") != 2) {
+			cerr << "Lower smoke failed: binding versions\n";
+			return 1;
+		}
+
+		// 2) 资源依赖补边（case 1）：Pw 写 X，Pr 读 X，用户只声明 Pu -> Pr
+		RenderGraphBuilder b2;
+		b2.DeclareResource("X", dataDesc);
+		b2.DeclarePass("Pw", {}, { "X" }, Pass::Host, HostPassDesc{});
+		b2.DeclarePass("Pu", {}, {}, Pass::Host, HostPassDesc{});
+		b2.DeclarePass("Pr", { "X" }, {}, Pass::Host, HostPassDesc{});
+		b2.DeclareTopology(RenderGraphBuilder::Topology{ { { "Pu", "Pr" } } });
+		LowerResult r2 = b2.Lower();
+		if (!r2.ok || !hasDiag(r2, BuilderDiagKind::ImpliedEdgeAdded)
+			|| r2.topology.impliedAdded.size() != 1
+			|| r2.topology.impliedAdded[0].from != "Pw"
+			|| r2.topology.impliedAdded[0].to != "Pr") {
+			cerr << "Lower smoke failed: implied edge warning\n";
+			return 1;
+		}
+
+		// 3) Load 原地链 -> 相邻版本同块
+		ImageDesc colorDesc;
+		colorDesc.width = 64;
+		colorDesc.height = 64;
+		colorDesc.format = ImageFormat::RGBA8;
+
+		auto makeColorPass = [&](const std::string& name, LoadOp load) {
+			RenderPassDesc desc;
+			AttachmentBinding att;
+			att.resourceName = "Color";
+			att.slot = 0;
+			att.load = load;
+			desc.attachments.push_back(att);
+			return desc;
+		};
+		RenderGraphBuilder b3;
+		b3.DeclareResource("Color", colorDesc);
+		b3.DeclarePass("Clear", Pass::Render, makeColorPass("Clear", LoadOp::DontCare));
+		b3.DeclarePass("Accum", Pass::Render, makeColorPass("Accum", LoadOp::Load));
+		b3.DeclareTopology(RenderGraphBuilder::Topology::Sequence({ "Clear", "Accum" }));
+		LowerResult r3 = b3.Lower();
+		if (!r3.ok || r3.graph.aliasGroups.size() != 1
+			|| r3.graph.aliasGroups[0].members.size() != 2
+			|| !findVersion(r3, "Color", 2) || !findVersion(r3, "Color", 2)->aliasPrevious) {
+			cerr << "Lower smoke failed: load alias chain\n";
+			return 1;
+		}
+
+		// 4) 跨帧：同块 + 允许读导入版本
+		ImageDesc historyDesc;
+		historyDesc.width = 64;
+		historyDesc.height = 64;
+		historyDesc.format = ImageFormat::RGBA16F;
+
+		RenderGraphBuilder b4;
+		b4.DeclareResource("History", historyDesc,
+			{ .initialLayout = rhi::ImageLayout::TransferDst, .crossFrame = true });
+		b4.DeclarePass("Use", { "History" }, {}, Pass::Host, HostPassDesc{});
+		b4.DeclarePass("Update", {}, { "History" }, Pass::Host, HostPassDesc{});
+		b4.DeclareTopology(RenderGraphBuilder::Topology::Sequence({ "Use", "Update" }));
+		LowerResult r4 = b4.Lower();
+		if (!r4.ok || r4.graph.aliasGroups.size() != 1
+			|| r4.graph.aliasGroups[0].members.size() != 2
+			|| !findVersion(r4, "History", 0) || !findVersion(r4, "History", 1)
+			|| !findVersion(r4, "History", 1)->aliasPrevious) {
+			cerr << "Lower smoke failed: cross-frame alias\n";
+			return 1;
+		}
+
+		// 5) 错误路径：同 pass 读写、读先于生产者、多写者未定序
+		RenderGraphBuilder e1;
+		e1.DeclareResource("Y", dataDesc);
+		e1.DeclarePass("RW", { "Y" }, { "Y" }, Pass::Host, HostPassDesc{});
+		if (e1.Lower().ok || !hasDiag(e1.Lower(), BuilderDiagKind::SamePassReadWrite)) {
+			cerr << "Lower smoke failed: same-pass read/write not rejected\n";
+			return 1;
+		}
+
+		RenderGraphBuilder e2;
+		e2.DeclareResource("Z", dataDesc);
+		e2.DeclarePass("ReadZ", { "Z" }, {}, Pass::Host, HostPassDesc{});
+		e2.DeclarePass("WriteZ", {}, { "Z" }, Pass::Host, HostPassDesc{});
+		e2.DeclareTopology(RenderGraphBuilder::Topology::Sequence({ "ReadZ", "WriteZ" }));
+		LowerResult er2 = e2.Lower();
+		if (er2.ok || !hasDiag(er2, BuilderDiagKind::ReadBeforeProducer)) {
+			cerr << "Lower smoke failed: read-before-producer not rejected\n";
+			return 1;
+		}
+
+		RenderGraphBuilder e3;
+		e3.DeclareResource("W", dataDesc);
+		e3.DeclarePass("W1", {}, { "W" }, Pass::Host, HostPassDesc{});
+		e3.DeclarePass("W2", {}, { "W" }, Pass::Host, HostPassDesc{});
+		LowerResult er3 = e3.Lower();
+		if (er3.ok || !hasDiag(er3, BuilderDiagKind::WriterOrderUndetermined)) {
+			cerr << "Lower smoke failed: undetermined writer order not rejected\n";
+			return 1;
+		}
+
+		cout << "Lower ok: version chain, implied edge, load alias, cross-frame alias, 3 rejections\n";
+	}
+
+	// Build 冒烟：Lower -> 版本化后端声明 -> ProcessRegister（不依赖 Device）
+	{
+		BufferDesc dataDesc;
+		dataDesc.size = 256;
+		dataDesc.usage = BufferUsage::Storage;
+		dataDesc.hostVisible = true;
+
+		ComputePassDesc readDesc;
+		readDesc.shader = { rhi::ShaderStage::Compute, "" };
+		ShaderBinding sb;
+		sb.resourceName = "Data";
+		sb.usage = Usage::UniformRead;
+		readDesc.shaderBindings.push_back(sb);
+
+		RenderGraphBuilder b;
+		b.DeclareResource("Data", dataDesc);
+		b.DeclarePass("Write", {}, { "Data" }, Pass::Host, HostPassDesc{});
+		b.DeclarePass("Read", Pass::Compute, readDesc);
+		b.DeclareTopology(RenderGraphBuilder::Topology::Sequence({ "Write", "Read" }));
+
+		RenderGraph g;
+		LowerResult lr;
+		if (!b.Build(g, &lr)) {
+			cerr << "Build smoke failed: valid build rejected\n";
+			return 1;
+		}
+		g.ProcessRegister();
+		g.GenerateSubmitSequence();
+
+		Resource* data = g.FindResourceByName("Data", 1);
+		Pass* writePass = g.FindPass("Write");
+		Pass* readPass = g.FindPass("Read");
+		if (data == nullptr || data->get_version() != 1 || writePass == nullptr || readPass == nullptr) {
+			cerr << "Build smoke failed: versioned resource not registered\n";
+			return 1;
+		}
+		if (data->get_topology().writer != writePass->get_id()
+			|| data->get_topology().readers.size() != 1
+			|| *data->get_topology().readers.begin() != readPass->get_id()) {
+			cerr << "Build smoke failed: versioned topology edges wrong\n";
+			return 1;
+		}
+		auto* cp = static_cast<ComputePass*>(readPass);
+		if (cp->get_desc().shaderBindings.size() != 1
+			|| !cp->get_desc().shaderBindings[0].resourceId
+			|| *cp->get_desc().shaderBindings[0].resourceId != data->get_id()) {
+			cerr << "Build smoke failed: binding did not resolve to the right version\n";
+			return 1;
+		}
+		if (readPass->get_topology().reads.size() != 1
+			|| readPass->get_topology().reads[0].resourceId != data->get_id()) {
+			cerr << "Build smoke failed: read edge not versioned\n";
+			return 1;
+		}
+
+		RenderGraphBuilder bad;
+		bad.DeclareResource("Y", dataDesc);
+		bad.DeclarePass("RW", { "Y" }, { "Y" }, Pass::Host, HostPassDesc{});
+		RenderGraph badOut;
+		if (bad.Build(badOut) || badOut.GetPass(0) != nullptr) {
+			cerr << "Build smoke failed: failed lower wrote into target graph\n";
+			return 1;
+		}
+
+		cout << "Build ok: versioned declaration + binding resolution, failure leaves graph empty\n";
+	}
+
+	// 读写集推导：Transfer 源读/目的写，版本分配与显式声明一致
+	{
+		BufferDesc ioBuf;
+		ioBuf.size = 64;
+		ioBuf.usage = BufferUsage::Storage;
+		ioBuf.hostVisible = true;
+
+		RenderGraphBuilder io;
+		io.DeclareResource("A", ioBuf);
+		io.DeclareResource("B", ioBuf);
+		TransferPassDesc td;
+		td.kind = TransferKind::BufferToBuffer;
+		td.sourceName = "A";
+		td.destName = "B";
+		io.DeclarePass("Fill", {}, { "A" }, Pass::Host, HostPassDesc{});
+		io.DeclarePass("Copy", Pass::Transfer, td);
+		io.DeclareTopology(RenderGraphBuilder::Topology::Sequence({ "Fill", "Copy" }));
+		LowerResult lr = io.Lower();
+		if (!lr.ok || lr.graph.passes.size() != 2
+			|| lr.graph.passes[1].reads.count(ResourceRef{ "A", 1 }) != 1
+			|| lr.graph.passes[1].writes.count(ResourceRef{ "B", 1 }) != 1) {
+			cerr << "Derive smoke failed: transfer io mismatch\n";
+			return 1;
+		}
+		cout << "Derive ok: render/compute/transfer io inferred from PassDesc\n";
+	}
+
+	// 前端合并：同名资源去重 + Pass 前缀 + 跨模块拓扑，合并发生在 Lower 之前
+	{
+		BufferDesc bufDesc;
+		bufDesc.size = 128;
+		bufDesc.usage = BufferUsage::Storage;
+		bufDesc.hostVisible = true;
+
+		RenderGraphBuilder ma;
+		ma.DeclareResource("Data", bufDesc);
+		ma.DeclarePass("Write", {}, { "Data" }, Pass::Host, HostPassDesc{});
+
+		RenderGraphBuilder mb;
+		mb.DeclareResource("Data", bufDesc);   // 同名同描述 -> 自动合一
+		mb.DeclarePass("Read", { "Data" }, {}, Pass::Host, HostPassDesc{});
+
+		RenderGraphBuilder mm;
+		if (!mm.ImportDeclarations(ma)) {
+			cerr << "Import smoke failed: first import rejected\n";
+			return 1;
+		}
+		if (!mm.ImportDeclarations(mb, RenderGraphBuilder::ImportOptions{ "B." })) {
+			cerr << "Import smoke failed: second import rejected\n";
+			return 1;
+		}
+		mm.DeclareTopology(RenderGraphBuilder::Topology::Sequence({ "Write", "B.Read" }));
+		LowerResult lm = mm.Lower();
+		if (!lm.ok || lm.versions.size() != 1
+			|| lm.versions[0].resource != "Data" || lm.versions[0].version != 1) {
+			cerr << "Import smoke failed: dedup/version assignment wrong\n";
+			return 1;
+		}
+		if (lm.graph.passes.size() != 2
+			|| lm.graph.passes[0].name != "Write" || lm.graph.passes[1].name != "B.Read"
+			|| lm.graph.passes[1].bindingVersions.at("Data") != 1) {
+			cerr << "Import smoke failed: pass prefix or binding version wrong\n";
+			return 1;
+		}
+
+		RenderGraphBuilder c1, c2;
+		c1.DeclarePass("Same", {}, {}, Pass::Host, HostPassDesc{});
+		c2.DeclarePass("Same", {}, {}, Pass::Host, HostPassDesc{});
+		RenderGraphBuilder cm;
+		if (!cm.ImportDeclarations(c1) || cm.ImportDeclarations(c2)) {
+			cerr << "Import smoke failed: pass name conflict not rejected\n";
+			return 1;
+		}
+		if (cm.Lower().graph.passes.size() != 1) {
+			cerr << "Import smoke failed: failed import left partial state\n";
+			return 1;
+		}
+
+		BufferDesc otherDesc = bufDesc;
+		otherDesc.size = 256;
+		RenderGraphBuilder d1, d2;
+		d1.DeclareResource("Z", bufDesc);
+		d2.DeclareResource("Z", otherDesc);
+		RenderGraphBuilder dm;
+		if (!dm.ImportDeclarations(d1) || dm.ImportDeclarations(d2)) {
+			cerr << "Import smoke failed: resource desc mismatch not rejected\n";
+			return 1;
+		}
+
+		cout << "Import ok: resource dedup + pass prefix + topology merge, conflicts leave builder unchanged\n";
+	}
+
+	// P0：ShaderBinding 的图资源名与 SPIR-V 变量名分离
+	{
+		BufferDesc bufDesc;
+		bufDesc.size = 128;
+		bufDesc.usage = BufferUsage::Storage;
+		bufDesc.hostVisible = true;
+
+		ComputePassDesc readDesc;
+		readDesc.shader = { rhi::ShaderStage::Compute, "" };
+		ShaderBinding sb;
+		sb.resourceName = "ShaderData";   // 反射名
+		sb.graphResourceName = "Data";    // 图资源名
+		sb.usage = Usage::UniformRead;
+		readDesc.shaderBindings.push_back(sb);
+
+		RenderGraph g;
+		g.RegisterResource("Data", { "Read" }, "", Resource::Buffer, bufDesc);
+		g.RegisterPass("Read", { "Data" }, {}, Pass::Compute, readDesc);
+		g.ProcessRegister();
+
+		Pass* read = g.FindPass("Read");
+		if (read == nullptr || read->get_type() != Pass::Compute) {
+			cerr << "Binding split failed: compute pass missing\n";
+			return 1;
+		}
+		const ShaderBinding& bound = static_cast<ComputePass*>(read)->get_desc().shaderBindings[0];
+		if (bound.resourceName != "ShaderData"
+			|| bound.graphResourceName != "Data"
+			|| !bound.resourceId || *bound.resourceId != 0) {
+			cerr << "Binding split failed: graph name not resolved independently\n";
+			return 1;
+		}
+		cout << "Binding split ok: shader variable name kept, graph resource name resolved\n";
+	}
+
+	// P1：模块编译期校验与入口/出口推导
+	{
+		BufferDesc bufDesc;
+		bufDesc.size = 128;
+		bufDesc.usage = BufferUsage::Storage;
+		bufDesc.hostVisible = true;
+
+		RenderGraphBuilder b;
+		b.DeclareResource("Src", bufDesc);
+		b.DeclareResource("Dst", bufDesc);
+		b.DeclareResource("Temp", bufDesc);
+		b.DeclarePass("Step", { "Src" }, { "Temp" }, Pass::Host, HostPassDesc{});
+		b.DeclarePass("Copy", { "Temp" }, { "Dst" }, Pass::Host, HostPassDesc{});
+		b.DeclareTopology(RenderGraphBuilder::Topology::Sequence({ "Step", "Copy" }));
+
+		RenderGraphModule m;
+		std::vector<std::string> errs;
+		if (!b.CompileModule("M", {
+			{ "Src", ModulePortKind::Input },
+			{ "Dst", ModulePortKind::Output },
+		}, &m, &errs) || !errs.empty()) {
+			cerr << "Module compile failed: valid module rejected\n";
+			return 1;
+		}
+		if (m.Ports().size() != 2 || m.Ports()[0].type != Resource::Buffer
+			|| m.Entries().size() != 1 || m.Entries()[0] != "Step"
+			|| m.Exits().size() != 1 || m.Exits()[0] != "Copy") {
+			cerr << "Module compile failed: ports or entry/exit wrong\n";
+			return 1;
+		}
+
+		{
+			RenderGraphBuilder e;
+			e.DeclarePass("P", {}, {}, Pass::Host, HostPassDesc{});
+			RenderGraphModule bad;
+			if (e.CompileModule("X", { { "Missing", ModulePortKind::Input } }, &bad)) {
+				cerr << "Module compile failed: undeclared port not rejected\n";
+				return 1;
+			}
+		}
+		{
+			RenderGraphBuilder e;
+			e.DeclareResource("Out", bufDesc);
+			e.DeclarePass("Present", { "Out" }, {}, Pass::Present, PresentPassDesc{});
+			RenderGraphModule bad;
+			if (e.CompileModule("X", { { "Out", ModulePortKind::Output } }, &bad)) {
+				cerr << "Module compile failed: Present not rejected\n";
+				return 1;
+			}
+		}
+		{
+			RenderGraphBuilder e;
+			e.DeclareResource("X", bufDesc);
+			e.DeclareResource("Out", bufDesc);
+			e.DeclarePass("W1", {}, { "X" }, Pass::Host, HostPassDesc{});
+			e.DeclarePass("W2", {}, { "X" }, Pass::Host, HostPassDesc{});
+			e.DeclarePass("R", { "X" }, { "Out" }, Pass::Host, HostPassDesc{});
+			RenderGraphModule bad;
+			if (e.CompileModule("X", { { "Out", ModulePortKind::Output } }, &bad)) {
+				cerr << "Module compile failed: unordered writers not rejected\n";
+				return 1;
+			}
+		}
+		{
+			RenderGraphBuilder e;
+			e.DeclareResource("A", bufDesc);
+			e.DeclareResource("B", bufDesc);
+			e.DeclarePass("P", { "A" }, { "B" }, Pass::Host, HostPassDesc{});
+			e.AliasLogicalResources({ "A", "B" });
+			RenderGraphModule bad;
+			if (e.CompileModule("X", { { "A", ModulePortKind::Input }, { "B", ModulePortKind::Output } }, &bad)) {
+				cerr << "Module compile failed: port in alias group not rejected\n";
+				return 1;
+			}
+		}
+		{
+			RenderGraphBuilder e;
+			e.DeclareResource("A", bufDesc);
+			e.DeclareResource("Orphan", bufDesc);
+			e.DeclarePass("P", {}, { "A" }, Pass::Host, HostPassDesc{});
+			RenderGraphModule bad;
+			if (e.CompileModule("X", { { "A", ModulePortKind::Output }, { "Orphan", ModulePortKind::Input } }, &bad)) {
+				cerr << "Module compile failed: unreferenced port not rejected\n";
+				return 1;
+			}
+		}
+		{
+			RenderGraphBuilder e;
+			e.DeclareResource("A", bufDesc);
+			e.DeclareResource("B", bufDesc);
+			e.DeclarePass("P1", {}, { "A" }, Pass::Host, HostPassDesc{});
+			e.DeclarePass("P2", { "A" }, { "B" }, Pass::Host, HostPassDesc{});
+			e.DeclareTopology(RenderGraphBuilder::Topology::Sequence({ "P1", "P2" }));
+			e.DeclareTopology(RenderGraphBuilder::Topology{}.Then("P2", "P1"));
+			RenderGraphModule bad;
+			if (e.CompileModule("X", { { "B", ModulePortKind::Output } }, &bad)) {
+				cerr << "Module compile failed: cycle not rejected\n";
+				return 1;
+			}
+		}
+
+		cout << "Module compile ok: ports, entry/exit, 6 rejections\n";
+	}
+
+	// P2：模块实例化：作用域展开、端口绑定、多实例、错误路径
+	{
+		BufferDesc bufDesc;
+		bufDesc.size = 128;
+		bufDesc.usage = BufferUsage::Storage;
+		bufDesc.hostVisible = true;
+
+		RenderGraphBuilder mod;
+		mod.DeclareResource("Src", bufDesc);
+		mod.DeclareResource("Dst", bufDesc);
+		mod.DeclareResource("Temp", bufDesc);
+		mod.DeclarePass("Step", { "Src" }, { "Temp" }, Pass::Host, HostPassDesc{});
+		mod.DeclarePass("Copy", { "Temp" }, { "Dst" }, Pass::Host, HostPassDesc{});
+		mod.DeclareTopology(RenderGraphBuilder::Topology::Sequence({ "Step", "Copy" }));
+
+		RenderGraphModule m;
+		std::vector<std::string> errs;
+		if (!mod.CompileModule("Blur", {
+			{ "Src", ModulePortKind::Input },
+			{ "Dst", ModulePortKind::Output },
+		}, &m, &errs)) {
+			cerr << "Module instantiate failed: compile rejected\n";
+			return 1;
+		}
+
+		RenderGraphBuilder parent;
+		parent.DeclareResource("Color", bufDesc);
+		parent.DeclareResource("BlurA", bufDesc);
+		parent.DeclareResource("BlurB", bufDesc);
+		parent.DeclarePass("Init", {}, { "Color" }, Pass::Host, HostPassDesc{});
+
+		auto a = parent.Instantiate(m, "a", { { "Src", "Color" }, { "Dst", "BlurA" } });
+		auto b = parent.Instantiate(m, "b", { { "Src", "Color" }, { "Dst", "BlurB" } });
+		if (!a || !b) {
+			cerr << "Module instantiate failed: valid instances rejected\n";
+			return 1;
+		}
+		if (a->Entries.size() != 1 || a->Entries[0] != "a/Step"
+			|| a->Exits.size() != 1 || a->Exits[0] != "a/Copy") {
+			cerr << "Module instantiate failed: entry/exit not scoped\n";
+			return 1;
+		}
+
+		RenderGraphBuilder::Topology t;
+		t.Then("Init", "a/Step").Then("Init", "b/Step");
+		parent.DeclareTopology(t);
+
+		LowerResult lr = parent.Lower();
+		if (!lr.ok) {
+			cerr << "Module instantiate failed: lower rejected\n";
+			return 1;
+		}
+		std::set<std::string> resNames, passNames;
+		for (const auto& r : lr.graph.resources) resNames.insert(r.ref.name);
+		for (const auto& p : lr.graph.passes) passNames.insert(p.name);
+		if (resNames.size() != 5 || resNames.count("a/Temp") == 0 || resNames.count("b/Temp") == 0
+			|| resNames.count("Src") != 0 || resNames.count("Temp") != 0) {
+			cerr << "Module instantiate failed: resource scoping wrong\n";
+			return 1;
+		}
+		if (passNames.size() != 5 || passNames.count("a/Step") == 0 || passNames.count("a/Copy") == 0
+			|| passNames.count("b/Step") == 0 || passNames.count("b/Copy") == 0) {
+			cerr << "Module instantiate failed: pass scoping wrong\n";
+			return 1;
+		}
+		for (const auto& p : lr.graph.passes) {
+			if (p.name == "a/Step") {
+				auto it = p.bindingVersions.find("Color");
+				if (it == p.bindingVersions.end() || it->second != 1) {
+					cerr << "Module instantiate failed: port binding version wrong\n";
+					return 1;
+				}
+			}
+		}
+
+		// 错误路径：重复 tag / 缺绑定 / 未知端口 / 父资源缺失 / 形状不一致
+		if (parent.Instantiate(m, "a", { { "Src", "Color" }, { "Dst", "BlurA" } })
+			|| parent.Instantiate(m, "c", { { "Src", "Color" } })
+			|| parent.Instantiate(m, "d", { { "Src", "Color" }, { "Dst", "BlurA" }, { "Nope", "BlurB" } })
+			|| parent.Instantiate(m, "e", { { "Src", "Missing" }, { "Dst", "BlurA" } })) {
+			cerr << "Module instantiate failed: binding errors not rejected\n";
+			return 1;
+		}
+		BufferDesc bigDesc = bufDesc;
+		bigDesc.size = 512;
+		parent.DeclareResource("BlurBig", bigDesc);
+		if (parent.Instantiate(m, "f", { { "Src", "Color" }, { "Dst", "BlurBig" } })) {
+			cerr << "Module instantiate failed: shape mismatch not rejected\n";
+			return 1;
+		}
+
+		// 跨帧端口要求父资源 crossFrame
+		RenderGraphBuilder cf;
+		cf.DeclareResource("Hist", bufDesc, { .crossFrame = true });
+		cf.DeclarePass("Use", { "Hist" }, {}, Pass::Host, HostPassDesc{});
+		RenderGraphModule cm;
+		if (!cf.CompileModule("CF", { { "Hist", ModulePortKind::Input } }, &cm, &errs)) {
+			cerr << "Module instantiate failed: cross-frame module compile rejected\n";
+			return 1;
+		}
+		RenderGraphBuilder p2;
+		p2.DeclareResource("Hist", bufDesc);
+		if (p2.Instantiate(cm, "h", { { "Hist", "Hist" } })) {
+			cerr << "Module instantiate failed: cross-frame mismatch not rejected\n";
+			return 1;
+		}
+
+		// 失败不留半成品
+		LowerResult after = parent.Lower();
+		if (!after.ok || after.graph.passes.size() != 5 || after.graph.resources.size() != 5) {
+			cerr << "Module instantiate failed: failed instance left partial state\n";
+			return 1;
+		}
+
+		cout << "Module instantiate ok: scoped expansion, multi-instance, 6 rejections\n";
+	}
+
+	// P3：ThenAll 用实例 Entries/Exits 接线
+	{
+		BufferDesc bufDesc;
+		bufDesc.size = 128;
+		bufDesc.usage = BufferUsage::Storage;
+		bufDesc.hostVisible = true;
+
+		RenderGraphBuilder mod;
+		mod.DeclareResource("Src", bufDesc);
+		mod.DeclareResource("Dst", bufDesc);
+		mod.DeclareResource("Temp", bufDesc);
+		mod.DeclarePass("Step", { "Src" }, { "Temp" }, Pass::Host, HostPassDesc{});
+		mod.DeclarePass("Copy", { "Temp" }, { "Dst" }, Pass::Host, HostPassDesc{});
+		mod.DeclareTopology(RenderGraphBuilder::Topology::Sequence({ "Step", "Copy" }));
+
+		RenderGraphModule m;
+		std::vector<std::string> errs;
+		if (!mod.CompileModule("Blur", {
+			{ "Src", ModulePortKind::Input },
+			{ "Dst", ModulePortKind::Output },
+		}, &m, &errs)) {
+			cerr << "ThenAll failed: module compile rejected\n";
+			return 1;
+		}
+
+		RenderGraphBuilder parent;
+		parent.DeclareResource("Color", bufDesc);
+		parent.DeclareResource("OutA", bufDesc);
+		parent.DeclareResource("OutB", bufDesc);
+		parent.DeclarePass("Init", {}, { "Color" }, Pass::Host, HostPassDesc{});
+
+		auto a = parent.Instantiate(m, "a", { { "Src", "Color" }, { "Dst", "OutA" } });
+		auto b = parent.Instantiate(m, "b", { { "Src", "Color" }, { "Dst", "OutB" } });
+		if (!a || !b) {
+			cerr << "ThenAll failed: instances rejected\n";
+			return 1;
+		}
+
+		RenderGraphBuilder::Topology t;
+		t.ThenAll({ "Init" }, a->Entries);
+		t.ThenAll(a->Exits, b->Entries);
+		t.ThenAll({}, b->Exits);   // 空集合不产生边
+		parent.DeclareTopology(t);
+
+		LowerResult lr = parent.Lower();
+		if (!lr.ok) {
+			cerr << "ThenAll failed: lower rejected\n";
+			return 1;
+		}
+		std::set<std::pair<std::string, std::string>> edges;
+		for (const auto& e : lr.topology.declared)
+			edges.insert({ e.from, e.to });
+		// 4 = 2 条用户边 + 模块内部 Step->Copy 展开边
+		if (edges.size() != 4
+			|| edges.count(std::pair<std::string, std::string>{ "Init", "a/Step" }) == 0
+			|| edges.count(std::pair<std::string, std::string>{ "a/Copy", "b/Step" }) == 0
+			|| edges.count(std::pair<std::string, std::string>{ "a/Step", "a/Copy" }) == 0
+			|| edges.count(std::pair<std::string, std::string>{ "b/Step", "b/Copy" }) == 0) {
+			cerr << "ThenAll failed: declared edges wrong\n";
+			return 1;
+		}
+
+		cout << "ThenAll ok: instance entries/exits wired, empty set ignored\n";
+	}
+
+	// P4：模块实例 -> Lower -> Build -> ProcessRegister 端到端
+	{
+		BufferDesc bufDesc;
+		bufDesc.size = 128;
+		bufDesc.usage = BufferUsage::Storage;
+		bufDesc.hostVisible = true;
+
+		RenderGraphBuilder mod;
+		mod.DeclareResource("Src", bufDesc);
+		mod.DeclareResource("Dst", bufDesc);
+		mod.DeclareResource("Temp", bufDesc);
+		mod.DeclarePass("Step", { "Src" }, { "Temp" }, Pass::Host, HostPassDesc{});
+		mod.DeclarePass("Copy", { "Temp" }, { "Dst" }, Pass::Host, HostPassDesc{});
+		mod.DeclareTopology(RenderGraphBuilder::Topology::Sequence({ "Step", "Copy" }));
+
+		RenderGraphModule m;
+		std::vector<std::string> errs;
+		if (!mod.CompileModule("Blur", {
+			{ "Src", ModulePortKind::Input },
+			{ "Dst", ModulePortKind::Output },
+		}, &m, &errs)) {
+			cerr << "End-to-end failed: module compile rejected\n";
+			return 1;
+		}
+
+		RenderGraphBuilder parent;
+		parent.DeclareResource("Color", bufDesc);
+		parent.DeclareResource("OutA", bufDesc);
+		parent.DeclareResource("OutB", bufDesc);
+		parent.DeclarePass("Init", {}, { "Color" }, Pass::Host, HostPassDesc{});
+
+		auto a = parent.Instantiate(m, "a", { { "Src", "Color" }, { "Dst", "OutA" } });
+		auto b = parent.Instantiate(m, "b", { { "Src", "Color" }, { "Dst", "OutB" } });
+		if (!a || !b) {
+			cerr << "End-to-end failed: instantiate rejected\n";
+			return 1;
+		}
+		RenderGraphBuilder::Topology t;
+		t.ThenAll({ "Init" }, a->Entries);
+		t.ThenAll(a->Exits, b->Entries);
+		parent.DeclareTopology(t);
+
+		LowerResult lr;
+		RenderGraph graph;
+		if (!parent.Build(graph, &lr) || !lr.ok) {
+			cerr << "End-to-end failed: build rejected\n";
+			return 1;
+		}
+		graph.ProcessRegister();
+		graph.GenerateSubmitSequence();
+
+		Pass* init = graph.FindPass("Init");
+		Pass* aStep = graph.FindPass("a/Step");
+		Pass* aCopy = graph.FindPass("a/Copy");
+		Pass* bStep = graph.FindPass("b/Step");
+		Pass* bCopy = graph.FindPass("b/Copy");
+		Resource* tempA = graph.FindResourceByName("a/Temp", 1);
+		Resource* tempB = graph.FindResourceByName("b/Temp", 1);
+		Resource* color = graph.FindResourceByName("Color", 1);
+		Resource* outA = graph.FindResourceByName("OutA", 1);
+		Resource* outB = graph.FindResourceByName("OutB", 1);
+		if (init == nullptr || aStep == nullptr || aCopy == nullptr
+			|| bStep == nullptr || bCopy == nullptr
+			|| tempA == nullptr || tempB == nullptr
+			|| color == nullptr || outA == nullptr || outB == nullptr) {
+			cerr << "End-to-end failed: nodes missing after ProcessRegister\n";
+			return 1;
+		}
+		if (tempA->get_topology().writer != aStep->get_id()
+			|| tempA->get_topology().readers.count(aCopy->get_id()) == 0
+			|| tempB->get_topology().writer != bStep->get_id()
+			|| tempB->get_topology().readers.count(bCopy->get_id()) == 0) {
+			cerr << "End-to-end failed: internal version edges wrong\n";
+			return 1;
+		}
+		if (outA->get_topology().writer != aCopy->get_id()
+			|| outB->get_topology().writer != bCopy->get_id()
+			|| color->get_topology().writer != init->get_id()
+			|| color->get_topology().readers.count(aStep->get_id()) == 0
+			|| color->get_topology().readers.count(bStep->get_id()) == 0) {
+			cerr << "End-to-end failed: port bound edges wrong\n";
+			return 1;
+		}
+		if (graph.FindResourceByName("Src") != nullptr
+			|| graph.FindResourceByName("Dst") != nullptr
+			|| graph.FindResourceByName("Temp") != nullptr) {
+			cerr << "End-to-end failed: module internal names leaked\n";
+			return 1;
+		}
+		if (graph.GetSubmitSequence().size() != 5) {
+			cerr << "End-to-end failed: submit sequence wrong\n";
+			return 1;
+		}
+
+		cout << "End-to-end ok: module instances -> lower -> build -> process register\n";
+	}
+
+	// P5：嵌套模块（深度 2），作用域名逐层叠加
+	{
+		BufferDesc bufDesc;
+		bufDesc.size = 128;
+		bufDesc.usage = BufferUsage::Storage;
+		bufDesc.hostVisible = true;
+
+		RenderGraphBuilder inner;
+		inner.DeclareResource("Src", bufDesc);
+		inner.DeclareResource("Dst", bufDesc);
+		inner.DeclareResource("Temp", bufDesc);
+		inner.DeclarePass("Step", { "Src" }, { "Temp" }, Pass::Host, HostPassDesc{});
+		inner.DeclarePass("Copy", { "Temp" }, { "Dst" }, Pass::Host, HostPassDesc{});
+		inner.DeclareTopology(RenderGraphBuilder::Topology::Sequence({ "Step", "Copy" }));
+		RenderGraphModule innerMod;
+		std::vector<std::string> errs;
+		if (!inner.CompileModule("Inner", {
+			{ "Src", ModulePortKind::Input },
+			{ "Dst", ModulePortKind::Output },
+		}, &innerMod, &errs)) {
+			cerr << "Nested module failed: inner compile rejected\n";
+			return 1;
+		}
+
+		RenderGraphBuilder outer;
+		outer.DeclareResource("SharedIn", bufDesc);
+		outer.DeclareResource("SharedOut", bufDesc);
+		if (!outer.Instantiate(innerMod, "in", {
+			{ "Src", "SharedIn" }, { "Dst", "SharedOut" },
+		})) {
+			cerr << "Nested module failed: inner instantiate rejected\n";
+			return 1;
+		}
+		RenderGraphModule outerMod;
+		if (!outer.CompileModule("Outer", {
+			{ "SharedIn", ModulePortKind::Input },
+			{ "SharedOut", ModulePortKind::Output },
+		}, &outerMod, &errs)) {
+			cerr << "Nested module failed: outer compile rejected\n";
+			return 1;
+		}
+
+		RenderGraphBuilder top;
+		top.DeclareResource("RealIn", bufDesc);
+		top.DeclareResource("RealOut", bufDesc);
+		top.DeclarePass("Init", {}, { "RealIn" }, Pass::Host, HostPassDesc{});
+		auto out = top.Instantiate(outerMod, "out", {
+			{ "SharedIn", "RealIn" }, { "SharedOut", "RealOut" },
+		});
+		if (!out) {
+			cerr << "Nested module failed: outer instantiate rejected\n";
+			return 1;
+		}
+		if (out->Entries.size() != 1 || out->Entries[0] != "out/in/Step"
+			|| out->Exits.size() != 1 || out->Exits[0] != "out/in/Copy") {
+			cerr << "Nested module failed: nested entry/exit wrong\n";
+			return 1;
+		}
+		top.DeclareTopology(RenderGraphBuilder::Topology{}.Then("Init", "out/in/Step"));
+
+		LowerResult lr = top.Lower();
+		if (!lr.ok) {
+			cerr << "Nested module failed: lower rejected\n";
+			return 1;
+		}
+		std::set<std::string> resNames, passNames;
+		for (const auto& r : lr.graph.resources) resNames.insert(r.ref.name);
+		for (const auto& p : lr.graph.passes) passNames.insert(p.name);
+		if (resNames.size() != 3 || resNames.count("out/in/Temp") == 0
+			|| resNames.count("RealIn") == 0 || resNames.count("RealOut") == 0
+			|| resNames.count("in/Temp") != 0 || resNames.count("SharedIn") != 0) {
+			cerr << "Nested module failed: resource names wrong\n";
+			return 1;
+		}
+		if (passNames.size() != 3 || passNames.count("out/in/Step") == 0
+			|| passNames.count("out/in/Copy") == 0 || passNames.count("Init") == 0) {
+			cerr << "Nested module failed: pass names wrong\n";
+			return 1;
+		}
+
+		cout << "Nested module ok: depth-2 scoping and port pass-through\n";
+	}
+
 	if (!glfwInit()) {
 		cerr << "glfwInit 失败\n";
 		return 1;
@@ -861,6 +1725,97 @@ int main()
 							     << int(first[2]) << "," << int(first[3]) << "\n";
 						}
 					}
+				}
+			}
+
+			// MSAA：4x 颜色附件 + 1x 解算目标（dynamic rendering resolve），回读校验
+			{
+				RenderGraph msaaGraph(device.get());
+
+				ImageDesc msaaDesc;
+				msaaDesc.width = 64; msaaDesc.height = 64;
+				msaaDesc.format = ImageFormat::RGBA8;
+				msaaDesc.samples = 4;
+				ImageDesc resolveDesc = msaaDesc;
+				resolveDesc.samples = 1;
+
+				RenderPassDesc fillDesc;
+				{
+					AttachmentBinding color;
+					color.resourceName = "MsaaColor";
+					color.slot = 0;
+					color.load = LoadOp::Clear;
+					color.clear.value = std::array<float, 4>{ 0.0f, 0.0f, 0.0f, 1.0f };
+					fillDesc.attachments.push_back(color);
+
+					AttachmentBinding resolve;
+					resolve.resourceName = "Resolved";
+					resolve.usage = Usage::ResolveDst;
+					resolve.slot = 0;
+					fillDesc.attachments.push_back(resolve);
+
+					fillDesc.pipeline.shaders = {
+						{ rhi::ShaderStage::Vertex,   shaderDir + "/fullscreen.vert.spv" },
+						{ rhi::ShaderStage::Fragment, shaderDir + "/solid.frag.spv" },
+					};
+					fillDesc.pipeline.cullMode = CullMode::None;
+				}
+
+				TransferPassDesc msaaBackDesc;
+				msaaBackDesc.kind = TransferKind::ImageToBuffer;
+				msaaBackDesc.sourceName = "Resolved";
+				msaaBackDesc.destName = "Pixels";
+
+				BufferDesc pixelsDesc;
+				pixelsDesc.size = 64 * 64 * 4;
+				pixelsDesc.usage = BufferUsage::TransferDst;
+				pixelsDesc.hostVisible = true;
+
+				msaaGraph.RegisterPass("Fill",    {},             { "MsaaColor", "Resolved" }, Pass::Render, fillDesc);
+				msaaGraph.RegisterPass("Back",    { "Resolved" }, { "Pixels" }, Pass::Transfer, msaaBackDesc, {}, rhi::QueueClass::Transfer);
+				msaaGraph.RegisterPass("Consume", { "Pixels" },   {}, Pass::Host, HostPassDesc{});
+
+				msaaGraph.RegisterResource("MsaaColor", {},        "Fill", Resource::Image, msaaDesc);
+				msaaGraph.RegisterResource("Resolved",  { "Back" }, "Fill", Resource::Image, resolveDesc);
+				msaaGraph.RegisterResource("Pixels",    { "Consume" }, "Back", Resource::Buffer, pixelsDesc);
+
+				msaaGraph.ProcessRegister();
+				msaaGraph.GenerateSubmitSequence();
+				msaaGraph.RealizeAll();
+
+				for (uint32_t i = 0; msaaGraph.GetPass(i) != nullptr; ++i) {
+					Pass* p = msaaGraph.GetPass(i);
+					if (p->get_type() != Pass::Render) continue;
+					DrawSource draw;
+					draw.kind = DrawSource::Direct;
+					draw.count = 3;
+					draw.instanceCount = 1;
+					static_cast<RenderPass*>(p)->SetDraw(draw);
+				}
+
+				HostPass* msaaConsume = nullptr;
+				for (uint32_t i = 0; msaaGraph.GetPass(i) != nullptr; ++i) {
+					Pass* p = msaaGraph.GetPass(i);
+					if (p->get_type() == Pass::Host) msaaConsume = static_cast<HostPass*>(p);
+				}
+				unsigned char msaaFirst[4] = {};
+				if (msaaConsume != nullptr) {
+					msaaConsume->SetCallback([&msaaFirst](HostContext& ctx) {
+						ctx.WaitForGpu();
+						const rhi::Buffer* source = ctx.ReadBuffer("Pixels");
+						if (source != nullptr && source->Map() != nullptr)
+							std::memcpy(msaaFirst, source->Map(), sizeof(msaaFirst));
+						ctx.SignalGpu();
+					});
+					msaaGraph.SubmitGraph();
+					msaaGraph.WaitHostPasses();
+					device->WaitForFrame();
+
+					const bool ok = msaaFirst[0] == 255 && msaaFirst[1] == 0
+						&& msaaFirst[2] == 255 && msaaFirst[3] == 255;
+					cout << "MSAA resolve " << (ok ? "ok" : "FAILED") << ": samples=4 rgba8="
+					     << int(msaaFirst[0]) << "," << int(msaaFirst[1]) << ","
+					     << int(msaaFirst[2]) << "," << int(msaaFirst[3]) << "\n";
 				}
 			}
 

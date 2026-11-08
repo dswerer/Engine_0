@@ -119,9 +119,12 @@ namespace dEngine {
 		std::optional<rhi::ImageSubresourceRange> range;
 	};
 
-	// shader 资源绑定：变量名须与图资源名相同，Realize 时按名对账。
+	// shader 资源绑定：resourceName 为 SPIR-V 变量名；graphResourceName 为图资源名（空则回落）
 	struct ShaderBinding {
+		// SPIR-V 变量名：反射对账用，模块实例化/作用域改写时保持不变
 		std::string             resourceName;
+		// 图资源名：参与图内对账；空表示回落 resourceName（模块实例化时写入）
+		std::string             graphResourceName;
 		std::optional<uint32_t> resourceId;
 		Usage                   usage = Usage::Auto; // Auto: 图像推断 SampledRead，Buffer 推断 UniformRead
 		// Buffer 专用：描述符的窗口（0 长度 = 整个 buffer）。图像绑定忽略这两个字段
@@ -134,6 +137,34 @@ namespace dEngine {
 		std::optional<uint32_t> binding;
 		// 反射回填：数组绑定的元素数（层展开的同步范围据此计算）
 		std::optional<uint32_t> arrayCount;
+
+		// 常用预设：一行完成绑定声明，其余字段（offset/range 等）可再改
+		static ShaderBinding Uniform(std::string name) {
+			ShaderBinding b;
+			b.resourceName = std::move(name);
+			b.usage = Usage::UniformRead;
+			return b;
+		}
+		static ShaderBinding Sampled(std::string name,
+			std::optional<SamplerDesc> sampler = std::nullopt) {
+			ShaderBinding b;
+			b.resourceName = std::move(name);
+			b.usage = Usage::SampledRead;
+			b.sampler = sampler;
+			return b;
+		}
+		static ShaderBinding StorageRead(std::string name) {
+			ShaderBinding b;
+			b.resourceName = std::move(name);
+			b.usage = Usage::StorageRead;
+			return b;
+		}
+		static ShaderBinding StorageWrite(std::string name) {
+			ShaderBinding b;
+			b.resourceName = std::move(name);
+			b.usage = Usage::StorageWrite;
+			return b;
+		}
 	};
 
 	// 管线状态：shader 与固定功能；附件格式与描述符布局由引擎推导。
@@ -257,6 +288,8 @@ namespace dEngine {
 	// Mux Pass：零命令选择点，输出为 Borrow-later，按帧槽 retarget。
 	struct MuxPassDesc {
 		std::vector<std::string> alternatives; // 顺序即选择索引
+		// ProcessRegister 回填：候选解析到的资源 id（版本化后不再按名查表）
+		std::vector<uint32_t> alternativeIds;
 	};
 
 	// Present Pass：只做布局转换到 PresentSrc，不录绘制命令。

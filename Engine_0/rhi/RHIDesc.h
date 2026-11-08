@@ -44,6 +44,22 @@ namespace dEngine::rhi {
 		float               mipLodBias = 0.0f;
 		float               minLod = 0.0f;
 		float               maxLod = 1000.0f; // 与 VK_LOD_CLAMP_NONE 同值
+
+		// 常用预设：三轴向统一寻址（默认 ClampToEdge），mipmap 固定 Nearest；逐轴不同可先取预设再改字段
+		static SamplerDesc Linear(SamplerAddressMode address = SamplerAddressMode::ClampToEdge) {
+			SamplerDesc s;
+			s.magFilter = s.minFilter = Filter::Linear;
+			s.mipmapMode = SamplerMipmapMode::Nearest;
+			s.addressU = s.addressV = s.addressW = address;
+			return s;
+		}
+		static SamplerDesc Nearest(SamplerAddressMode address = SamplerAddressMode::ClampToEdge) {
+			SamplerDesc s;
+			s.magFilter = s.minFilter = Filter::Nearest;
+			s.mipmapMode = SamplerMipmapMode::Nearest;
+			s.addressU = s.addressV = s.addressW = address;
+			return s;
+		}
 	};
 
 	enum class LoadOp  { Load, Clear, DontCare };
@@ -403,6 +419,7 @@ namespace dEngine::rhi {
 		std::array<ImageFormat, kMaxColorAttachments> colorFormats {};
 		uint32_t    colorAttachmentCount = 0;
 		ImageFormat depthFormat = ImageFormat::None;   // None = 无深度
+		uint32_t    samples = 1;                       // 采样数：须与 pass 的所有附件一致（MSAA 来自颜色附件）
 
 		// 固定功能（第一版最小集）
 		PrimitiveTopology topology = PrimitiveTopology::TriangleList;
@@ -471,6 +488,10 @@ namespace dEngine::rhi {
 		LoadOp         load = LoadOp::DontCare;
 		StoreOp        store = StoreOp::Store;
 		ClearValue     clear {};
+		// MSAA 解算目标（只对颜色附件有效；nullptr = 不解算）。源即 image 本身
+		Image*         resolveImage = nullptr;
+		ImageSubresourceRange resolveRange { {}, 1, 1 };
+		ImageLayout    resolveLayout = ImageLayout::ColorAttachment;
 	};
 
 	struct RenderingInfo {
