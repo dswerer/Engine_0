@@ -372,6 +372,8 @@ namespace dEngine::rhi {
 	struct ShaderStageDesc {
 		ShaderStage stage;
 		std::string spirvPath;
+		// 入口点名；默认 "main"（glslc 默认产出）
+		std::string entryPoint = "main";
 	};
 
 	// 反射产出的资源类别（亦可手工声明时使用）

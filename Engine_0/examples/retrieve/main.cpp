@@ -3,6 +3,8 @@
 
 #include "RenderGraphAbstracted.h"
 #include "RenderGraphNodes.h"
+#include "AssetResolver.h"
+#include "ShaderLibrary.h"
 #include "rhi/RHI.h"
 #include "AssimpMesh.h"
 #include "FrameData.h"
@@ -58,8 +60,8 @@ constexpr uint32_t kShadowSize = 4096;
 constexpr uint32_t kLutSize = 256;
 constexpr uint32_t kSkyAmbientSize = 128;
 
-const string kShaderDir = RETRIEVE_SHADER_DIR;
 const string kAssetDir = RETRIEVE_ASSET_DIR;
+const string kShaderDir = RETRIEVE_SHADER_DIR;
 
 struct Options {
 	bool     smoke = false;
@@ -99,7 +101,8 @@ std::unique_ptr<rhi::Image> CreateLut(rhi::Device& device, uint32_t size, rhi::I
 
 bool PrecomputeAtmosphere(rhi::Device& device, const AtmosphereParams& params,
 	std::unique_ptr<rhi::Image>& t2a, std::unique_ptr<rhi::Image>& ms,
-	std::unique_ptr<rhi::Image>& sa, std::unique_ptr<rhi::Buffer>& atmoUBO)
+	std::unique_ptr<rhi::Image>& sa, std::unique_ptr<rhi::Buffer>& atmoUBO,
+	const ShaderLibrary& shaders)
 {
 	t2a = CreateLut(device, kLutSize, rhi::ImageFormat::RGBA16F);
 	ms = CreateLut(device, kLutSize, rhi::ImageFormat::RGBA16F);
@@ -119,14 +122,14 @@ bool PrecomputeAtmosphere(rhi::Device& device, const AtmosphereParams& params,
 		return false;
 	}
 
-	RenderGraph graph(&device);
+	RenderGraph graph(&device, &shaders);
 
 	graph.RegisterPass("HostParams", {}, { "AtmosphereParams" }, Pass::Host, HostPassDesc{});
 	graph.RegisterResource("AtmosphereParams", { "Transmittance", "MultipleScattering", "SkyAmbient" },
 		"HostParams", atmoUBO.get());
 
 	ComputePassDesc transmittanceDesc;
-	transmittanceDesc.shader = { rhi::ShaderStage::Compute, kShaderDir + "/transmittance.comp.spv" };
+	transmittanceDesc.shaderRef = "transmittance.comp";
 	transmittanceDesc.groupCountX = kLutSize / 4;
 	transmittanceDesc.groupCountY = kLutSize / 8;
 	transmittanceDesc.shaderBindings = {
@@ -138,7 +141,7 @@ bool PrecomputeAtmosphere(rhi::Device& device, const AtmosphereParams& params,
 		"Transmittance", t2a.get(), {}, rhi::ImageLayout::Undefined);
 
 	ComputePassDesc msDesc;
-	msDesc.shader = { rhi::ShaderStage::Compute, kShaderDir + "/multiple_scattering.comp.spv" };
+	msDesc.shaderRef = "multiple_scattering.comp";
 	msDesc.groupCountX = kLutSize / 4;
 	msDesc.groupCountY = kLutSize / 8;
 	msDesc.shaderBindings = {
@@ -149,7 +152,7 @@ bool PrecomputeAtmosphere(rhi::Device& device, const AtmosphereParams& params,
 		{ "MultipleScatteringLUT" }, Pass::Compute, msDesc);
 
 	ComputePassDesc saDesc;
-	saDesc.shader = { rhi::ShaderStage::Compute, kShaderDir + "/sky_ambient.comp.spv" };
+	saDesc.shaderRef = "sky_ambient.comp";
 	saDesc.groupCountX = kSkyAmbientSize / 4;
 	saDesc.groupCountY = kSkyAmbientSize / 8;
 	saDesc.shaderBindings = {
@@ -301,7 +304,7 @@ bool BuildFrameGraph(RenderGraph& graph, const rhi::Buffer* vb, const rhi::Buffe
 		Pass::Host, HostPassDesc{});
 
 	ComputePassDesc evalDesc;
-	evalDesc.shader = { rhi::ShaderStage::Compute, kShaderDir + "/boids_eval.comp.spv" };
+	evalDesc.shaderRef = "boids_eval.comp";
 	evalDesc.groupCountX = (kFishCount + kWorkGroupSize - 1) / kWorkGroupSize;
 	evalDesc.shaderBindings = {
 		ShaderBinding::Uniform("BoidsParams"),
@@ -311,7 +314,7 @@ bool BuildFrameGraph(RenderGraph& graph, const rhi::Buffer* vb, const rhi::Buffe
 		Pass::Compute, evalDesc);
 
 	ComputePassDesc updateDesc;
-	updateDesc.shader = { rhi::ShaderStage::Compute, kShaderDir + "/boids_update.comp.spv" };
+	updateDesc.shaderRef = "boids_update.comp";
 	updateDesc.groupCountX = (kFishCount + kWorkGroupSize - 1) / kWorkGroupSize;
 	updateDesc.shaderBindings = {
 		ShaderBinding::Uniform("BoidsParams"),
@@ -330,13 +333,7 @@ bool BuildFrameGraph(RenderGraph& graph, const rhi::Buffer* vb, const rhi::Buffe
 		depth.store = StoreOp::Store;
 		shadowDesc0.attachments.push_back(depth);
 
-		shadowDesc0.pipeline.shaders = {
-			{ rhi::ShaderStage::Vertex,      kShaderDir + "/shadow.vert.spv" },
-			{ rhi::ShaderStage::TessControl, kShaderDir + "/fish.tesc.spv" },
-			{ rhi::ShaderStage::TessEval,    kShaderDir + "/fish.tese.spv" },
-			{ rhi::ShaderStage::Geometry,    kShaderDir + "/shadow.geom.spv" },
-			{ rhi::ShaderStage::Fragment,    kShaderDir + "/shadow.frag.spv" },
-		};
+		shadowDesc0.pipeline.shaderRefs = { "shadow.vert", "fish.tesc", "fish.tese", "shadow.geom", "shadow.frag" };
 		shadowDesc0.pipeline.topology = PrimitiveTopology::PatchList;
 		shadowDesc0.pipeline.tessPatchControlPoints = 3;
 		shadowDesc0.pipeline.cullMode = CullMode::None;
@@ -377,13 +374,7 @@ bool BuildFrameGraph(RenderGraph& graph, const rhi::Buffer* vb, const rhi::Buffe
 		depth.store = StoreOp::Store;
 		sceneDesc.attachments.push_back(depth);
 
-		sceneDesc.pipeline.shaders = {
-			{ rhi::ShaderStage::Vertex,      kShaderDir + "/fish.vert.spv" },
-			{ rhi::ShaderStage::TessControl, kShaderDir + "/fish.tesc.spv" },
-			{ rhi::ShaderStage::TessEval,    kShaderDir + "/fish.tese.spv" },
-			{ rhi::ShaderStage::Geometry,    kShaderDir + "/fish.geom.spv" },
-			{ rhi::ShaderStage::Fragment,    kShaderDir + "/fish.frag.spv" },
-		};
+		sceneDesc.pipeline.shaderRefs = { "fish.vert", "fish.tesc", "fish.tese", "fish.geom", "fish.frag" };
 		sceneDesc.pipeline.topology = PrimitiveTopology::PatchList;
 		sceneDesc.pipeline.tessPatchControlPoints = 3;
 		sceneDesc.pipeline.cullMode = CullMode::None;
@@ -412,10 +403,7 @@ bool BuildFrameGraph(RenderGraph& graph, const rhi::Buffer* vb, const rhi::Buffe
 		color.store = StoreOp::Store;
 		backDesc.attachments.push_back(color);
 
-		backDesc.pipeline.shaders = {
-			{ rhi::ShaderStage::Vertex,   kShaderDir + "/fullscreen.vert.spv" },
-			{ rhi::ShaderStage::Fragment, kShaderDir + "/atmosphere.frag.spv" },
-		};
+		backDesc.pipeline.shaderRefs = { "fullscreen.vert", "atmosphere.frag" };
 		backDesc.pipeline.cullMode = CullMode::None;
 		backDesc.pipeline.depthStencil.depthTestEnable = false;
 
@@ -565,6 +553,22 @@ int main(int argc, char** argv) {
 	cout << "Tessellation=" << (device->SupportsTessellation() ? "yes" : "no")
 	     << " Geometry=" << (device->SupportsGeometryShaders() ? "yes" : "no") << "\n";
 
+	AssetResolver assets;
+	assets.Mount("shaders", kShaderDir);
+	assets.Mount("assets", kAssetDir);
+	ShaderLibrary shaders(assets);
+	{
+		std::vector<std::string> shaderWarnings;
+		if (!shaders.LoadManifest("shaders/shaders.manifest.json", &shaderWarnings)) {
+			for (const auto& warning : shaderWarnings)
+				cerr << "[ShaderLibrary] " << warning << "\n";
+			cerr << "着色器清单加载失败\n";
+			if (window) glfwDestroyWindow(window);
+			if (glfwInitialized) glfwTerminate();
+			return 1;
+		}
+	}
+
 	FishMesh mesh;
 	std::string meshError;
 	if (!LoadFishMesh(kAssetDir + "/lowpoly_fish.glb", mesh, &meshError)) {
@@ -607,7 +611,7 @@ int main(int argc, char** argv) {
 	unique_ptr<rhi::Image> ms;
 	unique_ptr<rhi::Image> sa;
 	unique_ptr<rhi::Buffer> atmoUBO;
-	if (!PrecomputeAtmosphere(*device, atmosphereParams, t2a, ms, sa, atmoUBO)) {
+	if (!PrecomputeAtmosphere(*device, atmosphereParams, t2a, ms, sa, atmoUBO, shaders)) {
 		return 1;
 	}
 
@@ -677,7 +681,7 @@ int main(int argc, char** argv) {
 		}
 
 		if (!graphReady) {
-			graph.emplace(device.get());
+			graph.emplace(device.get(), &shaders);
 			const rhi::Image* backbuffer = currentFrame.has_value() ? currentFrame->backbuffer : nullptr;
 			if (!BuildFrameGraph(*graph, vertexBuffer.get(), indexBuffer.get(),
 				static_cast<uint32_t>(mesh.indices.size()), atmoUBO.get(),

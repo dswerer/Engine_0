@@ -2249,7 +2249,7 @@ std::unique_ptr<Pipeline> Device::CreatePipeline(const GraphicsPipelineDesc& des
 		stages[i].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
 		stages[i].stage = ToVkStage(desc.shaders[i].stage);
 		stages[i].module = modules[i];
-		stages[i].pName = "main";
+		stages[i].pName = desc.shaders[i].entryPoint.c_str();
 	}
 
 	std::vector<VkVertexInputBindingDescription> vkBindings;
@@ -2472,7 +2472,7 @@ std::unique_ptr<Pipeline> Device::CreateComputePipeline(const ComputePipelineDes
 	pipelineCI.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
 	pipelineCI.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
 	pipelineCI.stage.module = module;
-	pipelineCI.stage.pName = "main";
+	pipelineCI.stage.pName = desc.shader.entryPoint.c_str();
 	pipelineCI.layout = pipelineLayout;
 	pipelineCI.basePipelineHandle = VK_NULL_HANDLE;
 	pipelineCI.basePipelineIndex = -1;

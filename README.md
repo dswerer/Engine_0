@@ -9,14 +9,19 @@
 ## 目录
 
 - [快速开始](#快速开始)
+- [使用步骤](#使用步骤)
 - [目录结构](#目录结构)
 - [架构总览](#架构总览)
 - [RHI 用户 API](#rhi-用户-api)
 - [RenderGraph 用户 API](#rendergraph-用户-api)
+- [RenderGraph 前端（Builder）](#rendergraph-前端builder)
+- [资源定位与着色器登记](#资源定位与着色器登记)
+- [渲染图文档（统一格式）](#渲染图文档统一格式)
 - [Pass 类型](#pass-类型)
 - [已实现功能](#已实现功能)
 - [着色器与资源](#着色器与资源)
 - [冒烟测试](#冒烟测试)
+- [示例](#示例)
 - [已知限制](#已知限制)
 - [扩展指南](#扩展指南)
 
@@ -77,6 +82,96 @@ cmake --build out/build/x64-debug
 
 ---
 
+## 使用步骤
+
+以「Host 更新参数 → Compute 模糊 → Render 合成」为例的最短路径。
+
+### 1. 挂载资源目录
+
+```cpp
+AssetResolver assets;
+assets.Mount("shaders", ENGINE_SHADER_DIR);
+assets.Mount("assets",  ENGINE_ASSET_DIR);
+```
+
+### 2. 加载着色器清单
+
+```cpp
+ShaderLibrary shaders(assets);
+std::vector<std::string> warnings;
+if (!shaders.LoadManifest("shaders/shaders.manifest.json", &warnings)) {
+    /* 构建产物缺失：检查 glslc 是否执行 */
+}
+```
+
+新增着色器只需把源文件加入对应目标的 `*_SHADER_SOURCES`，清单与 C++ 引用都无需写路径。
+
+### 3. 创建设备与交换链
+
+```cpp
+auto device = rhi::Device::Create(deviceDesc);
+auto swapchain = device->CreateSwapchain();
+```
+
+### 4. 声明渲染图
+
+```cpp
+RenderGraphBuilder builder(device.get());
+builder.DeclareResource("Color",      colorDesc);
+builder.DeclareResource("Blurred",    blurredDesc);
+builder.DeclareResource("Backbuffer", currentBackbuffer);  // 外部图像，图不拥有
+
+builder.DeclarePass("Update", {}, {"Params"}, Pass::Host,    hostDesc);
+builder.DeclarePass("Blur",   Pass::Compute, blurDesc);     // shaderRef = "blur.comp"
+builder.DeclarePass("ToneMap", Pass::Render, tonemapDesc);  // shaderRefs = { ... }
+
+builder.DeclareTopology(
+    RenderGraphBuilder::Topology::Sequence({ "Update", "Blur", "ToneMap" }));
+
+LowerResult lower = builder.Lower();
+if (!lower.ok) { /* lower.diagnostics 给出原因 */ }
+```
+
+也可以跳过 Builder，直接用 `RenderGraph::RegisterResource` / `RegisterPass` 显式声明读写集。
+
+### 5. 构建并实化
+
+```cpp
+RenderGraph graph(device.get(), &shaders);
+builder.Build(graph);
+graph.ProcessRegister();
+graph.GenerateSubmitSequence();
+graph.RealizeAll();          // 创建资源/管线/描述符并编译屏障
+```
+
+### 6. 每帧提交
+
+```cpp
+auto frame = swapchain->AcquireNextImage();
+if (!frame.acquired) { /* 交换链重建，跳过本帧 */ }
+
+const uint32_t slot = device->BeginFrame();
+graph.BeginFrame(slot);
+graph.SubmitGraph(RenderGraph::FrameSync{ frame.ready, frame.presentReady });
+graph.WaitHostPasses();
+swapchain->Present();
+device->WaitForFrame();
+```
+
+### 7. 保存 / 恢复图（可选）
+
+```cpp
+RenderGraphDocument::Capture(builder).Save("out/graph.json");
+
+auto loaded = RenderGraphDocument::Load("out/graph.json");
+RenderGraphBuilder restored;
+loaded->Restore(restored, externals);   // 外部资源与 Host 回调按名注入
+```
+
+文档只保存声明层；外部图像/缓冲与 Host 回调需在 `Restore` 时提供。
+
+---
+
 ## 目录结构
 
 ```text
@@ -92,6 +187,9 @@ Engine_0/
     ├── RenderGraphNodes.h         # RenderPass/ComputePass/HostPass/Transfer/Mux/Present/Image/Buffer
     ├── RenderGraphNodes.cpp
     ├── RenderGraph.cpp            # 注册校验、拓扑、屏障编译、批划分、录制与提交
+    ├── RenderGraphDocument.h/.cpp # 声明层序列化：Capture / Save / Load / Restore
+    ├── AssetResolver.h/.cpp       # 逻辑路径 -> 绝对路径（挂载前缀、越界校验）
+    ├── ShaderLibrary.h/.cpp       # 逻辑名 -> 阶段 / SPIR-V 路径 / 入口点
     ├── rhi/
     │   ├── RHIDesc.h              # 后端无关描述词表（不含 Vulkan 头）
     │   ├── RHI.h                  # Device/资源/管线/描述符/命令/同步/交换链
@@ -99,6 +197,7 @@ Engine_0/
     ├── shaders/                   # GLSL 源文件（构建期由 glslc 编译）
     ├── assets/                    # 纹理等运行时资源
     ├── examples/retrieve/         # 大气散射 + boids + 阴影复现示例（独立目标）
+    ├── examples/cube_reflection/  # 环境贴图反射示例（独立目标）
     ├── external/                  # 第三方头文件与实现
     └── vmaExporter.cpp            # VMA 实现编译单元
 ```
@@ -109,6 +208,13 @@ Engine_0/
 
 ```text
 宿主代码 / 冒烟测试
+        │
+        ▼
+┌───────────────────────────────────────────┐
+│ RenderGraphBuilder 前端（可选）            │
+│ · 逻辑声明、隐式版本化、Lower / Build      │
+│ · 声明合并、模块编译与实例化               │
+└───────────────────────────────────────────┘
         │
         ▼
 ┌───────────────────────────────────────────┐
@@ -134,6 +240,12 @@ Engine_0/
 ```
 
 两层可以独立使用：只用 RHI 时等价于一个轻量 Vulkan 封装；只用 RenderGraph 时不必手写任何 `vkCmdPipelineBarrier`。
+
+横向辅助模块：
+
+- `AssetResolver`：逻辑路径 → 绝对路径，隔离开发期构建目录与发布期资源包。
+- `ShaderLibrary`：逻辑名 → 阶段 / SPIR-V 路径 / 入口点，由构建期清单驱动。
+- `RenderGraphDocument`：把 Builder 的声明层序列化成稳定 JSON，支持跨机器保存与恢复。
 
 ---
 
@@ -202,7 +314,8 @@ auto device = rhi::Device::Create(desc);
 ### 1. 声明资源与 Pass
 
 ```cpp
-RenderGraph graph(device.get());
+ShaderLibrary shaders(assets);                         // 见「资源定位与着色器登记」
+RenderGraph graph(device.get(), &shaders);             // 可选：启用 shaderRefs 解析
 
 // 自建资源：读者集合、写者、类型、Desc
 graph.RegisterResource("Color",   {"Blur"}, "GBuffer", Resource::Image, colorDesc);
@@ -222,6 +335,9 @@ graph.RegisterPass("Present", {"Backbuffer"}, {},       Pass::Present, PresentPa
 - `AttachmentBinding` 的 `slot` 必须从 0 开始稠密排列；`load` / `store` / `clear` 显式声明。
 - `PassOrder.after` / `.before` 只追加顺序边，不会覆盖真实数据依赖。
 - 顶点/索引流通过 `VertexStreamBinding` / `IndexStreamBinding` 声明，不进入描述符绑定。
+- 着色器用逻辑名声明：`desc.pipeline.shaderRefs = { "fullscreen.vert", "solid.frag" }`、
+  `computeDesc.shaderRef = "blur.comp"`，由构造时传入的 `ShaderLibrary` 在 `RealizePass` 解析；
+  `desc.pipeline.shaders` 仍保留直接路径作为低层入口（例如原始 RHI 冒烟）。
 
 ### 2. 编译
 
@@ -305,6 +421,150 @@ hostPass->SetCallback([](HostContext& ctx) {
 
 ---
 
+## RenderGraph 前端（Builder）
+
+`RenderGraph` 后端要求每个资源显式列出读者/写者，便于精确对账；需要多写者、跨帧复用或模块化组合时，可先用 `RenderGraphBuilder` 做逻辑声明，再 Lower 成后端图。入口同样在 [RenderGraphAbstracted.h](Engine_0/RenderGraphAbstracted.h)。
+
+```cpp
+RenderGraphBuilder builder(device.get());
+
+builder.DeclareResource("Color", colorDesc);
+builder.DeclareResource("Blurred", blurredDesc);
+builder.DeclareResource("Backbuffer", frame.backbuffer,
+                        ResourceOptions{ .initialLayout = rhi::ImageLayout::Undefined });
+
+// Render / Compute / Transfer 的读写集可从 PassDesc 推导
+builder.DeclarePass("GBuffer", Pass::Render, gbufferDesc);
+builder.DeclarePass("Blur",    Pass::Compute, blurDesc);
+builder.DeclarePass("ToneMap", Pass::Render, tonemapDesc);
+// Host / Mux / Present 无法推导，需显式给出读写集
+builder.DeclarePass("Update", std::set<std::string>{}, {"Params"}, Pass::Host,
+                    HostPassDesc{ [](HostContext&) {} });
+
+builder.DeclareTopology(RenderGraphBuilder::Topology::Sequence({ "Update", "GBuffer", "Blur", "ToneMap" }));
+
+LowerResult lower = builder.Lower();
+if (!lower.ok) { /* lower.diagnostics 给出原因 */ }
+builder.Build(graph);      // 只写后端声明，不自动 ProcessRegister
+graph.ProcessRegister();
+graph.RealizeAll();
+```
+
+要点：
+
+- 资源身份是 `(逻辑名, 版本)`：读未写资源为 `v0`（导入版本），每次写生成下一版本；版本对用户隐式。
+- 同一 Pass 内读写同名、多写者未被用户拓扑定序、读者排在所有写者之前且无可读初态，都会产生 `BuilderDiagnostic`。
+- `Lower()` 是纯函数，不接触 `Device`；`Build()` 只注册声明，`ProcessRegister` / `RealizeAll` 由调用方完成。
+- 别名策略：附件 `LoadOp::Load` 的相邻版本强制同块，`crossFrame` 整条版本链强制同块；也可用 `AliasLogicalResources` 手动指定，失败会硬报错。
+- `ImportDeclarations` 在 Lower 之前合并另一份声明，可为导入 Pass 加前缀，并对同名同描述资源去重。
+- 绘制数量不进入声明；`RenderPass::SetDraw` 在 `RealizeAll` 之后按帧设置。
+
+### 模块
+
+`CompileModule` 把当前声明快照编译为只读模块，`Instantiate` 在父 Builder 中按 tag 作用域展开实例：
+
+```cpp
+RenderGraphModule post;
+builder.CompileModule("Post",
+    { {"Scene", ModulePortKind::Input}, {"Out", ModulePortKind::Output} }, &post);
+
+auto inst = builder.Instantiate(post, "postA",
+    { {"Scene", "SceneColor"}, {"Out", "Backbuffer"} });
+builder.DeclareTopology(RenderGraphBuilder::Topology{}.ThenAll(inst->Entries, inst->Exits));
+```
+
+- 端口必须在模块内已声明，且形状（类型 / Desc / 视图 / crossFrame）与父资源一致。
+- 内部资源与 Pass 名按 tag 前缀拼接；允许嵌套模块，内部名可含 `/`。
+- 模块内禁止 Present / Mux；多写者必须在 `CompileModule` 阶段已经定序；模块不单独 Lower。
+
+---
+
+## 资源定位与着色器登记
+
+`AssetResolver` 与 `ShaderLibrary` 位于 RHI 与渲染图之间，负责把逻辑路径 / 逻辑名解析成磁盘文件，避免在 C++ 中散落构建机绝对路径。
+
+### AssetResolver
+
+```cpp
+AssetResolver assets;
+assets.Mount("shaders", ENGINE_SHADER_DIR);   // 前缀 -> 根目录
+assets.Mount("assets",  ENGINE_ASSET_DIR);
+assets.SetFallbackRoot("packed");             // 可选：发布期资源包根目录
+
+auto file = assets.Resolve("shaders/blur.comp.spv");
+// file->absolutePath / file->logicalPath / file->size / file->mtime
+```
+
+- 逻辑路径第一段是挂载前缀，按最长前缀匹配；未匹配时退到兜底根。
+- `Normalize` 拒绝绝对路径、盘符与 `..` 越界，并统一分隔符；失败返回空串。
+- 构造后只读，可多线程共享；错误经 `std::string*` 返回，不抛异常。
+
+### ShaderLibrary
+
+构建期为每个目标生成 `shaders.manifest.json`，与 `glslc` 共用同一份源列表：
+
+```json
+{
+  "version": 1,
+  "shaders": {
+    "fullscreen.vert": { "stage": "Vertex", "path": "shaders/fullscreen.vert.spv", "entry": "main" },
+    "blur.comp": { "stage": "Compute", "path": "shaders/blur.comp.spv", "entry": "main" }
+  }
+}
+```
+
+运行时：
+
+```cpp
+ShaderLibrary shaders(assets);
+std::vector<std::string> warnings;
+shaders.LoadManifest("shaders/shaders.manifest.json", &warnings);
+
+auto stage = shaders.Resolve("blur.comp");    // 阶段 + 绝对路径 + entryPoint
+```
+
+- 阶段可由清单显式给出，也可由 `.vert/.frag/.comp/.tesc/.tese/.geom` 推断；两者冲突时登记失败。
+- `Resolve` 校验文件存在与 SPIR-V 魔数（`0x07230203`），避免把 GLSL 源误配为 `.spv`。
+- `ResolveStages` 批量解析并汇总全部失败原因；`Revision(name)` 返回 mtime/size 供变更检测。
+- `RHI` 侧 `ShaderStageDesc::entryPoint` 默认 `"main"`，不再硬编码入口点。
+
+---
+
+## 渲染图文档（统一格式）
+
+`RenderGraphDocument` 保存 **声明层**：资源、Pass、拓扑边与别名组。注册期回填字段（`resourceId`、`set`/`binding`、`alternativeIds` 等）与外部句柄不落盘，因此同一份文档可在不同机器、不同构建目录之间共享。
+
+```cpp
+RenderGraphDocument doc = RenderGraphDocument::Capture(builder);
+doc.Save("out/graph.json");
+
+auto loaded = RenderGraphDocument::Load("out/graph.json");
+RenderGraphBuilder restored;
+RenderGraphDocument::ExternalBindings externals;
+externals.image = [&](const std::string& name) -> const rhi::Image* { /* ... */ };
+externals.buffer = [&](const std::string& name) -> const rhi::Buffer* { /* ... */ };
+externals.hostCallbacks["update.params"] = [](HostContext&) {};
+loaded->Restore(restored, externals);
+
+LowerResult lower = restored.Lower();   // 校验仍由 Lower 负责
+restored.Build(graph);
+```
+
+文档结构：
+
+- `resources`：名称、类型、`ImageDesc` / `BufferDesc`、view / viewFormat / barrierRange / initialLayout / crossFrame；外部资源只记 `external: "image" | "buffer"`。
+- `passes`：名称、类型、队列、读写集与完整 Desc；着色器只存 `shaderRefs` / `shaderRef` 逻辑名。
+- `edges` / `aliases`：顺序边与别名组，按声明顺序保存。
+
+约束：
+
+- 外部图像 / 缓冲由宿主在 `Restore` 时按资源名注入，缺失返回错误而非静默降级。
+- Host 回调以 `HostPassDesc::callbackKey` 关联，加载时从 `ExternalBindings::hostCallbacks` 查表。
+- 模块实例按展开后的扁平声明保存，模块定义本身不单独持久化。
+- 输出为稳定格式 JSON（字段顺序固定），可直接用于 diff 与 round-trip 比对。
+
+---
+
 ## Pass 类型
 
 | 类型 | Desc | 关键字段 |
@@ -328,13 +588,7 @@ hostPass->SetCallback([](HostContext& ctx) {
 
 ```cpp
 RenderPassDesc desc;
-desc.pipeline.shaders = {
-    { rhi::ShaderStage::Vertex,      shaderDir + "/tess.vert.spv" },
-    { rhi::ShaderStage::TessControl, shaderDir + "/tess.tesc.spv" },
-    { rhi::ShaderStage::TessEval,    shaderDir + "/tess.tese.spv" },
-    { rhi::ShaderStage::Geometry,    shaderDir + "/tess.geom.spv" },
-    { rhi::ShaderStage::Fragment,    shaderDir + "/tess.frag.spv" },
-};
+desc.pipeline.shaderRefs = { "tess.vert", "tess.tesc", "tess.tese", "tess.geom", "tess.frag" };
 desc.pipeline.topology = PrimitiveTopology::PatchList; // 细分管线必须
 desc.pipeline.tessPatchControlPoints = 3;              // 每个 patch 的控制点数
 ```
@@ -351,6 +605,20 @@ Task/Mesh 阶段仍为预留，尚未实现。
 ---
 
 ## 已实现功能
+
+### 前端与模块
+
+- 多写者版本化：隐式版本分配、用户拓扑定序、补边警告与矛盾诊断。
+- `Lower` 纯函数产出后端声明；`Build` 不做实化，失败不留半成品。
+- 前端声明合并：Pass 前缀重写、同名同描述资源去重、顺序边与别名组合并。
+- 模块：`CompileModule` 快照校验（封闭世界、无环、多写者定序、端口规则），`Instantiate` 作用域展开，支持嵌套与 `ThenAll` 接线。
+
+### 资源与文档
+
+- `AssetResolver`：前缀挂载、路径规范化与越界拒绝、开发/打包两种根目录，构造后只读。
+- `ShaderLibrary`：构建期清单、逻辑名解析、阶段推断与冲突检查、SPIR-V 魔数校验、`Revision` 变更检测。
+- 着色器引用：`PipelineDesc::shaderRefs` / `ComputePassDesc::shaderRef`，`RealizePass` 时按 `ShaderLibrary` 解析。
+- `RenderGraphDocument`：声明层 `Capture` / `Save` / `Load` / `Restore`，稳定 JSON 输出，round-trip 逐字节一致。
 
 ### 渲染图与同步
 
@@ -396,7 +664,38 @@ Task/Mesh 阶段仍为预留，尚未实现。
 - 编译期宏 `ENGINE_SHADER_DIR` 指向该目录；`ENGINE_ASSET_DIR` 指向 `Engine_0/assets`。
 - 若未找到 `glslc`，CMake 会跳过着色器编译并给出警告，依赖着色器的冒烟项不会执行。
 
-新增着色器只需把源文件加入 `Engine_0/CMakeLists.txt` 的 `ENGINE_SHADER_SOURCES` 列表。
+### 着色器清单
+
+`Engine_0/CMakeLists.txt` 中的 `engine0_write_shader_manifest` 在配置期生成 `<binary>/shaders/shaders.manifest.json`，条目与 `glslc` 共用同一份 `ENGINE_SHADER_SOURCES`：
+
+```json
+{
+  "version": 1,
+  "shaders": {
+    "fullscreen.vert": { "stage": "Vertex", "path": "shaders/fullscreen.vert.spv", "entry": "main" }
+  }
+}
+```
+
+清单键是 `<文件名>.<GLSL 扩展名>`（如 `blur.comp`），`stage` 由扩展名映射。运行时 `ShaderLibrary::LoadManifest` 读取该文件，Pass 只引用逻辑名。
+
+### 运行期装配
+
+```cpp
+AssetResolver assets;
+assets.Mount("shaders", ENGINE_SHADER_DIR);
+assets.Mount("assets",  ENGINE_ASSET_DIR);
+
+ShaderLibrary shaders(assets);
+if (!shaders.LoadManifest("shaders/shaders.manifest.json", &warnings))
+    /* 构建产物缺失 */;
+
+RenderGraph graph(device.get(), &shaders);
+```
+
+- 主程序、`retrieve`、`cube_reflection` 三个目标各自生成并加载自己的清单。
+- 原始 RHI 管线（`CreatePipeline` / `CreateComputePipeline`）仍可直接传 `ShaderStageDesc` 路径，属于低层逃生口。
+- 新增着色器只需加入对应目标的 `*_SHADER_SOURCES`，清单与 C++ 引用都无需手写路径。
 
 ---
 
@@ -422,6 +721,11 @@ Task/Mesh 阶段仍为预留，尚未实现。
 | 别名 | 共享句柄成功与校验失败降级 |
 | 跨帧持久 | 同一图连续两帧重提交 |
 | 帧循环 | acquire → SubmitGraph → Present → WaitForFrame，连续 3 帧 |
+| MSAA | 4x 颜色附件 + 1x resolve，回读中心像素 |
+| 纹理链路 | stb_image 解码、Host/Transfer 上传、采样绘制 |
+| 前端 Lower / Build | 版本链、补边警告、Load 别名、跨帧别名、失败回滚 |
+| 模块 | CompileModule 校验、作用域实例化、ThenAll 接线、深度 2 嵌套 |
+| 图文档 | Capture → Save → Load → Restore → Capture，JSON 逐字节一致；非法 format 被拒绝 |
 
 预期输出片段：
 
@@ -430,12 +734,15 @@ Device: NVIDIA GeForce RTX 5060 Laptop GPU (Vulkan 1.4)
 Queues: graphics=f0 compute=f2(dedicated) transfer=f1(dedicated) timeline=yes
 Tess/Geom pipeline ok: tess=yes, geom=yes, patchControlPoints=3
 Runtime mux ok: first(red)=ok, second(blue)=ok
+Graph document round-trip ok: 5 resources, 6 passes, 5 edges
 Frame loop ok: 3 frames presented
 ```
 
 ---
 
-## 示例：retrieve 复现
+## 示例
+
+### retrieve 复现
 
 `Engine_0/examples/retrieve/` 是独立构建目标，复现原 `retrieve` 工程实际生效的渲染路径：
 
@@ -472,14 +779,31 @@ Retrieve smoke ok: wrote out/retrieve_smoke.png
 - boids 的 eval/update 公式、常量、`pos += vel * 0.001` 均与原工程一致；`BoidsParams.minSpeed` 默认 0（完全按原工程），可用 `--boids-min-speed 0.5` 打开演示用最低巡游速度。
 - 修复过一个复现 bug：`outvel` 的 CPU 缓冲曾按 `sizeof(vec3) * N`（12N 字节）分配，但 std430 中 `vec3` 数组的步长是 16 字节，导致 id ≥ 768 的鱼越界写。表现正好是 232 条鱼（id 768..999）速度归零、位置和方向停在初始化值；把缓冲改为 `vec4[1024]`、按 16N 分配后，`minSpeed = 0` 下也是 `active=1000/1000`、`zeroVel=0`、`sameAsInitDir=0`。
 
+### cube_reflection
+
+`Engine_0/examples/cube_reflection/` 是最小渲染图用法：`Device::UploadImage` 一次性上载全景环境贴图，`Cube` Pass 绘制带深度测试的旋转立方体，`Composite` Pass 全屏采样环境贴图与场景色，最后交给 `Present`（冒烟模式则走 `Capture` 回读）。
+
+```powershell
+.\out\build\x64-debug\Engine_0\examples\cube_reflection\CubeReflection.exe
+.\out\build\x64-debug\Engine_0\examples\cube_reflection\CubeReflection.exe --smoke 30
+```
+
+冒烟模式输出 `out/cube_reflection_smoke.png`。
+
 ---
 
 ## 已知限制
 
-- MSAA Resolve 仅完成声明校验，执行逻辑尚未实现。
-- 跨队列 barrier 未按 stage/access 细化，同步策略偏保守。
+- 跨队列 release 的 `dstStage` 仍取 `AllCommands`，acquire 的 `srcAccess` 为空；执行顺序由 semaphore 保证，尚未做更细的 stage/access 划分。
 - 交换链格式变化时不会自动重建对应管线，当前依赖格式不变的前提。
-- 静态纹理堆容量受 descriptor indexing 限制，暂未实现分页与多堆回退。
+- 静态纹理堆固定占用 set 0，容量 `kStaticTextureHeapCapacity = 16`；未实现分页与多堆回退。
+- 无自动 mip 链生成；`TransferPass` 只做显式的区域拷贝与 Blit。
+- SPIR-V 反射不支持运行时长度描述符数组（`T[]`），固定长度数组可用。
+- `RenderGraphBuilder::ImportDeclarations` 只合并同名同描述资源，不支持异名资源统一。
+- 模块内禁止 Present / Mux / 静态纹理；模块内多写者须在 `CompileModule` 前定序，端口不能属于别名组。
+- 图文档只保存声明层：外部图像 / 缓冲需宿主在 `Restore` 时按名注入，Host 回调需 `callbackKey` 绑定；模块实例按展开后的名称保存，模块定义不单独持久化。
+- 图文档不保存 mux 运行期选择与 `DrawSource`（绘制数量属于每帧参数）。
+- 着色器清单由构建期生成，运行期不做 GLSL 编译；`ShaderLibrary::Revision` 只提供变更信号，不会自动重建已缓存管线与描述符集。
 - Task / Mesh 着色器阶段尚未实现。
 - 主工程没有内置模型导入器；`retrieve` 示例通过 assimp 读取 glTF，其余测试网格在代码中构造。
 - 当前 `Engine_0.cpp` 是冒烟测试程序，不是持续交互的编辑器或演示器。
@@ -491,8 +815,8 @@ Retrieve smoke ok: wrote out/retrieve_smoke.png
 
 ### 新增一个 Render Pass
 
-1. 在 `shaders/` 添加 SPIR-V 源文件，并加入 `ENGINE_SHADER_SOURCES`。
-2. 构造 `RenderPassDesc`：附件、`ShaderBinding`、顶点/索引流、`PipelineDesc`。
+1. 在 `shaders/` 添加 SPIR-V 源文件，并加入对应目标的 `*_SHADER_SOURCES`（清单自动生成）。
+2. 构造 `RenderPassDesc`：附件、`ShaderBinding`、顶点/索引流、`PipelineDesc`；着色器用 `shaderRefs` 引用逻辑名。
 3. `RegisterPass` 声明读写集，`RegisterResource` 声明资源与读者/写者。
 4. `ProcessRegister` → `GenerateSubmitSequence` → `RealizeAll`。
 5. 运行期用 `RenderPass::SetDraw` 设置绘制数量；需要时用 `SetPassActive` 做执行层裁剪。

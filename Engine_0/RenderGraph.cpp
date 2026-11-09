@@ -1,5 +1,6 @@
 #include "RenderGraphAbstracted.h"
 #include "RenderGraphNodes.h"
+#include "ShaderLibrary.h"
 #include <stdexcept>
 #include <iostream>
 #include <algorithm>
@@ -172,6 +173,8 @@ void RenderGraph::HandleError(ErrorCode code) {
 		std::cerr << "RenderGraph: MSAA 采样数不一致（颜色附件须 samples>1、解算目标须 samples==1，且同 pass 附件采样数须相同）" << std::endl; break;
 	case ErrorCode::ResolveDescMismatch:
 		std::cerr << "RenderGraph: MSAA 解算源与目标的格式/尺寸/层数不一致" << std::endl; break;
+	case ErrorCode::ShaderResolutionFailed:
+		std::cerr << "RenderGraph: 着色器逻辑名解析失败（检查 ShaderLibrary 是否登记、清单是否加载、文件是否存在）" << std::endl; break;
 	default:
 		std::cerr << "RenderGraph: 未知校验错误" << std::endl; break;
 	}
@@ -1892,6 +1895,22 @@ void RenderGraph::RealizeResource(Resource* resource) {
 	}
 }
 
+bool RenderGraph::ResolveShaderRefs(const std::vector<std::string>& refs,
+	std::vector<rhi::ShaderStageDesc>& out) {
+	out.clear();
+	if (m_shaderLibrary == nullptr) {
+		std::cerr << "RenderGraph: shaderRefs 需要 ShaderLibrary（构造时传入或 SetShaderLibrary）\n";
+		return false;
+	}
+	std::vector<std::string> errors;
+	if (!m_shaderLibrary->ResolveStages(refs, &out, &errors)) {
+		for (const auto& error : errors)
+			std::cerr << "[RenderGraph] " << error << "\n";
+		return false;
+	}
+	return true;
+}
+
 void RenderGraph::RealizePass(Pass* pass) {
 	if (m_graphicDevice == nullptr)
 		HandleError(ErrorCode::DeviceNotSet);
@@ -1904,7 +1923,13 @@ void RenderGraph::RealizePass(Pass* pass) {
 		const RenderPassDesc& desc = rp->get_desc();
 
 		rhi::GraphicsPipelineDesc info;
-		info.shaders           = desc.pipeline.shaders;
+		if (!desc.pipeline.shaderRefs.empty()) {
+			if (!ResolveShaderRefs(desc.pipeline.shaderRefs, info.shaders))
+				HandleError(ErrorCode::ShaderResolutionFailed);
+		}
+		else {
+			info.shaders = desc.pipeline.shaders;
+		}
 		info.depthStencil      = desc.pipeline.depthStencil;
 		info.colorStates       = desc.pipeline.colorStates;
 		info.blendConstants    = desc.pipeline.blendConstants;
@@ -1961,7 +1986,15 @@ void RenderGraph::RealizePass(Pass* pass) {
 			return;
 
 		rhi::ComputePipelineDesc info;
-		info.shader = cp->mDesc.shader;
+		if (!cp->mDesc.shaderRef.empty()) {
+			std::vector<rhi::ShaderStageDesc> resolved;
+			if (!ResolveShaderRefs({ cp->mDesc.shaderRef }, resolved))
+				HandleError(ErrorCode::ShaderResolutionFailed);
+			info.shader = resolved.front();
+		}
+		else {
+			info.shader = cp->mDesc.shader;
+		}
 		info.pushConstantSize = cp->mDesc.pushConstantSize;
 		const rhi::DescriptorSetLayout* externalSet0 =
 			cp->mDesc.bindStaticHeap ? m_staticHeapLayout.get() : nullptr;

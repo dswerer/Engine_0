@@ -6,8 +6,14 @@
 add_executable (Engine_0 
 "Engine_0.cpp" 
 "Engine_0.h" 
+"AssetResolver.h"
+"AssetResolver.cpp"
+"ShaderLibrary.h"
+"ShaderLibrary.cpp"
 "RenderGraphDesc.h" 
 "RenderGraphAbstracted.h" 
+"RenderGraphDocument.h"
+"RenderGraphDocument.cpp"
 "RenderGraph.cpp" 
 "RenderGraphNodes.h" 
 "RenderGraphNodes.cpp" 
@@ -44,6 +50,38 @@ target_link_libraries(Engine_0 PUBLIC
 	glfw
 	glm::glm)
 
+# ---- Shader 清单：逻辑名 -> { stage, path }，与 glslc 共用同一份源列表 ----
+# 运行期由 ShaderLibrary 读取，避免在 C++ 中硬编码 SPIR-V 路径。
+function(engine0_write_shader_manifest manifest_path)
+	get_filename_component(manifest_dir "${manifest_path}" DIRECTORY)
+	file(MAKE_DIRECTORY "${manifest_dir}")
+	set(entries "")
+	foreach(src ${ARGN})
+		get_filename_component(name "${src}" NAME_WE)
+		get_filename_component(ext "${src}" EXT)
+		string(TOLOWER "${ext}" ext_lower)
+		if(ext_lower STREQUAL ".vert")
+			set(stage "Vertex")
+		elseif(ext_lower STREQUAL ".frag")
+			set(stage "Fragment")
+		elseif(ext_lower STREQUAL ".comp")
+			set(stage "Compute")
+		elseif(ext_lower STREQUAL ".tesc")
+			set(stage "TessControl")
+		elseif(ext_lower STREQUAL ".tese")
+			set(stage "TessEval")
+		elseif(ext_lower STREQUAL ".geom")
+			set(stage "Geometry")
+		else()
+			message(WARNING "未知着色器扩展名 ${ext}：${src}")
+			set(stage "Unknown")
+		endif()
+		list(APPEND entries "    \"${name}${ext}\": { \"stage\": \"${stage}\", \"path\": \"shaders/${name}${ext}.spv\", \"entry\": \"main\" }")
+	endforeach()
+	string(JOIN ",\n" body ${entries})
+	file(WRITE "${manifest_path}" "{\n  \"version\": 1,\n  \"shaders\": {\n${body}\n  }\n}\n")
+endfunction()
+
 # ---- Shader 编译：GLSL -> SPIR-V（glslc，Vulkan SDK 自带）----
 # 优先用 find_package(Vulkan) 已定位的 glslc；兜底按 VULKAN_SDK 环境变量搜索
 set(ENGINE_SHADER_DIR "${CMAKE_BINARY_DIR}/shaders")
@@ -65,6 +103,8 @@ set(ENGINE_SHADER_SOURCES
 	"${CMAKE_CURRENT_SOURCE_DIR}/shaders/tess.tese"
 	"${CMAKE_CURRENT_SOURCE_DIR}/shaders/tess.geom"
 	"${CMAKE_CURRENT_SOURCE_DIR}/shaders/tess.frag")
+
+engine0_write_shader_manifest("${ENGINE_SHADER_DIR}/shaders.manifest.json" ${ENGINE_SHADER_SOURCES})
 
 if (Vulkan_GLSLC_EXECUTABLE)
 	set(ENGINE_GLSLC "${Vulkan_GLSLC_EXECUTABLE}")

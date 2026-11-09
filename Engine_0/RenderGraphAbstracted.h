@@ -15,6 +15,7 @@
 // 渲染图抽象层：Resource / Pass 基类与 RenderGraph 本体。
 namespace dEngine {
 	class RenderGraph;
+	class ShaderLibrary;
 
 	// 合并任务：声明期合并两张尚未 ProcessRegister 的图，只表达参与者、资源统表、顺序与归属。
 	enum class MergeOrder {
@@ -400,6 +401,8 @@ namespace dEngine {
 		rhi::Device* Device() const { return m_device; }
 
 	private:
+		friend class RenderGraphDocument;
+
 		struct ResourceDecl {
 			std::string       name;
 			Resource::Type    type = Resource::None;
@@ -502,10 +505,15 @@ namespace dEngine {
 			PassIoNotDerivable,
 			ResolveAttachmentUnpaired,
 			ResolveSampleCountMismatch,
-			ResolveDescMismatch
+			ResolveDescMismatch,
+			ShaderResolutionFailed
 		};
 		RenderGraph() :pass_top_id(-1), resource_top_id(-1), m_graphicDevice(nullptr) {}
 		RenderGraph(rhi::Device* device):pass_top_id(-1),resource_top_id(-1),m_graphicDevice(device) {}
+		// 可选着色器登记表：PassDesc.shaderRefs / ComputePassDesc.shaderRef 经它解析成 SPIR-V 路径
+		RenderGraph(rhi::Device* device, const ShaderLibrary* shaders)
+			: pass_top_id(-1), resource_top_id(-1), m_graphicDevice(device), m_shaderLibrary(shaders) {}
+		void SetShaderLibrary(const ShaderLibrary* shaders) { m_shaderLibrary = shaders; }
 		// 显式顺序约束：after 须在本 Pass 之前，before 须在其之后，只增边不覆盖依赖。
 		struct PassOrder {
 			std::set<std::string> after;
@@ -664,6 +672,9 @@ namespace dEngine {
 		void RealizeShaderSets(rhi::Pipeline& pipeline, std::vector<ShaderBinding>& shaderBindings,
 			std::vector<std::unique_ptr<rhi::DescriptorSet>>& sets, PassTopology& topo,
 			uint32_t firstSetIndex = 0);
+		// 把 PassDesc 的逻辑名解析成 RHI 阶段描述；失败打印原因并返回 false
+		bool ResolveShaderRefs(const std::vector<std::string>& refs,
+			std::vector<rhi::ShaderStageDesc>& out);
 		rhi::Sampler* AcquireSampler(const rhi::SamplerDesc& desc);
 		void ValidateAttachments(const std::set<uint32_t>& read, const std::set<uint32_t>& write,
 			const RenderPassDesc& desc);
@@ -720,6 +731,8 @@ namespace dEngine {
 			}
 		};
 		std::map<SamplerKey, std::unique_ptr<rhi::Sampler>> m_samplers;
+
+		const ShaderLibrary* m_shaderLibrary = nullptr;
 
 		std::unique_ptr<rhi::DescriptorSetLayout> m_staticHeapLayout;
 		std::unique_ptr<rhi::DescriptorSet>       m_staticHeapSet;

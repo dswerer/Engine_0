@@ -4,6 +4,8 @@ add_executable(CubeReflection
 	"main.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/../../RenderGraph.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/../../RenderGraphNodes.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../AssetResolver.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../ShaderLibrary.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/../../rhi/RHI.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/../../vmaExporter.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/../../external/spv_reflect/spirv_reflect.c")
@@ -39,6 +41,8 @@ set(CUBE_REFLECTION_SHADER_SOURCES
 	"${CMAKE_CURRENT_SOURCE_DIR}/shaders/cube.vert"
 	"${CMAKE_CURRENT_SOURCE_DIR}/shaders/cube.frag"
 	"${CMAKE_CURRENT_SOURCE_DIR}/shaders/composite.frag")
+
+engine0_write_shader_manifest("${CUBE_REFLECTION_SHADER_DIR}/shaders.manifest.json" ${CUBE_REFLECTION_SHADER_SOURCES})
 
 if (Vulkan_GLSLC_EXECUTABLE)
 	set(CUBE_REFLECTION_GLSLC "${Vulkan_GLSLC_EXECUTABLE}")

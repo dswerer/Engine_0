@@ -169,6 +169,9 @@ namespace dEngine {
 
 	// 管线状态：shader 与固定功能；附件格式与描述符布局由引擎推导。
 	struct PipelineDesc {
+		// 逻辑名（ShaderLibrary 登记键，如 "blur.comp"）：非空时优先，RealizePass 解析成 SPIR-V 路径
+		std::vector<std::string> shaderRefs;
+		// 直接 SPIR-V 路径（低层逃生口：不经 ShaderLibrary 时使用）
 		std::vector<ShaderStageDesc> shaders; // 各阶段 SPIR-V 路径（离线 glslc 产出；组合合法性由 RHI 校验）
 
 		// 顶点输入：两向量留空 = 按反射派生单流交错布局。
@@ -234,7 +237,9 @@ namespace dEngine {
 	// 计算 Pass：单 compute shader + 工作组数，绑定按名对账。
 	struct ComputePassDesc {
 		std::vector<ShaderBinding> shaderBindings;
-		ShaderStageDesc            shader;
+		// 逻辑名（ShaderLibrary 登记键）：非空时优先于 shader 的直接路径
+		std::string                shaderRef;
+		ShaderStageDesc            shader { rhi::ShaderStage::Compute, {} };
 		uint32_t                   pushConstantSize = 0;
 		uint32_t                   groupCountX = 1;
 		uint32_t                   groupCountY = 1;
@@ -252,6 +257,8 @@ namespace dEngine {
 	// Host Pass：纯 CPU 回调（不录命令），写边记为 HostWrite。
 	struct HostPassDesc {
 		std::function<void(HostContext&)> callback;
+		// 序列化键：非空时由宿主在加载文档时按此键注入回调
+		std::string callbackKey;
 	};
 
 	// 传输 Pass：单次拷贝，两端即拓扑读/写边，方向决定资源类型。

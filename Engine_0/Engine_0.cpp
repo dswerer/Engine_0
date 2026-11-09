@@ -1,6 +1,9 @@
 #include "Engine_0.h"
 #include "RenderGraphAbstracted.h"
 #include "RenderGraphNodes.h"
+#include "RenderGraphDocument.h"
+#include "AssetResolver.h"
+#include "ShaderLibrary.h"
 #include "rhi/RHI.h"
 #define STB_IMAGE_IMPLEMENTATION
 #include "external/stb_image/stb_image.h"
@@ -11,6 +14,7 @@
 
 #include <iostream>
 #include <cstring>
+#include <filesystem>
 
 using namespace std;
 using namespace dEngine;
@@ -881,6 +885,127 @@ int main()
 		cout << "Nested module ok: depth-2 scoping and port pass-through\n";
 	}
 
+	// 图文档 round-trip：声明层 Capture -> Save -> Load -> Restore -> Capture，要求 JSON 完全一致
+	{
+		RenderGraphBuilder docBuilder;
+
+		ImageDesc docColor;
+		docColor.width = 320;
+		docColor.height = 180;
+		docColor.mipLevels = 3;
+		docColor.format = ImageFormat::RGBA16F;
+		ResourceOptions docColorOptions;
+		docColorOptions.view = ImageSubresource{ 0, 0 };
+		docColorOptions.initialLayout = rhi::ImageLayout::Undefined;
+		docBuilder.DeclareResource("Color", docColor, docColorOptions);
+		docBuilder.DeclareResource("ColorAlt", docColor, docColorOptions);
+
+		BufferDesc docParams;
+		docParams.size = 512;
+		docParams.usage = BufferUsage::Uniform | BufferUsage::TransferDst;
+		docParams.hostVisible = true;
+		docParams.crossFrame = true;
+		docBuilder.DeclareResource("Params", docParams);
+
+		BufferDesc docSrc;
+		docSrc.size = 256;
+		docSrc.usage = BufferUsage::TransferSrc;
+		docBuilder.DeclareResource("SrcBuf", docSrc);
+
+		BufferDesc docDst;
+		docDst.size = 256;
+		docDst.usage = BufferUsage::TransferDst;
+		docBuilder.DeclareResource("DstBuf", docDst);
+
+		HostPassDesc docHost;
+		docHost.callbackKey = "update.params";
+		docBuilder.DeclarePass("Update", {}, { "Params" }, Pass::Host, docHost);
+
+		RenderPassDesc docRender;
+		{
+			AttachmentBinding color;
+			color.resourceName = "Color";
+			color.slot = 0;
+			color.load = LoadOp::Clear;
+			color.clear.value = std::array<float, 4>{ 0.1f, 0.2f, 0.3f, 1.0f };
+			docRender.attachments.push_back(color);
+
+			ShaderBinding uniform;
+			uniform.resourceName = "Params";
+			uniform.usage = Usage::UniformRead;
+			docRender.shaderBindings.push_back(uniform);
+
+			docRender.pipeline.shaderRefs = { "fullscreen.vert", "solid.frag" };
+			docRender.pipeline.cullMode = CullMode::None;
+			docRender.pipeline.depthStencil.depthTestEnable = false;
+			docRender.pipeline.depthStencil.depthWriteEnable = false;
+			docRender.pushConstantData = { 1, 2, 3, 4 };
+		}
+		docBuilder.DeclarePass("Draw", { "Params" }, { "Color" }, Pass::Render, docRender);
+
+		ComputePassDesc docCompute;
+		docCompute.shaderRef = "blur.comp";
+		docCompute.shaderBindings = {
+			ShaderBinding::Sampled("Color", rhi::SamplerDesc::Linear()),
+			ShaderBinding::StorageWrite("Params") };
+		docCompute.groupCountX = 8;
+		docCompute.groupCountY = 8;
+		docCompute.groupCountZ = 1;
+		docBuilder.DeclarePass("Blur", { "Color" }, { "Params" }, Pass::Compute, docCompute);
+
+		TransferPassDesc docTransfer;
+		docTransfer.kind = TransferKind::BufferToBuffer;
+		docTransfer.sourceName = "SrcBuf";
+		docTransfer.destName = "DstBuf";
+		docTransfer.byteSize = 256;
+		docBuilder.DeclarePass("Copy", { "SrcBuf" }, { "DstBuf" }, Pass::Transfer, docTransfer);
+
+		MuxPassDesc docMux;
+		docMux.alternatives = { "Color", "ColorAlt" };
+		docBuilder.DeclarePass("Select", { "Color" }, { "ColorAlt" }, Pass::Mux, docMux);
+		docBuilder.DeclarePass("Present", { "ColorAlt" }, { "ColorAlt" }, Pass::Present, PresentPassDesc{});
+
+		docBuilder.DeclareTopology(RenderGraphBuilder::Topology::Sequence(
+			{ "Update", "Draw", "Blur", "Copy", "Select", "Present" }));
+		docBuilder.AliasLogicalResources({ "Color", "ColorAlt" });
+
+		const RenderGraphDocument document = RenderGraphDocument::Capture(docBuilder);
+		std::error_code fsError;
+		std::filesystem::create_directories("out", fsError);
+		const std::string docPath = "out/rendergraph_document_smoke.json";
+		std::string docError;
+		if (!document.Save(docPath, &docError)) {
+			cerr << "Graph document failed: " << docError << "\n";
+			return 1;
+		}
+		const auto loadedDocument = RenderGraphDocument::Load(docPath, &docError);
+		if (!loadedDocument || loadedDocument->ToJson() != document.ToJson()) {
+			cerr << "Graph document failed: save/load mismatch " << docError << "\n";
+			return 1;
+		}
+
+		RenderGraphBuilder restoredBuilder;
+		RenderGraphDocument::ExternalBindings externals;
+		externals.hostCallbacks["update.params"] = [](HostContext&) {};
+		std::vector<std::string> restoreErrors;
+		if (!loadedDocument->Restore(restoredBuilder, externals, &restoreErrors)) {
+			cerr << "Graph document failed: restore"
+			     << (restoreErrors.empty() ? "" : " - " + restoreErrors.front()) << "\n";
+			return 1;
+		}
+		const RenderGraphDocument restoredDocument = RenderGraphDocument::Capture(restoredBuilder);
+		if (restoredDocument.ToJson() != document.ToJson()) {
+			cerr << "Graph document failed: round-trip mismatch\n";
+			return 1;
+		}
+		if (RenderGraphDocument::FromJson("{ \"format\": \"other\" }").has_value()) {
+			cerr << "Graph document failed: invalid document accepted\n";
+			return 1;
+		}
+		cout << "Graph document round-trip ok: " << document.ResourceCount() << " resources, "
+		     << document.PassCount() << " passes, " << document.EdgeCount() << " edges\n";
+	}
+
 	if (!glfwInit()) {
 		cerr << "glfwInit 失败\n";
 		return 1;
@@ -902,8 +1027,6 @@ int main()
 		cout << "Device: " << device->DeviceName()
 		     << " (Vulkan " << (api >> 22) << "." << ((api >> 12) & 0x3FF) << ")\n";
 
-		RenderGraph graph(device.get());
-
 #ifdef ENGINE_SHADER_DIR
 		const std::string shaderDir = ENGINE_SHADER_DIR;
 #else
@@ -914,6 +1037,21 @@ int main()
 #else
 		const std::string assetDir;
 #endif
+
+		AssetResolver assets;
+		assets.Mount("shaders", shaderDir);
+		assets.Mount("assets", assetDir);
+		ShaderLibrary shaders(assets);
+		{
+			std::vector<std::string> shaderWarnings;
+			if (!shaders.LoadManifest("shaders/shaders.manifest.json", &shaderWarnings)) {
+				for (const auto& warning : shaderWarnings)
+					cerr << "[ShaderLibrary] " << warning << "\n";
+				cerr << "着色器清单加载失败（检查构建产物 shaders.manifest.json）\n";
+				return 1;
+			}
+		}
+		RenderGraph graph(device.get(), &shaders);
 
 		RenderPassDesc gbufferDesc;
 		{
@@ -931,10 +1069,7 @@ int main()
 			depthAtt.clear.value = DepthStencilValue{ 1.0f, 0 };
 			gbufferDesc.attachments.push_back(depthAtt);
 
-			gbufferDesc.pipeline.shaders = {
-				{ rhi::ShaderStage::Vertex,   shaderDir + "/fullscreen.vert.spv" },
-				{ rhi::ShaderStage::Fragment, shaderDir + "/solid.frag.spv" },
-			};
+			gbufferDesc.pipeline.shaderRefs = { "fullscreen.vert", "solid.frag" };
 			gbufferDesc.pipeline.cullMode = CullMode::None;
 		}
 
@@ -951,10 +1086,7 @@ int main()
 			sb.resourceName = "Blurred";
 			tonemapDesc.shaderBindings.push_back(sb);
 
-			tonemapDesc.pipeline.shaders = {
-				{ rhi::ShaderStage::Vertex,   shaderDir + "/fullscreen.vert.spv" },
-				{ rhi::ShaderStage::Fragment, shaderDir + "/textured.frag.spv" },
-			};
+			tonemapDesc.pipeline.shaderRefs = { "fullscreen.vert", "textured.frag" };
 			tonemapDesc.pipeline.cullMode = CullMode::None;
 		}
 
@@ -970,7 +1102,7 @@ int main()
 			out.usage = Usage::StorageWrite;
 			blurDesc.shaderBindings.push_back(out);
 
-			blurDesc.shader = { rhi::ShaderStage::Compute, shaderDir + "/blur.comp.spv" };
+			blurDesc.shaderRef = "blur.comp";
 			blurDesc.groupCountX = 1920 / 8;
 			blurDesc.groupCountY = 1080 / 8;
 		}
@@ -1136,7 +1268,7 @@ int main()
 
 				bool ok = false;
 				if (patchVB && tessOut) {
-					RenderGraph tessGraph(device.get());
+					RenderGraph tessGraph(device.get(), &shaders);
 
 					RenderPassDesc tessDesc;
 					{
@@ -1147,13 +1279,7 @@ int main()
 						att.clear.value = std::array<float, 4>{ 0.0f, 0.0f, 0.0f, 1.0f };
 						tessDesc.attachments.push_back(att);
 
-						tessDesc.pipeline.shaders = {
-							{ rhi::ShaderStage::Vertex,      shaderDir + "/tess.vert.spv" },
-							{ rhi::ShaderStage::TessControl, shaderDir + "/tess.tesc.spv" },
-							{ rhi::ShaderStage::TessEval,    shaderDir + "/tess.tese.spv" },
-							{ rhi::ShaderStage::Geometry,    shaderDir + "/tess.geom.spv" },
-							{ rhi::ShaderStage::Fragment,    shaderDir + "/tess.frag.spv" },
-						};
+						tessDesc.pipeline.shaderRefs = { "tess.vert", "tess.tesc", "tess.tese", "tess.geom", "tess.frag" };
 						tessDesc.pipeline.topology = PrimitiveTopology::PatchList;
 						tessDesc.pipeline.tessPatchControlPoints = 3;
 						tessDesc.pipeline.cullMode = CullMode::None;
@@ -1183,7 +1309,7 @@ int main()
 					tessGraph.SubmitGraph();
 					device->WaitForFrame();
 
-					RenderGraph tessRead(device.get());
+					RenderGraph tessRead(device.get(), &shaders);
 					TransferPassDesc tessBack;
 					tessBack.kind = TransferKind::ImageToBuffer;
 					tessBack.sourceName = "Frame";
@@ -1234,7 +1360,7 @@ int main()
 
 			bool ok = false;
 			if (pcOut) {
-				RenderGraph pcGraph(device.get());
+				RenderGraph pcGraph(device.get(), &shaders);
 				RenderPassDesc pcDesc;
 				{
 					AttachmentBinding att;
@@ -1244,10 +1370,7 @@ int main()
 					att.clear.value = std::array<float, 4>{ 0.0f, 0.0f, 0.0f, 1.0f };
 					pcDesc.attachments.push_back(att);
 
-					pcDesc.pipeline.shaders = {
-						{ rhi::ShaderStage::Vertex,   shaderDir + "/fullscreen.vert.spv" },
-						{ rhi::ShaderStage::Fragment, shaderDir + "/push_constant.frag.spv" },
-					};
+					pcDesc.pipeline.shaderRefs = { "fullscreen.vert", "push_constant.frag" };
 					pcDesc.pipeline.cullMode = CullMode::None;
 					pcDesc.pipeline.depthStencil.depthTestEnable = false;
 					pcDesc.pipeline.pushConstantSize = sizeof(float) * 4;
@@ -1275,7 +1398,7 @@ int main()
 				pcGraph.SubmitGraph();
 				device->WaitForFrame();
 
-				RenderGraph pcRead(device.get());
+				RenderGraph pcRead(device.get(), &shaders);
 				TransferPassDesc backDesc;
 				backDesc.kind = TransferKind::ImageToBuffer;
 				backDesc.sourceName = "Frame";
@@ -1455,7 +1578,7 @@ int main()
 			graphOutInfo.usage = rhi::ImageUsage::Storage | rhi::ImageUsage::Sampled;
 			auto graphOut = device->CreateImage(graphOutInfo);
 			if (blurTex && graphOut) {
-				RenderGraph computeGraph(device.get());
+				RenderGraph computeGraph(device.get(), &shaders);
 
 				ComputePassDesc graphBlur;
 				{
@@ -1469,7 +1592,7 @@ int main()
 					out.usage = Usage::StorageWrite;
 					graphBlur.shaderBindings.push_back(out);
 
-					graphBlur.shader = { rhi::ShaderStage::Compute, shaderDir + "/blur.comp.spv" };
+					graphBlur.shaderRef = "blur.comp";
 					graphBlur.groupCountX = 64 / 8;
 					graphBlur.groupCountY = 64 / 8;
 				}
@@ -1519,7 +1642,7 @@ int main()
 			}
 
 			{
-				RenderGraph uboGraph(device.get());
+				RenderGraph uboGraph(device.get(), &shaders);
 
 				RenderPassDesc tintDesc;
 				{
@@ -1535,10 +1658,7 @@ int main()
 					ub.usage = Usage::UniformRead;
 					tintDesc.shaderBindings.push_back(ub);
 
-					tintDesc.pipeline.shaders = {
-						{ rhi::ShaderStage::Vertex,   shaderDir + "/fullscreen.vert.spv" },
-						{ rhi::ShaderStage::Fragment, shaderDir + "/ubo.frag.spv" },
-					};
+					tintDesc.pipeline.shaderRefs = { "fullscreen.vert", "ubo.frag" };
 					tintDesc.pipeline.cullMode = CullMode::None;
 				}
 
@@ -1601,7 +1721,7 @@ int main()
 				auto outB = device->CreateImage(outInfo);
 
 				if (vb && ib && args && outA && outB) {
-					RenderGraph drawGraph(device.get());
+					RenderGraph drawGraph(device.get(), &shaders);
 
 					RenderPassDesc meshPass;
 					{
@@ -1612,10 +1732,7 @@ int main()
 						att.clear.value = std::array<float, 4>{ 0.05f, 0.05f, 0.08f, 1.0f };
 						meshPass.attachments.push_back(att);
 
-						meshPass.pipeline.shaders = {
-							{ rhi::ShaderStage::Vertex,   shaderDir + "/mesh.vert.spv" },
-							{ rhi::ShaderStage::Fragment, shaderDir + "/mesh.frag.spv" },
-						};
+						meshPass.pipeline.shaderRefs = { "mesh.vert", "mesh.frag" };
 						meshPass.pipeline.topology = PrimitiveTopology::TriangleList;
 						meshPass.pipeline.depthStencil.depthTestEnable = false;
 						meshPass.pipeline.cullMode = CullMode::None;
@@ -1672,7 +1789,7 @@ int main()
 					cout << "Graph render ok: direct-indexed + indirect-indexed draws\n";
 
 					{
-						RenderGraph readbackGraph(device.get());
+						RenderGraph readbackGraph(device.get(), &shaders);
 
 						TransferPassDesc backDesc;
 						backDesc.kind = TransferKind::ImageToBuffer;
@@ -1730,7 +1847,7 @@ int main()
 
 			// MSAA：4x 颜色附件 + 1x 解算目标（dynamic rendering resolve），回读校验
 			{
-				RenderGraph msaaGraph(device.get());
+				RenderGraph msaaGraph(device.get(), &shaders);
 
 				ImageDesc msaaDesc;
 				msaaDesc.width = 64; msaaDesc.height = 64;
@@ -1754,10 +1871,7 @@ int main()
 					resolve.slot = 0;
 					fillDesc.attachments.push_back(resolve);
 
-					fillDesc.pipeline.shaders = {
-						{ rhi::ShaderStage::Vertex,   shaderDir + "/fullscreen.vert.spv" },
-						{ rhi::ShaderStage::Fragment, shaderDir + "/solid.frag.spv" },
-					};
+					fillDesc.pipeline.shaderRefs = { "fullscreen.vert", "solid.frag" };
 					fillDesc.pipeline.cullMode = CullMode::None;
 				}
 
@@ -1829,7 +1943,7 @@ int main()
 				else {
 					const uint64_t stagingBytes = static_cast<uint64_t>(texW) * texH * 4;
 
-					RenderGraph texGraph(device.get());
+					RenderGraph texGraph(device.get(), &shaders);
 
 					texGraph.RegisterPass("UploadHost", {}, { "Staging" }, Pass::Host, HostPassDesc{});
 
@@ -1859,10 +1973,7 @@ int main()
 						texBinding.sampler = sampler;
 						sampleDesc.shaderBindings.push_back(texBinding);
 
-						sampleDesc.pipeline.shaders = {
-							{ rhi::ShaderStage::Vertex,   shaderDir + "/fullscreen.vert.spv" },
-							{ rhi::ShaderStage::Fragment, shaderDir + "/texture.frag.spv" },
-						};
+						sampleDesc.pipeline.shaderRefs = { "fullscreen.vert", "texture.frag" };
 						sampleDesc.pipeline.cullMode = CullMode::None;
 					}
 					texGraph.RegisterPass("Sample", { "Texture" }, { "Out" }, Pass::Render, sampleDesc);
@@ -1945,7 +2056,7 @@ int main()
 				const uint64_t mip0Bytes = 64ull * 64ull * 4ull;
 				const uint64_t mip1Bytes = 32ull * 32ull * 4ull;
 
-				RenderGraph regionGraph(device.get());
+				RenderGraph regionGraph(device.get(), &shaders);
 
 				BufferDesc srcDesc;
 				srcDesc.size = mip0Bytes + mip1Bytes;
@@ -2073,7 +2184,7 @@ int main()
 			}
 
 			{
-				RenderGraph mipClearGraph(device.get());
+				RenderGraph mipClearGraph(device.get(), &shaders);
 
 				ImageDesc mipDesc;
 				mipDesc.width = 64; mipDesc.height = 64;
@@ -2133,7 +2244,7 @@ int main()
 			}
 
 			{
-				RenderGraph hostMipGraph(device.get());
+				RenderGraph hostMipGraph(device.get(), &shaders);
 
 				ImageDesc hostDesc;
 				hostDesc.width = 64; hostDesc.height = 64;
@@ -2208,7 +2319,7 @@ int main()
 			}
 
 			{
-				RenderGraph layerGraph(device.get());
+				RenderGraph layerGraph(device.get(), &shaders);
 
 				ImageDesc layerDesc;
 				layerDesc.width = 16; layerDesc.height = 16;
@@ -2341,7 +2452,7 @@ int main()
 						device->Submit(initSubmit);
 						device->WaitForFrame();
 
-						RenderGraph heapGraph(device.get());
+						RenderGraph heapGraph(device.get(), &shaders);
 
 						const uint32_t slotA = heapGraph.RegisterStaticTexture("StaticA", *texA);
 						const uint32_t slotB = heapGraph.RegisterStaticTexture("StaticB", *texB);
@@ -2355,10 +2466,7 @@ int main()
 							att.clear.value = std::array<float, 4>{ 0.0f, 0.0f, 0.0f, 1.0f };
 							heapDesc.attachments.push_back(att);
 
-							heapDesc.pipeline.shaders = {
-								{ rhi::ShaderStage::Vertex,   shaderDir + "/fullscreen.vert.spv" },
-								{ rhi::ShaderStage::Fragment, shaderDir + "/static_texture.frag.spv" },
-							};
+							heapDesc.pipeline.shaderRefs = { "fullscreen.vert", "static_texture.frag" };
 							heapDesc.pipeline.cullMode = CullMode::None;
 							heapDesc.pipeline.depthStencil.depthTestEnable = false;
 							heapDesc.bindStaticHeap = true;
@@ -2389,7 +2497,7 @@ int main()
 						     << " bindless=" << (device->SupportsBindlessTextures() ? "yes" : "no") << "\n";
 
 						{
-							RenderGraph readbackGraph(device.get());
+							RenderGraph readbackGraph(device.get(), &shaders);
 							TransferPassDesc backDesc;
 							backDesc.kind = TransferKind::ImageToBuffer;
 							backDesc.sourceName = "Frame";
@@ -2444,7 +2552,7 @@ int main()
 			}
 
 			{
-				RenderGraph stateGraph(device.get());
+				RenderGraph stateGraph(device.get(), &shaders);
 
 				RenderPassDesc dualDesc;
 				{
@@ -2462,10 +2570,7 @@ int main()
 					attB.clear.value = std::array<float, 4>{ 0.0f, 0.0f, 0.0f, 1.0f };
 					dualDesc.attachments.push_back(attB);
 
-					dualDesc.pipeline.shaders = {
-						{ rhi::ShaderStage::Vertex,   shaderDir + "/fullscreen.vert.spv" },
-						{ rhi::ShaderStage::Fragment, shaderDir + "/dual_output.frag.spv" },
-					};
+					dualDesc.pipeline.shaderRefs = { "fullscreen.vert", "dual_output.frag" };
 					dualDesc.pipeline.cullMode = CullMode::None;
 					dualDesc.pipeline.depthStencil.depthTestEnable = false;
 
@@ -2534,7 +2639,7 @@ int main()
 			}
 
 			{
-				RenderGraph sameQueueGraph(device.get());
+				RenderGraph sameQueueGraph(device.get(), &shaders);
 				ComputePassDesc emptyCompute;
 				emptyCompute.shader = { rhi::ShaderStage::Compute, "" };
 				RenderGraph::PassOrder headFirst;
@@ -2570,7 +2675,7 @@ int main()
 				     << "\n";
 			}
 			{
-				RenderGraph crossQueueGraph(device.get());
+				RenderGraph crossQueueGraph(device.get(), &shaders);
 				ComputePassDesc emptyCompute;
 				emptyCompute.shader = { rhi::ShaderStage::Compute, "" };
 				RenderGraph::PassOrder computeFirst;
@@ -2636,7 +2741,7 @@ int main()
 					device->Submit(muxInitSubmit);
 					device->WaitForFrame();
 
-					RenderGraph muxGraph(device.get());
+					RenderGraph muxGraph(device.get(), &shaders);
 					ImageDesc muxOutDesc;
 					muxOutDesc.width = 64; muxOutDesc.height = 64;
 					muxOutDesc.format = ImageFormat::RGBA8;
@@ -2662,10 +2767,7 @@ int main()
 						ShaderBinding sb;
 						sb.resourceName = "MuxOut";
 						muxSampleDesc.shaderBindings.push_back(sb);
-						muxSampleDesc.pipeline.shaders = {
-							{ rhi::ShaderStage::Vertex,   shaderDir + "/fullscreen.vert.spv" },
-							{ rhi::ShaderStage::Fragment, shaderDir + "/mux_sample.frag.spv" },
-						};
+						muxSampleDesc.pipeline.shaderRefs = { "fullscreen.vert", "mux_sample.frag" };
 						muxSampleDesc.pipeline.cullMode = CullMode::None;
 						muxSampleDesc.pipeline.depthStencil.depthTestEnable = false;
 					}
@@ -2788,7 +2890,7 @@ int main()
 					device->Submit(initSubmit);
 					device->WaitForFrame();
 
-					RenderGraph storageMuxGraph(device.get());
+					RenderGraph storageMuxGraph(device.get(), &shaders);
 
 					ImageDesc storeOutDesc;
 					storeOutDesc.width = 64; storeOutDesc.height = 64;
@@ -2810,7 +2912,7 @@ int main()
 						{ "Blurred" }, Pass::Mux, storeMuxDesc);
 
 					ComputePassDesc blurMuxDesc;
-					blurMuxDesc.shader = { rhi::ShaderStage::Compute, shaderDir + "/blur.comp.spv" };
+					blurMuxDesc.shaderRef = "blur.comp";
 					blurMuxDesc.groupCountX = 1;
 					blurMuxDesc.groupCountY = 1;
 					ShaderBinding colorBinding;
@@ -2921,7 +3023,7 @@ int main()
 
 				bool ok = false;
 				if (candA && candB) {
-					RenderGraph attachMuxGraph(device.get());
+					RenderGraph attachMuxGraph(device.get(), &shaders);
 
 					ImageDesc attachOutDesc;
 					attachOutDesc.width = 64; attachOutDesc.height = 64;
@@ -2947,10 +3049,7 @@ int main()
 						att.load = LoadOp::Load;
 						att.clear.value = std::array<float, 4>{ 0.0f, 0.0f, 0.0f, 1.0f };
 						fillDesc.attachments.push_back(att);
-						fillDesc.pipeline.shaders = {
-							{ rhi::ShaderStage::Vertex,   shaderDir + "/fullscreen.vert.spv" },
-							{ rhi::ShaderStage::Fragment, shaderDir + "/solid.frag.spv" },
-						};
+						fillDesc.pipeline.shaderRefs = { "fullscreen.vert", "solid.frag" };
 						fillDesc.pipeline.cullMode = CullMode::None;
 						fillDesc.pipeline.depthStencil.depthTestEnable = false;
 					}
@@ -3044,7 +3143,7 @@ int main()
 					uboB->Flush();
 				}
 
-				RenderGraph bufferMuxGraph(device.get());
+				RenderGraph bufferMuxGraph(device.get(), &shaders);
 				BufferDesc uboDesc;
 				uboDesc.size = 256;
 				uboDesc.usage = rhi::BufferUsage::Uniform;
@@ -3071,10 +3170,7 @@ int main()
 					ub.resourceName = "ubo";
 					ub.usage = Usage::UniformRead;
 					uboTintDesc.shaderBindings.push_back(ub);
-					uboTintDesc.pipeline.shaders = {
-						{ rhi::ShaderStage::Vertex,   shaderDir + "/fullscreen.vert.spv" },
-						{ rhi::ShaderStage::Fragment, shaderDir + "/ubo.frag.spv" },
-					};
+					uboTintDesc.pipeline.shaderRefs = { "fullscreen.vert", "ubo.frag" };
 					uboTintDesc.pipeline.cullMode = CullMode::None;
 					uboTintDesc.pipeline.depthStencil.depthTestEnable = false;
 				}
@@ -3150,7 +3246,7 @@ int main()
 				dataDesc.usage = BufferUsage::Storage;
 				dataDesc.hostVisible = true;
 
-				RenderGraph liveGraph(device.get());
+				RenderGraph liveGraph(device.get(), &shaders);
 				liveGraph.RegisterPass("Writer", {}, { "Data" }, Pass::Compute, emptyCompute);
 				liveGraph.RegisterPass("Reader", { "Data" }, {}, Pass::Host, HostPassDesc{});
 				liveGraph.RegisterResource("Data", { "Reader" }, "Writer", Resource::Buffer, dataDesc);
@@ -3162,7 +3258,7 @@ int main()
 				liveGraph.SetPassActive("Writer", false);
 				const bool liveRejected = liveGraph.GetPass(writerId)->is_active();
 
-				RenderGraph deadGraph(device.get());
+				RenderGraph deadGraph(device.get(), &shaders);
 				deadGraph.RegisterPass("Solo", {}, { "Lonely" }, Pass::Compute, emptyCompute);
 				deadGraph.RegisterResource("Lonely", {}, "Solo", Resource::Buffer, dataDesc);
 				deadGraph.ProcessRegister();
@@ -3261,7 +3357,7 @@ int main()
 			}
 
 			{
-				RenderGraph featureGraph(device.get());
+				RenderGraph featureGraph(device.get(), &shaders);
 
 				constexpr uint32_t kSrcSize = 64;
 				constexpr uint32_t kSmallSize = 32;
@@ -3276,7 +3372,7 @@ int main()
 					blurredBinding.resourceName = "Blurred";
 					blurredBinding.usage = Usage::StorageWrite;
 					blurDesc.shaderBindings = { colorBinding, blurredBinding };
-					blurDesc.shader = { rhi::ShaderStage::Compute, shaderDir + "/blur.comp.spv" };
+					blurDesc.shaderRef = "blur.comp";
 					blurDesc.indirectBuffer = "Args";
 				}
 				featureGraph.RegisterPass("Blur", { "Color", "Args" }, { "Blurred" }, Pass::Compute, blurDesc);
@@ -3381,7 +3477,7 @@ int main()
 			}
 
 			{
-				RenderGraph aliasGraph(device.get());
+				RenderGraph aliasGraph(device.get(), &shaders);
 
 				BufferDesc aliasSrcDesc;
 				aliasSrcDesc.size = 16;
@@ -3427,7 +3523,7 @@ int main()
 					<< " (" << aliasGraph.GetSubmitPlan().batches.size() << " batches)\n";
 			}
 			{
-				RenderGraph rejectGraph(device.get());
+				RenderGraph rejectGraph(device.get(), &shaders);
 
 				BufferDesc srcDesc;
 				srcDesc.size = 16;
@@ -3473,7 +3569,7 @@ int main()
 			}
 
 			{
-				RenderGraph persistGraph(device.get());
+				RenderGraph persistGraph(device.get(), &shaders);
 
 				BufferDesc stagingDesc;
 				stagingDesc.size = 64 * 64 * 4;
@@ -3532,7 +3628,7 @@ int main()
 					if (!frame.acquired) continue;
 
 					if (!frameGraph) {
-						frameGraph.emplace(device.get());
+						frameGraph.emplace(device.get(), &shaders);
 
 						RenderPassDesc compositeDesc;
 						{
@@ -3547,10 +3643,7 @@ int main()
 							sampled.resourceName = "Blurred";
 							compositeDesc.shaderBindings.push_back(sampled);
 
-							compositeDesc.pipeline.shaders = {
-								{ rhi::ShaderStage::Vertex,   shaderDir + "/fullscreen.vert.spv" },
-								{ rhi::ShaderStage::Fragment, shaderDir + "/textured.frag.spv" },
-							};
+							compositeDesc.pipeline.shaderRefs = { "fullscreen.vert", "textured.frag" };
 							compositeDesc.pipeline.cullMode = CullMode::None;
 						}
 

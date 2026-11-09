@@ -5,7 +5,7 @@ Engine_0 的后端抽象层（Render Hardware Interface），位于渲染图（R
 ## 1. 设计原则
 
 - **显式优于隐式**：借用走显式工厂（`Image::Borrow`）、视图显式注册、fence 复位契约在使用者、无隐藏提交点——`Create*` 只构造资源，不做任何 GPU 操作。
-- **资源无状态跟踪**：RHI 不记录资源的布局/归属状态，`Image::Desc()` 之外的查询接口一律无状态。布局追踪是渲染图 barrier compiler / state tracker 的职责（尚未实现）。
+- **资源无状态跟踪**：RHI 不记录资源的布局/归属状态，`Image::Desc()` 之外的查询接口一律无状态。布局追踪由上层渲染图的 barrier compiler 负责。
 - **命令接口是直译出口**：`CommandList` 的方法与 Vulkan 命令一一对应（如 `Barrier` → `vkCmdPipelineBarrier2`），不引入中间语义。
 - **描述层不依赖后端**：`RHIDesc.h` 只用标准库，格式/同步枚举等词表可映射到任意后端。
 
@@ -78,10 +78,11 @@ set->Write(0, *uniformBuffer, 0, size);                   // uniform/storage 缓
 set->Write(0, *layeredTexture, rhi::ImageSubresource{ 0, 0 }, 4); // 数组绑定：从 layer 0 起连续 4 层
 ```
 
+- `ShaderStageDesc` 为 `{ stage, spirvPath, entryPoint }`：`entryPoint` 默认 `"main"`，创建管线时直接填入 `VkPipelineShaderStageCreateInfo::pName`，不再硬编码入口点。
 - **描述符布局完全由 SPIR-V 反射得出**（spv_reflect，`external/` 引入）：`CreatePipeline` 对各 stage 的 SPIR-V 一读两用——同一份 code 喂反射与 `vkCreateShaderModule`，产出每 set 的绑定表（变量名/set/binding/类型/数组长度），`DescriptorSetLayout` 由管线持有。**不再接受手工 `bindings` 声明**。
 - `DescriptorBinding::name` 携带 shader 顶层变量名，供上层按名匹配（渲染图约定「shader 变量名 == 图资源名」）。
 - 跨 stage 撞 (set,binding) 的共用槽位须同名同类型同长度；绑定的 stageFlags 取**实际使用该槽位的 stage 并集**（非 ALL_GRAPHICS 粗放值）。
-- 阶段组合校验：无重复、Vertex 与 Task/Mesh 互斥、须有 Vertex 或 Mesh、Task⇒Mesh、Tess 成对；**当前可用阶段为 Vertex/Fragment/Geometry**（tess/task/mesh 仅枚举预留，入口明确拒绝）。
+- 阶段组合校验：无重复、Vertex 与 Task/Mesh 互斥、须有 Vertex 或 Mesh、Task⇒Mesh、Tess 成对；**当前可用阶段为 Vertex/TessControl/TessEval/Geometry/Fragment**（Task/Mesh 仍为枚举预留，入口拒绝）。
 - 描述符写入在**录制前**完成（预编译路径）。图侧由 `RealizePass` 在对账后一次性分配并写入，句柄来自资源节点、元素数来自反射。
 - `Write` 的 `count` 覆盖数组绑定：图像按 layer 递增逐层展开（第 i 个元素用 `{mip, layer + i}`），缓冲按 range 步进（`offset + i*range`，`count > 1` 时 range 须非 0）。
 - 写入的描述符类型与布局由分配时记录的 binding 表决定：SampledImage → `COMBINED_IMAGE_SAMPLER`（内置采样器 + ShaderReadOnly），StorageImage → `STORAGE_IMAGE`（无采样器 + General）。
@@ -100,7 +101,7 @@ cset->Write(1, *storageImage, rhi::ImageSubresource{ 0, 0 });        // image2D�
 
 - 布局构建分两层，图形与计算共用：`ReflectAndMergeBindings`（前端：逐 stage 反射 + 按 `(set,binding)` 合并，撞槽须同名同类型同长度，stageFlags 取并集）→ `BuildSetLayouts`（后端：按 set 分组、组内 binding 升序、建 Vk 描述符布局与管线布局）。计算管线虽是单 stage，也走同一合并路径，规则只有一份实现。
 - `Pipeline::NativeBindPoint()` 区分 GRAPHICS / COMPUTE：`BindPipeline` 按其绑定点调用 `vkCmdBindPipeline`，后续 `BindDescriptorSet` / `PushConstants` 沿用同一绑定点与阶段集合，调用方无需显式传绑定点。
-- **图侧分工**：`ComputePassDesc`（shader + 工作组数）在 `RealizePass` 建管线，并沿同一反射对账路径分配/写入描述符集；`RecordPass`/`RecordGraph` 按 `submitSeq` 依次 `BindPipeline → BindDescriptorSet → Dispatch`。barrier 不注入节点，由调用方（或后续 compiler）在 `RecordGraph` 前后安排——节点只管“录什么”，不感知同步。
+- **图侧分工**：`ComputePassDesc`（shader + 工作组数）在 `RealizePass` 建管线，并沿同一反射对账路径分配/写入描述符集；`RecordPass`/`RecordGraph` 按 `submitSeq` 依次 `BindPipeline → BindDescriptorSet → Dispatch`。屏障由渲染图 barrier compiler 注入到对应批，节点本身只负责“录什么”，不感知同步。
 
 ## 6. 命令录制（CommandList）
 
@@ -121,7 +122,9 @@ device->Submit(info);                              // 自动 vkEndCommandBuffer�
 | `BindPipeline` | 记录 layout / pushConstantSize / 绑定点 / 阶段集合，供后续绑定使用 |
 | `Dispatch(x,y,z)` | `vkCmdDispatch`；参数是**工作组数**（非像素尺寸），任一维为 0 即拒绝 |
 | `SetViewport` | **同时设 viewport + scissor**（避免动态 scissor 未设触发 VUID 07832） |
-| `ClearColor` | 仅 color aspect；`CopyBufferToImage` 单 region、全层、仅 mip0 |
+| `CopyBufferToImage` / `CopyImageToBuffer` | 整图 mip0 全层；另提供区域重载（可指定 mip/层、行跨度、偏移与 extent） |
+| `CopyImage` / `BlitImage` | 同格式整图拷贝；`BlitImage` 支持区域与缩放（线性过滤受格式限制，深度/整数格式转最近邻） |
+| `ClearColor` / `ClearImage` | 颜色清场；`ClearImage` 支持任意子资源范围与深度/模板值 |
 
 ## 7. 帧循环与同步模型
 
@@ -202,19 +205,20 @@ uint32_t family = device->QueueFamily(rhi::QueueClass::AsyncCompute); // QFOT ba
 ```
 
 - 命令缓冲只能提交到与其 pool 同族的队列——帧槽按族建池（present 族不建池）。
-- 跨队列依赖经 `SubmitInfo::waits/signals`（semaphore）声明；barrier 的 `src/dstQueueFamily` 字段为 QFOT 占位（默认 IGNORED，执行路径待 barrier compiler）。
+- 跨队列依赖经 `SubmitInfo::waits/signals`（semaphore）声明；barrier 的 `src/dstQueueFamily` 字段用于 QFOT。渲染图后端会自动把跨队列依赖拆成生产批尾 release 与消费批头 acquire，并填写两端队列族。
 
 ## 9. 已知限制与演进方向
 
 | 项 | 状态 |
 |---|---|
-| barrier compiler / resource state tracker | 未实现；barrier 由调用方逐条手工声明 |
-| QFOT 执行路径 | 字段占位；配对 release/acquire + semaphore 串联待 compiler（state tracker 应同时维护 layout 与 queueFamily） |
-| Tess/Task/Mesh 着色阶段 | 枚举与组合校验预留；状态创建未实现（tessellation state / mesh 扩展特性），CreatePipeline 入口明确拒绝 |
+| barrier compiler / resource state tracker | RHI 本身不做状态跟踪；由上层的 RenderGraph barrier compiler 统一推导。直接使用 RHI 时仍需调用方逐条声明 |
+| QFOT 执行路径 | 渲染图后端已生成配对 release/acquire 并填写队列族；直接使用 RHI 时需自行填写 |
+| Tess/Geometry 着色阶段 | 已支持，创建管线时校验设备特性、成对 Tess 阶段与 PatchList |
+| Task/Mesh 着色阶段 | 枚举与组合校验预留；状态创建未实现，入口拒绝 |
 | 分离式描述符类型（SAMPLED_IMAGE/SAMPLER 分离、texel buffer 等） | 反射报暂不支持；当前仅 combined sampler / storage image / UBO / SSBO |
-| 上传路径（staging → CopyBufferToImage） | `CopyBufferToImage` 命令已具备，无配套 Upload API |
+| 上传路径（staging → CopyBufferToImage） | 已提供 `Device::UploadImage` / `UploadBuffer` 一次性上传 |
 | sRGB 格式词表 | 缺失，`*_SRGB` 归一为 UNORM |
-| Buffer 节点（渲染图侧） | 未实现 |
+| Buffer 节点（渲染图侧） | 已实现 Own / Borrow / Borrow-later |
 | 运行时长度描述符数组（`T[]`） | 反射报暂不支持：变长数组的 descriptorCount 无从得知，被静默当成标量会导致越界；固定长度数组（`T[4]`）已可写入 |
 | 图侧描述符写入时机 | 在 `RealizePass` 一次性完成；若将来出现每帧轮转的绑定（ping-pong、跨帧资源），需把写入拆到每帧提交前 |
 

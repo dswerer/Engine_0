@@ -8,6 +8,8 @@ add_executable(Retrieve
 	"Camera.h"
 	"${CMAKE_CURRENT_SOURCE_DIR}/../../RenderGraph.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/../../RenderGraphNodes.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../AssetResolver.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../ShaderLibrary.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/../../rhi/RHI.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/../../vmaExporter.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/../../external/spv_reflect/spirv_reflect.c")
@@ -56,6 +58,8 @@ set(RETRIEVE_SHADER_SOURCES
 	"${CMAKE_CURRENT_SOURCE_DIR}/shaders/shadow.geom"
 	"${CMAKE_CURRENT_SOURCE_DIR}/shaders/shadow.frag"
 	"${CMAKE_CURRENT_SOURCE_DIR}/shaders/atmosphere.frag")
+
+engine0_write_shader_manifest("${RETRIEVE_SHADER_DIR}/shaders.manifest.json" ${RETRIEVE_SHADER_SOURCES})
 
 if (Vulkan_GLSLC_EXECUTABLE)
 	set(RETRIEVE_GLSLC "${Vulkan_GLSLC_EXECUTABLE}")

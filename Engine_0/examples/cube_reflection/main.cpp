@@ -3,6 +3,8 @@
 
 #include "RenderGraphAbstracted.h"
 #include "RenderGraphNodes.h"
+#include "AssetResolver.h"
+#include "ShaderLibrary.h"
 #include "rhi/RHI.h"
 
 #define STB_IMAGE_IMPLEMENTATION
@@ -130,7 +132,7 @@ unique_ptr<rhi::Image> UploadEnvironment(rhi::Device& device, const string& path
 	return env;
 }
 
-bool BuildFrameGraph(RenderGraph& graph, const string& shaderDir,
+bool BuildFrameGraph(RenderGraph& graph,
 	const rhi::Buffer* vertexBuffer, const rhi::Buffer* indexBuffer,
 	const rhi::Image* envTexture, const rhi::Image* backbuffer, bool smoke) {
 	BufferDesc uboDesc;
@@ -194,10 +196,7 @@ bool BuildFrameGraph(RenderGraph& graph, const string& shaderDir,
 		depth.store = StoreOp::DontCare;
 		cubeDesc.attachments.push_back(depth);
 
-		cubeDesc.pipeline.shaders = {
-			{ rhi::ShaderStage::Vertex,   shaderDir + "/cube.vert.spv" },
-			{ rhi::ShaderStage::Fragment, shaderDir + "/cube.frag.spv" },
-		};
+		cubeDesc.pipeline.shaderRefs = { "cube.vert", "cube.frag" };
 		cubeDesc.pipeline.cullMode = CullMode::None;
 		cubeDesc.pipeline.depthStencil.depthTestEnable = true;
 		cubeDesc.pipeline.depthStencil.depthWriteEnable = true;
@@ -221,10 +220,7 @@ bool BuildFrameGraph(RenderGraph& graph, const string& shaderDir,
 		color.store = StoreOp::Store;
 		compositeDesc.attachments.push_back(color);
 
-		compositeDesc.pipeline.shaders = {
-			{ rhi::ShaderStage::Vertex,   shaderDir + "/fullscreen.vert.spv" },
-			{ rhi::ShaderStage::Fragment, shaderDir + "/composite.frag.spv" },
-		};
+		compositeDesc.pipeline.shaderRefs = { "fullscreen.vert", "composite.frag" };
 		compositeDesc.pipeline.cullMode = CullMode::None;
 		compositeDesc.pipeline.depthStencil.depthTestEnable = false;
 
@@ -322,6 +318,22 @@ int main(int argc, char** argv) {
 	}
 	cout << "Device: " << device->DeviceName() << "\n";
 
+	AssetResolver assets;
+	assets.Mount("shaders", shaderDir);
+	assets.Mount("assets", assetDir);
+	ShaderLibrary shaders(assets);
+	{
+		std::vector<std::string> shaderWarnings;
+		if (!shaders.LoadManifest("shaders/shaders.manifest.json", &shaderWarnings)) {
+			for (const auto& warning : shaderWarnings)
+				cerr << "[ShaderLibrary] " << warning << "\n";
+			cerr << "着色器清单加载失败\n";
+			if (window) glfwDestroyWindow(window);
+			if (glfwInitialized) glfwTerminate();
+			return 1;
+		}
+	}
+
 	auto envTexture = UploadEnvironment(*device, assetDir + "/skyview.jpg");
 	if (!envTexture) {
 		if (window) glfwDestroyWindow(window);
@@ -398,8 +410,8 @@ int main(int argc, char** argv) {
 		}
 
 		if (!graphReady) {
-			graph.emplace(device.get());
-			if (!BuildFrameGraph(*graph, shaderDir, vertexBuffer.get(), indexBuffer.get(),
+			graph.emplace(device.get(), &shaders);
+			if (!BuildFrameGraph(*graph, vertexBuffer.get(), indexBuffer.get(),
 				envTexture.get(), currentFrame.has_value() ? currentFrame->backbuffer : nullptr,
 				options.smoke)) {
 				return 1;
