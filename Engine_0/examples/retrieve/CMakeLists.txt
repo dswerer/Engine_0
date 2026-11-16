@@ -7,8 +7,15 @@ add_executable(Retrieve
 	"FrameData.h"
 	"Camera.h"
 	"${CMAKE_CURRENT_SOURCE_DIR}/../../RenderGraph.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../RenderGraphBuilder.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/../../RenderGraphNodes.cpp"
-	"${CMAKE_CURRENT_SOURCE_DIR}/../../AssetResolver.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../RenderGraphDocument.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../ContentResolver.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../AssetCatalog.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../AssetPack.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../AssetLoader.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../ModulePack.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../StbImageImpl.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/../../ShaderLibrary.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/../../rhi/RHI.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/../../vmaExporter.cpp"
@@ -32,7 +39,8 @@ endif()
 
 target_compile_definitions(Retrieve PRIVATE
 	SPIRV_REFLECT_USE_SYSTEM_SPIRV_H
-	RETRIEVE_ASSET_DIR="${CMAKE_CURRENT_SOURCE_DIR}/assets")
+	RETRIEVE_ASSET_DIR="${CMAKE_CURRENT_SOURCE_DIR}/assets"
+	RETRIEVE_MODULE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/modules")
 
 target_link_libraries(Retrieve PRIVATE
 	Vulkan::Vulkan
@@ -87,3 +95,11 @@ if (RETRIEVE_GLSLC)
 else()
 	message(WARNING "未找到 glslc，retrieve 示例的着色器不会被编译")
 endif()
+
+# 生成打包到源码目录的模块文档与 .pak
+add_custom_target(retrieve_modules
+	COMMAND $<TARGET_FILE:Retrieve> --emit-modules
+	DEPENDS Retrieve
+	WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+	COMMENT "Packing retrieve modules"
+	VERBATIM)

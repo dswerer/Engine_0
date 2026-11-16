@@ -1,11 +1,15 @@
 #include "Engine_0.h"
 #include "RenderGraphAbstracted.h"
+#include "RenderGraphBuilder.h"
 #include "RenderGraphNodes.h"
 #include "RenderGraphDocument.h"
-#include "AssetResolver.h"
+#include "ContentResolver.h"
+#include "AssetCatalog.h"
+#include "AssetPack.h"
+#include "AssetLoader.h"
+#include "ModulePack.h"
 #include "ShaderLibrary.h"
 #include "rhi/RHI.h"
-#define STB_IMAGE_IMPLEMENTATION
 #include "external/stb_image/stb_image.h"
 #define GLFW_EXPOSE_NATIVE_WIN32
 #include <GLFW/glfw3.h>
@@ -14,7 +18,9 @@
 
 #include <iostream>
 #include <cstring>
+#include <cstdlib>
 #include <filesystem>
+#include <fstream>
 
 using namespace std;
 using namespace dEngine;
@@ -107,7 +113,7 @@ int main()
 		dataDesc.hostVisible = true;
 
 		RenderGraphBuilder b1;
-		b1.DeclareResource("Data", dataDesc);
+		b1.DeclareBufferResource("Data", dataDesc);
 		b1.DeclarePass("P1", {}, { "Data" }, Pass::Host, HostPassDesc{});
 		b1.DeclarePass("P2", { "Data" }, {}, Pass::Host, HostPassDesc{});
 		b1.DeclarePass("P3", {}, { "Data" }, Pass::Host, HostPassDesc{});
@@ -129,7 +135,7 @@ int main()
 
 		// 2) 资源依赖补边（case 1）：Pw 写 X，Pr 读 X，用户只声明 Pu -> Pr
 		RenderGraphBuilder b2;
-		b2.DeclareResource("X", dataDesc);
+		b2.DeclareBufferResource("X", dataDesc);
 		b2.DeclarePass("Pw", {}, { "X" }, Pass::Host, HostPassDesc{});
 		b2.DeclarePass("Pu", {}, {}, Pass::Host, HostPassDesc{});
 		b2.DeclarePass("Pr", { "X" }, {}, Pass::Host, HostPassDesc{});
@@ -159,7 +165,7 @@ int main()
 			return desc;
 		};
 		RenderGraphBuilder b3;
-		b3.DeclareResource("Color", colorDesc);
+		b3.DeclareImageResource("Color", colorDesc);
 		b3.DeclarePass("Clear", Pass::Render, makeColorPass("Clear", LoadOp::DontCare));
 		b3.DeclarePass("Accum", Pass::Render, makeColorPass("Accum", LoadOp::Load));
 		b3.DeclareTopology(RenderGraphBuilder::Topology::Sequence({ "Clear", "Accum" }));
@@ -178,7 +184,7 @@ int main()
 		historyDesc.format = ImageFormat::RGBA16F;
 
 		RenderGraphBuilder b4;
-		b4.DeclareResource("History", historyDesc,
+		b4.DeclareImageResource("History", historyDesc,
 			{ .initialLayout = rhi::ImageLayout::TransferDst, .crossFrame = true });
 		b4.DeclarePass("Use", { "History" }, {}, Pass::Host, HostPassDesc{});
 		b4.DeclarePass("Update", {}, { "History" }, Pass::Host, HostPassDesc{});
@@ -194,15 +200,15 @@ int main()
 
 		// 5) 错误路径：同 pass 读写、读先于生产者、多写者未定序
 		RenderGraphBuilder e1;
-		e1.DeclareResource("Y", dataDesc);
+		e1.DeclareBufferResource("Y", dataDesc);
 		e1.DeclarePass("RW", { "Y" }, { "Y" }, Pass::Host, HostPassDesc{});
-		if (e1.Lower().ok || !hasDiag(e1.Lower(), BuilderDiagKind::SamePassReadWrite)) {
+		if (e1.Lower().ok || !hasDiag(e1.Lower(), BuilderDiagKind::DoubleBufferNotImplemented)) {
 			cerr << "Lower smoke failed: same-pass read/write not rejected\n";
 			return 1;
 		}
 
 		RenderGraphBuilder e2;
-		e2.DeclareResource("Z", dataDesc);
+		e2.DeclareBufferResource("Z", dataDesc);
 		e2.DeclarePass("ReadZ", { "Z" }, {}, Pass::Host, HostPassDesc{});
 		e2.DeclarePass("WriteZ", {}, { "Z" }, Pass::Host, HostPassDesc{});
 		e2.DeclareTopology(RenderGraphBuilder::Topology::Sequence({ "ReadZ", "WriteZ" }));
@@ -213,7 +219,7 @@ int main()
 		}
 
 		RenderGraphBuilder e3;
-		e3.DeclareResource("W", dataDesc);
+		e3.DeclareBufferResource("W", dataDesc);
 		e3.DeclarePass("W1", {}, { "W" }, Pass::Host, HostPassDesc{});
 		e3.DeclarePass("W2", {}, { "W" }, Pass::Host, HostPassDesc{});
 		LowerResult er3 = e3.Lower();
@@ -222,7 +228,42 @@ int main()
 			return 1;
 		}
 
-		cout << "Lower ok: version chain, implied edge, load alias, cross-frame alias, 3 rejections\n";
+		// 6) 显式 inPlace：Host pass 也能表达原地读写
+		RenderGraphBuilder e4;
+		e4.DeclareBufferResource("Counter", dataDesc);
+		e4.DeclarePass("Add", { "Counter" }, { "Counter" }, { "Counter" },
+			Pass::Host, HostPassDesc{});
+		LowerResult er4 = e4.Lower();
+		if (!er4.ok || hasDiag(er4, BuilderDiagKind::DoubleBufferNotImplemented)) {
+			cerr << "Lower smoke failed: explicit inPlace rejected\n";
+			return 1;
+		}
+
+		// 7) inPlace 必须同时出现在读写集
+		RenderGraphBuilder e5;
+		e5.DeclareBufferResource("Q", dataDesc);
+		e5.DeclarePass("Bad", { "Q" }, {}, { "Q" }, Pass::Host, HostPassDesc{});
+		LowerResult er5 = e5.Lower();
+		if (er5.ok || !hasDiag(er5, BuilderDiagKind::InPlaceNotReadWrite)) {
+			cerr << "Lower smoke failed: inPlace without write not rejected\n";
+			return 1;
+		}
+
+		// 8) in-place 资源跨队列直接拒绝
+		RenderGraphBuilder e6;
+		e6.DeclareBufferResource("R", dataDesc);
+		e6.DeclarePass("HostR", { "R" }, { "R" }, { "R" }, Pass::Host, HostPassDesc{},
+			rhi::QueueClass::Graphics);
+		e6.DeclarePass("AsyncR", { "R" }, { "R" }, { "R" }, Pass::Host, HostPassDesc{},
+			rhi::QueueClass::AsyncCompute);
+		e6.DeclareTopology(RenderGraphBuilder::Topology::Sequence({ "HostR", "AsyncR" }));
+		LowerResult er6 = e6.Lower();
+		if (er6.ok || !hasDiag(er6, BuilderDiagKind::InPlaceQueueMismatch)) {
+			cerr << "Lower smoke failed: cross-queue inPlace not rejected\n";
+			return 1;
+		}
+
+		cout << "Lower ok: version chain, implied edge, load alias, cross-frame alias, inPlace policy\n";
 	}
 
 	// Build 冒烟：Lower -> 版本化后端声明 -> ProcessRegister（不依赖 Device）
@@ -240,7 +281,7 @@ int main()
 		readDesc.shaderBindings.push_back(sb);
 
 		RenderGraphBuilder b;
-		b.DeclareResource("Data", dataDesc);
+		b.DeclareBufferResource("Data", dataDesc);
 		b.DeclarePass("Write", {}, { "Data" }, Pass::Host, HostPassDesc{});
 		b.DeclarePass("Read", Pass::Compute, readDesc);
 		b.DeclareTopology(RenderGraphBuilder::Topology::Sequence({ "Write", "Read" }));
@@ -281,7 +322,7 @@ int main()
 		}
 
 		RenderGraphBuilder bad;
-		bad.DeclareResource("Y", dataDesc);
+		bad.DeclareBufferResource("Y", dataDesc);
 		bad.DeclarePass("RW", { "Y" }, { "Y" }, Pass::Host, HostPassDesc{});
 		RenderGraph badOut;
 		if (bad.Build(badOut) || badOut.GetPass(0) != nullptr) {
@@ -300,8 +341,8 @@ int main()
 		ioBuf.hostVisible = true;
 
 		RenderGraphBuilder io;
-		io.DeclareResource("A", ioBuf);
-		io.DeclareResource("B", ioBuf);
+		io.DeclareBufferResource("A", ioBuf);
+		io.DeclareBufferResource("B", ioBuf);
 		TransferPassDesc td;
 		td.kind = TransferKind::BufferToBuffer;
 		td.sourceName = "A";
@@ -327,11 +368,11 @@ int main()
 		bufDesc.hostVisible = true;
 
 		RenderGraphBuilder ma;
-		ma.DeclareResource("Data", bufDesc);
+		ma.DeclareBufferResource("Data", bufDesc);
 		ma.DeclarePass("Write", {}, { "Data" }, Pass::Host, HostPassDesc{});
 
 		RenderGraphBuilder mb;
-		mb.DeclareResource("Data", bufDesc);   // 同名同描述 -> 自动合一
+		mb.DeclareBufferResource("Data", bufDesc);   // 同名同描述 -> 自动合一
 		mb.DeclarePass("Read", { "Data" }, {}, Pass::Host, HostPassDesc{});
 
 		RenderGraphBuilder mm;
@@ -373,8 +414,8 @@ int main()
 		BufferDesc otherDesc = bufDesc;
 		otherDesc.size = 256;
 		RenderGraphBuilder d1, d2;
-		d1.DeclareResource("Z", bufDesc);
-		d2.DeclareResource("Z", otherDesc);
+		d1.DeclareBufferResource("Z", bufDesc);
+		d2.DeclareBufferResource("Z", otherDesc);
 		RenderGraphBuilder dm;
 		if (!dm.ImportDeclarations(d1) || dm.ImportDeclarations(d2)) {
 			cerr << "Import smoke failed: resource desc mismatch not rejected\n";
@@ -427,9 +468,9 @@ int main()
 		bufDesc.hostVisible = true;
 
 		RenderGraphBuilder b;
-		b.DeclareResource("Src", bufDesc);
-		b.DeclareResource("Dst", bufDesc);
-		b.DeclareResource("Temp", bufDesc);
+		b.DeclareBufferResource("Src", bufDesc);
+		b.DeclareBufferResource("Dst", bufDesc);
+		b.DeclareBufferResource("Temp", bufDesc);
 		b.DeclarePass("Step", { "Src" }, { "Temp" }, Pass::Host, HostPassDesc{});
 		b.DeclarePass("Copy", { "Temp" }, { "Dst" }, Pass::Host, HostPassDesc{});
 		b.DeclareTopology(RenderGraphBuilder::Topology::Sequence({ "Step", "Copy" }));
@@ -461,7 +502,7 @@ int main()
 		}
 		{
 			RenderGraphBuilder e;
-			e.DeclareResource("Out", bufDesc);
+			e.DeclareBufferResource("Out", bufDesc);
 			e.DeclarePass("Present", { "Out" }, {}, Pass::Present, PresentPassDesc{});
 			RenderGraphModule bad;
 			if (e.CompileModule("X", { { "Out", ModulePortKind::Output } }, &bad)) {
@@ -471,8 +512,8 @@ int main()
 		}
 		{
 			RenderGraphBuilder e;
-			e.DeclareResource("X", bufDesc);
-			e.DeclareResource("Out", bufDesc);
+			e.DeclareBufferResource("X", bufDesc);
+			e.DeclareBufferResource("Out", bufDesc);
 			e.DeclarePass("W1", {}, { "X" }, Pass::Host, HostPassDesc{});
 			e.DeclarePass("W2", {}, { "X" }, Pass::Host, HostPassDesc{});
 			e.DeclarePass("R", { "X" }, { "Out" }, Pass::Host, HostPassDesc{});
@@ -484,8 +525,8 @@ int main()
 		}
 		{
 			RenderGraphBuilder e;
-			e.DeclareResource("A", bufDesc);
-			e.DeclareResource("B", bufDesc);
+			e.DeclareBufferResource("A", bufDesc);
+			e.DeclareBufferResource("B", bufDesc);
 			e.DeclarePass("P", { "A" }, { "B" }, Pass::Host, HostPassDesc{});
 			e.AliasLogicalResources({ "A", "B" });
 			RenderGraphModule bad;
@@ -496,8 +537,8 @@ int main()
 		}
 		{
 			RenderGraphBuilder e;
-			e.DeclareResource("A", bufDesc);
-			e.DeclareResource("Orphan", bufDesc);
+			e.DeclareBufferResource("A", bufDesc);
+			e.DeclareBufferResource("Orphan", bufDesc);
 			e.DeclarePass("P", {}, { "A" }, Pass::Host, HostPassDesc{});
 			RenderGraphModule bad;
 			if (e.CompileModule("X", { { "A", ModulePortKind::Output }, { "Orphan", ModulePortKind::Input } }, &bad)) {
@@ -507,8 +548,8 @@ int main()
 		}
 		{
 			RenderGraphBuilder e;
-			e.DeclareResource("A", bufDesc);
-			e.DeclareResource("B", bufDesc);
+			e.DeclareBufferResource("A", bufDesc);
+			e.DeclareBufferResource("B", bufDesc);
 			e.DeclarePass("P1", {}, { "A" }, Pass::Host, HostPassDesc{});
 			e.DeclarePass("P2", { "A" }, { "B" }, Pass::Host, HostPassDesc{});
 			e.DeclareTopology(RenderGraphBuilder::Topology::Sequence({ "P1", "P2" }));
@@ -531,9 +572,9 @@ int main()
 		bufDesc.hostVisible = true;
 
 		RenderGraphBuilder mod;
-		mod.DeclareResource("Src", bufDesc);
-		mod.DeclareResource("Dst", bufDesc);
-		mod.DeclareResource("Temp", bufDesc);
+		mod.DeclareBufferResource("Src", bufDesc);
+		mod.DeclareBufferResource("Dst", bufDesc);
+		mod.DeclareBufferResource("Temp", bufDesc);
 		mod.DeclarePass("Step", { "Src" }, { "Temp" }, Pass::Host, HostPassDesc{});
 		mod.DeclarePass("Copy", { "Temp" }, { "Dst" }, Pass::Host, HostPassDesc{});
 		mod.DeclareTopology(RenderGraphBuilder::Topology::Sequence({ "Step", "Copy" }));
@@ -549,9 +590,9 @@ int main()
 		}
 
 		RenderGraphBuilder parent;
-		parent.DeclareResource("Color", bufDesc);
-		parent.DeclareResource("BlurA", bufDesc);
-		parent.DeclareResource("BlurB", bufDesc);
+		parent.DeclareBufferResource("Color", bufDesc);
+		parent.DeclareBufferResource("BlurA", bufDesc);
+		parent.DeclareBufferResource("BlurB", bufDesc);
 		parent.DeclarePass("Init", {}, { "Color" }, Pass::Host, HostPassDesc{});
 
 		auto a = parent.Instantiate(m, "a", { { "Src", "Color" }, { "Dst", "BlurA" } });
@@ -608,7 +649,7 @@ int main()
 		}
 		BufferDesc bigDesc = bufDesc;
 		bigDesc.size = 512;
-		parent.DeclareResource("BlurBig", bigDesc);
+		parent.DeclareBufferResource("BlurBig", bigDesc);
 		if (parent.Instantiate(m, "f", { { "Src", "Color" }, { "Dst", "BlurBig" } })) {
 			cerr << "Module instantiate failed: shape mismatch not rejected\n";
 			return 1;
@@ -616,7 +657,7 @@ int main()
 
 		// 跨帧端口要求父资源 crossFrame
 		RenderGraphBuilder cf;
-		cf.DeclareResource("Hist", bufDesc, { .crossFrame = true });
+		cf.DeclareBufferResource("Hist", bufDesc, { .crossFrame = true });
 		cf.DeclarePass("Use", { "Hist" }, {}, Pass::Host, HostPassDesc{});
 		RenderGraphModule cm;
 		if (!cf.CompileModule("CF", { { "Hist", ModulePortKind::Input } }, &cm, &errs)) {
@@ -624,7 +665,7 @@ int main()
 			return 1;
 		}
 		RenderGraphBuilder p2;
-		p2.DeclareResource("Hist", bufDesc);
+		p2.DeclareBufferResource("Hist", bufDesc);
 		if (p2.Instantiate(cm, "h", { { "Hist", "Hist" } })) {
 			cerr << "Module instantiate failed: cross-frame mismatch not rejected\n";
 			return 1;
@@ -640,6 +681,280 @@ int main()
 		cout << "Module instantiate ok: scoped expansion, multi-instance, 6 rejections\n";
 	}
 
+	// 模块固定引用：初始化注入 + 实例化按身份收敛（纯声明，不依赖 Device）
+	{
+		BufferDesc bufDesc;
+		bufDesc.size = 128;
+		bufDesc.usage = BufferUsage::Storage;
+		bufDesc.hostVisible = true;
+
+		// 假句柄：Compile/Initialize/Instantiate/Lower 均不解引用
+		const rhi::Buffer* const envHandle =
+			reinterpret_cast<const rhi::Buffer*>(static_cast<uintptr_t>(0x1000));
+
+		RenderGraphBuilder mod;
+		mod.DeclareBufferResource("Env", "skybuffer");
+		mod.DeclareBufferResource("Dst", bufDesc);
+		mod.DeclarePass("Sample", { "Env" }, { "Dst" }, Pass::Host, HostPassDesc{});
+
+		RenderGraphModule m;
+		std::vector<std::string> errs;
+		if (!mod.CompileModule("Sky", { { "Dst", ModulePortKind::Output } }, &m, &errs)) {
+			cerr << "Module fixed smoke failed: compile rejected\n";
+			return 1;
+		}
+		if (m.IsInitialized() || m.FixedResources().size() != 1
+			|| m.FixedResources()[0].name != "Env"
+			|| m.FixedResources()[0].asset != "skybuffer"
+			|| m.UnboundFixedResources().size() != 1) {
+			cerr << "Module fixed smoke failed: fixed metadata wrong\n";
+			return 1;
+		}
+
+		// 未初始化即实例化 -> 拒绝
+		RenderGraphBuilder p0;
+		p0.DeclareBufferResource("Out0", bufDesc);
+		if (p0.Instantiate(m, "x", { { "Dst", "Out0" } })) {
+			cerr << "Module fixed smoke failed: uninitialized module accepted\n";
+			return 1;
+		}
+
+		if (!m.Initialize({ { "Env", nullptr, envHandle } }, &errs) || !m.IsInitialized()) {
+			cerr << "Module fixed smoke failed: initialize rejected\n";
+			return 1;
+		}
+		if (m.Initialize({ { "Env", nullptr, envHandle }, { "Nope", nullptr, envHandle } }, &errs)
+			|| m.Initialize({ { "Env", reinterpret_cast<const rhi::Image*>(envHandle), nullptr } }, &errs)) {
+			cerr << "Module fixed smoke failed: initialize errors not rejected\n";
+			return 1;
+		}
+
+		auto countName = [](const LowerResult& lr, const std::string& name) {
+			size_t n = 0;
+			for (const auto& r : lr.graph.resources)
+				if (r.ref.name == name) ++n;
+			return n;
+		};
+
+		// 1) 父级没有同源资源 -> 补一次声明，两个实例共享同一节点
+		{
+			RenderGraphBuilder parent;
+			parent.DeclareBufferResource("OutA", bufDesc);
+			parent.DeclareBufferResource("OutB", bufDesc);
+			if (!parent.Instantiate(m, "a", { { "Dst", "OutA" } })
+				|| !parent.Instantiate(m, "b", { { "Dst", "OutB" } })) {
+				cerr << "Module fixed smoke failed: instantiate rejected\n";
+				return 1;
+			}
+			LowerResult lr = parent.Lower();
+			if (!lr.ok || countName(lr, "Sky/Env") != 1
+				|| countName(lr, "a/Env") != 0 || countName(lr, "b/Env") != 0) {
+				cerr << "Module fixed smoke failed: fixed ref not converged (ok=" << lr.ok << ")";
+				for (const auto& d : lr.diagnostics)
+					cerr << " [" << d.message << "]";
+				cerr << "\n";
+				return 1;
+			}
+			for (const auto& p : lr.graph.passes) {
+				if (p.name != "a/Sample" && p.name != "b/Sample")
+					continue;
+				bool readsEnv = false;
+				for (const auto& rr : p.reads)
+					if (rr.name == "Sky/Env" && rr.version == 0) readsEnv = true;
+				if (!readsEnv) {
+					cerr << "Module fixed smoke failed: instance does not read converged ref\n";
+					return 1;
+				}
+			}
+		}
+
+		// 2) 父级已有同源资源 -> 直接复用，不重复包装
+		{
+			RenderGraphBuilder parent;
+			parent.DeclareBufferResource("SharedEnv", envHandle);
+			parent.DeclareBufferResource("OutA", bufDesc);
+			if (!parent.Instantiate(m, "a", { { "Dst", "OutA" } })) {
+				cerr << "Module fixed smoke failed: reuse instantiate rejected\n";
+				return 1;
+			}
+			LowerResult lr = parent.Lower();
+			if (!lr.ok || countName(lr, "Sky/Env") != 0 || countName(lr, "SharedEnv") != 1) {
+				cerr << "Module fixed smoke failed: existing external not reused\n";
+				return 1;
+			}
+		}
+
+		// 3) 仅固定引用、无端口的自包含模块合法
+		{
+			RenderGraphBuilder onlyFixed;
+			onlyFixed.DeclareBufferResource("EnvOnly", envHandle);
+			BufferDesc outDesc;
+			outDesc.size = 64;
+			outDesc.usage = BufferUsage::Storage;
+			onlyFixed.DeclareBufferResource("Out", outDesc);
+			onlyFixed.DeclarePass("Bake", { "EnvOnly" }, { "Out" }, Pass::Host, HostPassDesc{});
+			RenderGraphModule zeroPort;
+			if (!onlyFixed.CompileModule("BakeOnly", {}, &zeroPort) || !zeroPort.Ports().empty()) {
+				cerr << "Module fixed smoke failed: zero-port module rejected\n";
+				return 1;
+			}
+		}
+
+		// 4) 借用父资源句柄即权威：描述/布局不要求一致
+		{
+			RenderGraphBuilder parent;
+			BufferOptions borrowed;
+			borrowed.crossFrame = true;
+			parent.DeclareBufferResource("SharedEnv", envHandle, borrowed);
+			parent.DeclareBufferResource("OutA", bufDesc);
+			if (!parent.Instantiate(m, "a", { { "Dst", "OutA" } })) {
+				cerr << "Module fixed smoke failed: borrowed parent desc rejected\n";
+				return 1;
+			}
+			LowerResult lr = parent.Lower();
+			if (!lr.ok || countName(lr, "SharedEnv") != 1 || countName(lr, "Sky/Env") != 0) {
+				cerr << "Module fixed smoke failed: borrowed parent not authoritative\n";
+				return 1;
+			}
+		}
+
+		// 5) 模块固定引用要求 crossFrame，父级借用资源不满足 -> 拒绝
+		{
+			RenderGraphBuilder cfMod;
+			BufferOptions cfOptions;
+			cfOptions.crossFrame = true;
+			cfMod.DeclareBufferResource("Hist", std::string("hist"), cfOptions);
+			cfMod.DeclareBufferResource("Dst", bufDesc);
+			cfMod.DeclarePass("Sample", { "Hist" }, { "Dst" }, Pass::Host, HostPassDesc{});
+			RenderGraphModule cfModule;
+			if (!cfMod.CompileModule("HistMod", {}, &cfModule)
+				|| !cfModule.Initialize({ { "Hist", nullptr, envHandle } })) {
+				cerr << "Module fixed smoke failed: crossFrame module not compiled\n";
+				return 1;
+			}
+			RenderGraphBuilder parent;
+			parent.DeclareBufferResource("SharedHist", envHandle);
+			parent.DeclareBufferResource("OutH", bufDesc);
+			if (parent.Instantiate(cfModule, "h", std::vector<ModuleBinding>{})) {
+				cerr << "Module fixed smoke failed: crossFrame requirement not enforced\n";
+				return 1;
+			}
+		}
+
+		cout << "Module fixed ok: init entry, uninitialized rejection, identity convergence\n";
+	}
+
+	// 模块文档：落盘 / 加载 / 固定引用初始化（纯声明，不依赖 Device）
+	{
+		BufferDesc bufDesc;
+		bufDesc.size = 128;
+		bufDesc.usage = BufferUsage::Storage;
+		bufDesc.hostVisible = true;
+
+		const rhi::Buffer* const envHandle =
+			reinterpret_cast<const rhi::Buffer*>(static_cast<uintptr_t>(0x1000));
+
+		RenderGraphBuilder mod;
+		mod.DeclareBufferResource("Env", "skybuffer");
+		mod.DeclareBufferResource("Dst", bufDesc);
+		mod.DeclarePass("Sample", { "Env" }, { "Dst" }, Pass::Host, HostPassDesc{});
+
+		RenderGraphModule module;
+		std::vector<std::string> errs;
+		if (!mod.CompileModule("Sky", { { "Dst", ModulePortKind::Output } }, &module, &errs)
+			|| !module.Initialize({ { "Env", nullptr, envHandle } }, &errs)) {
+			cerr << "Module document failed: prepare module rejected\n";
+			return 1;
+		}
+
+		const RenderGraphModuleDocument document = RenderGraphModuleDocument::Capture(module);
+		if (document.Name() != "Sky" || document.PortCount() != 1
+			|| document.ResourceCount() != 2 || document.PassCount() != 1
+			|| document.FixedResourceCount() != 1) {
+			cerr << "Module document failed: captured shape wrong\n";
+			return 1;
+		}
+
+		std::error_code fsError;
+		std::filesystem::create_directories("out", fsError);
+		const std::string modulePath = "out/rendergraph_module_smoke.json";
+		std::string moduleError;
+		if (!document.Save(modulePath, &moduleError)) {
+			cerr << "Module document failed: " << moduleError << "\n";
+			return 1;
+		}
+		const auto loadedModule = RenderGraphModuleDocument::Load(modulePath, &moduleError);
+		if (!loadedModule || loadedModule->ToJson() != document.ToJson()) {
+			cerr << "Module document failed: save/load mismatch " << moduleError << "\n";
+			return 1;
+		}
+
+		// 定义恢复：固定引用保持未绑定，不能实例化
+		RenderGraphModule definitionOnly;
+		if (!loadedModule->Restore(definitionOnly, nullptr, &errs)
+			|| definitionOnly.IsInitialized()
+			|| definitionOnly.UnboundFixedResources().size() != 1) {
+			cerr << "Module document failed: definition restore wrong\n";
+			return 1;
+		}
+		RenderGraphBuilder unboundParent;
+		unboundParent.DeclareBufferResource("Out", bufDesc);
+		if (unboundParent.Instantiate(definitionOnly, "a", { { "Dst", "Out" } })) {
+			cerr << "Module document failed: unbound restored module instantiated\n";
+			return 1;
+		}
+
+		// 带绑定恢复：解析固定引用并初始化
+		RenderGraphModuleDocument::FixedBindings bindings;
+		bindings.buffer = [&](const std::string& name) -> const rhi::Buffer* {
+			return name == "Env" ? envHandle : nullptr;
+		};
+		bindings.bufferAsset = [&](const std::string& asset) -> const rhi::Buffer* {
+			return asset == "skybuffer" ? envHandle : nullptr;
+		};
+		RenderGraphModule restored;
+		if (!loadedModule->Restore(restored, &bindings, &errs) || !restored.IsInitialized()) {
+			cerr << "Module document failed: bound restore rejected\n";
+			return 1;
+		}
+		if (RenderGraphModuleDocument::Capture(restored).ToJson() != document.ToJson()) {
+			cerr << "Module document failed: round-trip mismatch\n";
+			return 1;
+		}
+
+		// 缺绑定 -> 拒绝
+		RenderGraphModuleDocument::FixedBindings missing;
+		RenderGraphModule rejected;
+		if (loadedModule->Restore(rejected, &missing, &errs)) {
+			cerr << "Module document failed: missing binding accepted\n";
+			return 1;
+		}
+		if (RenderGraphModuleDocument::FromJson("{ \"format\": \"other\" }").has_value()) {
+			cerr << "Module document failed: invalid document accepted\n";
+			return 1;
+		}
+
+		// 恢复后的模块仍按身份收敛固定引用
+		RenderGraphBuilder parent;
+		parent.DeclareBufferResource("OutA", bufDesc);
+		parent.DeclareBufferResource("OutB", bufDesc);
+		if (!parent.Instantiate(restored, "a", { { "Dst", "OutA" } })
+			|| !parent.Instantiate(restored, "b", { { "Dst", "OutB" } })) {
+			cerr << "Module document failed: restored module instantiate rejected\n";
+			return 1;
+		}
+		LowerResult lr = parent.Lower();
+		size_t envWrappers = 0;
+		for (const auto& r : lr.graph.resources)
+			if (r.ref.name == "Sky/Env") ++envWrappers;
+		if (!lr.ok || envWrappers != 1) {
+			cerr << "Module document failed: fixed ref not converged after restore\n";
+			return 1;
+		}
+
+		cout << "Module document ok: save/load, definition restore, bound init, convergence\n";
+	}
+
 	// P3：ThenAll 用实例 Entries/Exits 接线
 	{
 		BufferDesc bufDesc;
@@ -648,9 +963,9 @@ int main()
 		bufDesc.hostVisible = true;
 
 		RenderGraphBuilder mod;
-		mod.DeclareResource("Src", bufDesc);
-		mod.DeclareResource("Dst", bufDesc);
-		mod.DeclareResource("Temp", bufDesc);
+		mod.DeclareBufferResource("Src", bufDesc);
+		mod.DeclareBufferResource("Dst", bufDesc);
+		mod.DeclareBufferResource("Temp", bufDesc);
 		mod.DeclarePass("Step", { "Src" }, { "Temp" }, Pass::Host, HostPassDesc{});
 		mod.DeclarePass("Copy", { "Temp" }, { "Dst" }, Pass::Host, HostPassDesc{});
 		mod.DeclareTopology(RenderGraphBuilder::Topology::Sequence({ "Step", "Copy" }));
@@ -666,9 +981,9 @@ int main()
 		}
 
 		RenderGraphBuilder parent;
-		parent.DeclareResource("Color", bufDesc);
-		parent.DeclareResource("OutA", bufDesc);
-		parent.DeclareResource("OutB", bufDesc);
+		parent.DeclareBufferResource("Color", bufDesc);
+		parent.DeclareBufferResource("OutA", bufDesc);
+		parent.DeclareBufferResource("OutB", bufDesc);
 		parent.DeclarePass("Init", {}, { "Color" }, Pass::Host, HostPassDesc{});
 
 		auto a = parent.Instantiate(m, "a", { { "Src", "Color" }, { "Dst", "OutA" } });
@@ -713,9 +1028,9 @@ int main()
 		bufDesc.hostVisible = true;
 
 		RenderGraphBuilder mod;
-		mod.DeclareResource("Src", bufDesc);
-		mod.DeclareResource("Dst", bufDesc);
-		mod.DeclareResource("Temp", bufDesc);
+		mod.DeclareBufferResource("Src", bufDesc);
+		mod.DeclareBufferResource("Dst", bufDesc);
+		mod.DeclareBufferResource("Temp", bufDesc);
 		mod.DeclarePass("Step", { "Src" }, { "Temp" }, Pass::Host, HostPassDesc{});
 		mod.DeclarePass("Copy", { "Temp" }, { "Dst" }, Pass::Host, HostPassDesc{});
 		mod.DeclareTopology(RenderGraphBuilder::Topology::Sequence({ "Step", "Copy" }));
@@ -731,9 +1046,9 @@ int main()
 		}
 
 		RenderGraphBuilder parent;
-		parent.DeclareResource("Color", bufDesc);
-		parent.DeclareResource("OutA", bufDesc);
-		parent.DeclareResource("OutB", bufDesc);
+		parent.DeclareBufferResource("Color", bufDesc);
+		parent.DeclareBufferResource("OutA", bufDesc);
+		parent.DeclareBufferResource("OutB", bufDesc);
 		parent.DeclarePass("Init", {}, { "Color" }, Pass::Host, HostPassDesc{});
 
 		auto a = parent.Instantiate(m, "a", { { "Src", "Color" }, { "Dst", "OutA" } });
@@ -810,9 +1125,9 @@ int main()
 		bufDesc.hostVisible = true;
 
 		RenderGraphBuilder inner;
-		inner.DeclareResource("Src", bufDesc);
-		inner.DeclareResource("Dst", bufDesc);
-		inner.DeclareResource("Temp", bufDesc);
+		inner.DeclareBufferResource("Src", bufDesc);
+		inner.DeclareBufferResource("Dst", bufDesc);
+		inner.DeclareBufferResource("Temp", bufDesc);
 		inner.DeclarePass("Step", { "Src" }, { "Temp" }, Pass::Host, HostPassDesc{});
 		inner.DeclarePass("Copy", { "Temp" }, { "Dst" }, Pass::Host, HostPassDesc{});
 		inner.DeclareTopology(RenderGraphBuilder::Topology::Sequence({ "Step", "Copy" }));
@@ -827,8 +1142,8 @@ int main()
 		}
 
 		RenderGraphBuilder outer;
-		outer.DeclareResource("SharedIn", bufDesc);
-		outer.DeclareResource("SharedOut", bufDesc);
+		outer.DeclareBufferResource("SharedIn", bufDesc);
+		outer.DeclareBufferResource("SharedOut", bufDesc);
 		if (!outer.Instantiate(innerMod, "in", {
 			{ "Src", "SharedIn" }, { "Dst", "SharedOut" },
 		})) {
@@ -845,8 +1160,8 @@ int main()
 		}
 
 		RenderGraphBuilder top;
-		top.DeclareResource("RealIn", bufDesc);
-		top.DeclareResource("RealOut", bufDesc);
+		top.DeclareBufferResource("RealIn", bufDesc);
+		top.DeclareBufferResource("RealOut", bufDesc);
 		top.DeclarePass("Init", {}, { "RealIn" }, Pass::Host, HostPassDesc{});
 		auto out = top.Instantiate(outerMod, "out", {
 			{ "SharedIn", "RealIn" }, { "SharedOut", "RealOut" },
@@ -894,28 +1209,34 @@ int main()
 		docColor.height = 180;
 		docColor.mipLevels = 3;
 		docColor.format = ImageFormat::RGBA16F;
-		ResourceOptions docColorOptions;
+		ImageOptions docColorOptions;
 		docColorOptions.view = ImageSubresource{ 0, 0 };
 		docColorOptions.initialLayout = rhi::ImageLayout::Undefined;
-		docBuilder.DeclareResource("Color", docColor, docColorOptions);
-		docBuilder.DeclareResource("ColorAlt", docColor, docColorOptions);
+		docBuilder.DeclareImageResource("Color", docColor, docColorOptions);
+		docBuilder.DeclareImageResource("ColorAlt", docColor, docColorOptions);
+
+		ImageDesc docSrgb;
+		docSrgb.width = 64;
+		docSrgb.height = 64;
+		docSrgb.format = ImageFormat::RGBA8Srgb;
+		docBuilder.DeclareImageResource("ColorSrgb", docSrgb);
 
 		BufferDesc docParams;
 		docParams.size = 512;
 		docParams.usage = BufferUsage::Uniform | BufferUsage::TransferDst;
 		docParams.hostVisible = true;
 		docParams.crossFrame = true;
-		docBuilder.DeclareResource("Params", docParams);
+		docBuilder.DeclareBufferResource("Params", docParams);
 
 		BufferDesc docSrc;
 		docSrc.size = 256;
 		docSrc.usage = BufferUsage::TransferSrc;
-		docBuilder.DeclareResource("SrcBuf", docSrc);
+		docBuilder.DeclareBufferResource("SrcBuf", docSrc);
 
 		BufferDesc docDst;
 		docDst.size = 256;
 		docDst.usage = BufferUsage::TransferDst;
-		docBuilder.DeclareResource("DstBuf", docDst);
+		docBuilder.DeclareBufferResource("DstBuf", docDst);
 
 		HostPassDesc docHost;
 		docHost.callbackKey = "update.params";
@@ -970,6 +1291,10 @@ int main()
 		docBuilder.AliasLogicalResources({ "Color", "ColorAlt" });
 
 		const RenderGraphDocument document = RenderGraphDocument::Capture(docBuilder);
+		if (document.ToJson().find("\"RGBA8Srgb\"") == std::string::npos) {
+			cerr << "Graph document failed: sRGB format not serialized\n";
+			return 1;
+		}
 		std::error_code fsError;
 		std::filesystem::create_directories("out", fsError);
 		const std::string docPath = "out/rendergraph_document_smoke.json";
@@ -1016,6 +1341,8 @@ int main()
 
 	rhi::DeviceDesc deviceDesc;
 	deviceDesc.enableValidation = true;
+	if (std::getenv("ENGINE_FORCE_FIXED_HEAP") != nullptr)
+		deviceDesc.forceFixedArrayHeap = true;
 	if (window) {
 		deviceDesc.nativeWindowHandle = glfwGetWin32Window(window);
 		deviceDesc.width = 1280;
@@ -1026,6 +1353,38 @@ int main()
 		const uint32_t api = device->ApiVersion();
 		cout << "Device: " << device->DeviceName()
 		     << " (Vulkan " << (api >> 22) << "." << ((api >> 12) & 0x3FF) << ")\n";
+		cout << "Static heap tier: "
+		     << (device->GetStaticHeapTier() == rhi::StaticHeapTier::DescriptorIndexing
+		         ? "bindless" : "fixed-array") << "\n";
+
+		// sRGB 格式：创建、原生格式与视图重解释
+		{
+			rhi::ImageCreateInfo srgbInfo;
+			srgbInfo.width = 8;
+			srgbInfo.height = 8;
+			srgbInfo.format = rhi::ImageFormat::RGBA8Srgb;
+			srgbInfo.usage = rhi::ImageUsage::Sampled;
+			auto srgbImage = device->CreateImage(srgbInfo);
+			if (!srgbImage
+				|| srgbImage->Desc().format != rhi::ImageFormat::RGBA8Srgb
+				|| srgbImage->NativeFormat() != VK_FORMAT_R8G8B8A8_SRGB) {
+				cerr << "sRGB format failed: create/native format\n";
+				return 1;
+			}
+			rhi::ImageCreateInfo linearInfo = srgbInfo;
+			linearInfo.format = rhi::ImageFormat::RGBA8;
+			auto linearImage = device->CreateImage(linearInfo);
+			if (!linearImage) {
+				cerr << "sRGB format failed: linear image\n";
+				return 1;
+			}
+			const rhi::ImageView& view = linearImage->ReinterpretView(rhi::ImageFormat::RGBA8Srgb);
+			if (view.NativeHandle() == VK_NULL_HANDLE) {
+				cerr << "sRGB format failed: reinterpret view\n";
+				return 1;
+			}
+			cout << "sRGB formats ok: RGBA8Srgb create + view reinterpret\n";
+		}
 
 #ifdef ENGINE_SHADER_DIR
 		const std::string shaderDir = ENGINE_SHADER_DIR;
@@ -1038,7 +1397,7 @@ int main()
 		const std::string assetDir;
 #endif
 
-		AssetResolver assets;
+		ContentResolver assets;
 		assets.Mount("shaders", shaderDir);
 		assets.Mount("assets", assetDir);
 		ShaderLibrary shaders(assets);
@@ -1052,6 +1411,490 @@ int main()
 			}
 		}
 		RenderGraph graph(device.get(), &shaders);
+
+		// 资产清单冒烟：只做解析 / 校验，不加载资源
+		{
+			std::error_code fsError;
+			std::filesystem::create_directories("out", fsError);
+			const std::string manifestPath = "out/assets_catalog_smoke.json";
+			{
+				std::ofstream manifest(manifestPath, std::ios::binary | std::ios::trunc);
+				manifest << R"({
+  "version": 1,
+  "images": {
+    "skyview": {
+      "path": "assets/skyview.jpg",
+      "format": "RGBA8",
+      "usage": ["Sampled", "TransferDst"],
+      "initialLayout": "ShaderReadOnly",
+      "srgb": true,
+      "flipY": true
+    }
+  },
+  "buffers": {
+    "dummyParams": {
+      "path": "assets/skyview.jpg",
+      "usage": ["Uniform"],
+      "hostVisible": true,
+      "byteSize": 64
+    }
+  }
+})";
+			}
+
+			ContentResolver catalogAssets;
+			catalogAssets.Mount("shaders", shaderDir);
+			catalogAssets.Mount("assets", assetDir);
+			catalogAssets.Mount("out", "out");
+
+			AssetCatalog catalog(catalogAssets);
+			std::vector<std::string> catalogErrors;
+			bool catalogOk = catalog.LoadManifest(manifestPath, &catalogErrors);
+
+			const ImageAsset* skyview = catalog.FindImage("skyview");
+			const BufferAsset* params = catalog.FindBuffer("dummyParams");
+			catalogOk = catalogOk && skyview != nullptr && params != nullptr
+				&& skyview->format == ImageFormat::RGBA8
+				&& skyview->initialLayout == rhi::ImageLayout::ShaderReadOnly
+				&& skyview->srgb
+				&& skyview->flipY
+				&& (static_cast<uint32_t>(skyview->usage)
+					& static_cast<uint32_t>(rhi::ImageUsage::Sampled)) != 0
+				&& (static_cast<uint32_t>(skyview->usage)
+					& static_cast<uint32_t>(rhi::ImageUsage::TransferDst)) != 0
+				&& params->byteSize == 64 && params->hostVisible
+				&& catalog.FindImage("missing") == nullptr
+				&& catalog.Revision("skyview").has_value()
+				&& catalog.Validate(&catalogErrors);
+
+			ImageAsset duplicate;
+			duplicate.name = "skyview";
+			duplicate.logicalPath = "assets/skyview.jpg";
+			std::string duplicateError;
+			catalogOk = catalogOk && !catalog.RegisterImage(duplicate, &duplicateError);
+
+			for (const auto& error : catalogErrors)
+				cerr << "[AssetCatalog] " << error << "\n";
+			if (!catalogOk) {
+				cerr << "Asset catalog failed\n";
+				return 1;
+			}
+			cout << "Asset catalog ok: images=" << catalog.ImageNames().size()
+			     << " buffers=" << catalog.BufferNames().size() << "\n";
+		}
+
+		// AssetLoader：地址缓存 + 描述一致性 + asset 键声明
+		{
+			ContentResolver loaderAssets;
+			loaderAssets.Mount("shaders", shaderDir);
+			loaderAssets.Mount("assets", assetDir);
+			loaderAssets.Mount("out", "out");
+
+			AssetCatalog catalog(loaderAssets);
+			std::vector<std::string> catalogErrors;
+			if (!catalog.LoadManifest("out/assets_catalog_smoke.json", &catalogErrors)) {
+				cerr << "Asset loader failed: catalog reload\n";
+				return 1;
+			}
+
+			AssetLoader loader(*device, catalog);
+			std::string loaderError;
+			const rhi::Image* first = loader.AcquireImage("skyview", &loaderError);
+			const rhi::Image* second = loader.AcquireImage("skyview", &loaderError);
+			const rhi::Buffer* buffer = loader.AcquireBuffer("dummyParams", &loaderError);
+			const rhi::Buffer* bufferAgain = loader.AcquireBuffer("dummyParams", &loaderError);
+			if (first == nullptr || second != first || loader.ImageCount() != 1
+				|| first->Desc().format != ImageFormat::RGBA8Srgb
+				|| first->NativeFormat() != VK_FORMAT_R8G8B8A8_SRGB
+				|| buffer == nullptr || bufferAgain != buffer || loader.BufferCount() != 1) {
+				cerr << "Asset loader failed: cache miss/duplicate " << loaderError << "\n";
+				return 1;
+			}
+
+			// 同一路径 / 不同描述 -> 拒绝复用
+			ImageAsset conflict;
+			conflict.name = "skyviewBgra";
+			conflict.logicalPath = "assets/skyview.jpg";
+			conflict.format = ImageFormat::BGRA8;
+			std::string registerError;
+			if (!catalog.RegisterImage(conflict, &registerError)
+				|| loader.AcquireImage("skyviewBgra", &loaderError) != nullptr) {
+				cerr << "Asset loader failed: conflicting description accepted\n";
+				return 1;
+			}
+
+			// 描述校验：Cube 必须是 6 层
+			ImageAsset badCube;
+			badCube.name = "badCube";
+			badCube.logicalPath = "assets/skyview.jpg";
+			badCube.viewType = rhi::ImageViewType::Cube;
+			if (catalog.RegisterImage(badCube, &registerError)) {
+				cerr << "Asset loader failed: invalid cube accepted\n";
+				return 1;
+			}
+
+			// srgb 标记必须能映射到 sRGB 变体
+			ImageAsset badSrgb;
+			badSrgb.name = "badSrgb";
+			badSrgb.logicalPath = "assets/skyview.jpg";
+			badSrgb.format = ImageFormat::R16F;
+			badSrgb.srgb = true;
+			if (catalog.RegisterImage(badSrgb, &registerError)) {
+				cerr << "Asset loader failed: srgb on float format accepted\n";
+				return 1;
+			}
+
+			// asset 键声明：有 loader 时直接构造句柄；无 loader 时保持未绑定并在 Lower 报错
+			RenderGraphBuilder boundBuilder(device.get(), &loader);
+			std::string declError;
+			if (!boundBuilder.DeclareImageResource("Env", "skyview", {}, &declError)) {
+				cerr << "Asset loader failed: declare bound " << declError << "\n";
+				return 1;
+			}
+			const RenderGraphDocument boundDoc = RenderGraphDocument::Capture(boundBuilder);
+			if (boundDoc.ToJson().find("\"asset\": \"skyview\"") == std::string::npos
+				|| boundDoc.ToJson().find("\"external\": \"image\"") == std::string::npos) {
+				cerr << "Asset loader failed: asset key not recorded\n";
+				return 1;
+			}
+
+			RenderGraphBuilder unboundBuilder;
+			if (!unboundBuilder.DeclareImageResource("Env", "skyview")) {
+				cerr << "Asset loader failed: unbound declaration rejected\n";
+				return 1;
+			}
+			LowerResult unboundResult = unboundBuilder.Lower();
+			bool unboundReported = false;
+			for (const auto& diag : unboundResult.diagnostics)
+				if (diag.kind == BuilderDiagKind::UnboundExternal) unboundReported = true;
+			if (unboundResult.ok || !unboundReported) {
+				cerr << "Asset loader failed: unbound external not diagnosed\n";
+				return 1;
+			}
+
+			cout << "Asset loader ok: path cache, description conflict, asset-key binding\n";
+		}
+
+		// 整包加载：pack: 路由、内存 SPIR-V、不落盘解压
+		{
+			auto readFile = [](const std::string& path) -> std::vector<uint8_t> {
+				std::ifstream file(path, std::ios::binary | std::ios::ate);
+				if (!file) return {};
+				const std::streamsize size = file.tellg();
+				if (size <= 0) return {};
+				file.seekg(0, std::ios::beg);
+				std::vector<uint8_t> bytes(static_cast<size_t>(size));
+				if (!file.read(reinterpret_cast<char*>(bytes.data()), size)) return {};
+				return bytes;
+			};
+
+			const std::vector<uint8_t> imageBytes = readFile(assetDir + "/skyview.jpg");
+			const std::vector<uint8_t> shaderBytes = readFile(shaderDir + "/blur.comp.spv");
+			if (imageBytes.empty() || shaderBytes.empty()) {
+				cerr << "Asset pack failed: source files missing\n";
+				return 1;
+			}
+
+			std::vector<PackInput> inputs;
+			inputs.push_back({ "assets/skyview.jpg", imageBytes });
+			inputs.push_back({ "shaders/blur.comp.spv", shaderBytes });
+
+			// 包内清单使用无头相对路径，验证来源继承
+			const std::string assetManifest = R"({
+  "version": 1,
+  "images": {
+    "skyview": {
+      "path": "assets/skyview.jpg",
+      "format": "RGBA8",
+      "usage": ["Sampled", "TransferDst"],
+      "initialLayout": "ShaderReadOnly",
+      "srgb": true,
+      "flipY": true
+    }
+  }
+})";
+			const std::string shaderManifest = R"({
+  "version": 1,
+  "shaders": {
+    "blur.comp": { "stage": "Compute", "path": "shaders/blur.comp.spv", "entry": "main" }
+  }
+})";
+			inputs.push_back({ "manifests/assets.json",
+				std::vector<uint8_t>(assetManifest.begin(), assetManifest.end()) });
+			inputs.push_back({ "manifests/shaders.json",
+				std::vector<uint8_t>(shaderManifest.begin(), shaderManifest.end()) });
+			std::string packError;
+			const auto packBytes = BuildAssetPack(inputs, &packError);
+			if (!packBytes) {
+				cerr << "Asset pack failed: build " << packError << "\n";
+				return 1;
+			}
+			const auto pack = AssetPack::Load(*packBytes, &packError);
+			if (!pack) {
+				cerr << "Asset pack failed: load " << packError << "\n";
+				return 1;
+			}
+
+			ContentResolver packAssets;
+			packAssets.Mount("out", "out");
+			packAssets.SetPack(&*pack);
+
+			const auto packed = packAssets.Resolve("pack:assets/skyview.jpg", &packError);
+			const auto packedBytes = packAssets.ViewBinary("pack:assets/skyview.jpg", &packError);
+			if (!packed || packed->kind != ContentResolver::Resolved::Kind::Pack
+				|| packed->absolutePath.has_value()
+				|| !packedBytes || packedBytes->size() != imageBytes.size()
+				|| packAssets.Resolve("assets/skyview.jpg").has_value()) {
+				cerr << "Asset pack failed: pack routing " << packError << "\n";
+				return 1;
+			}
+
+			// 资产清单从包内加载，条目为无头路径 -> 继承 pack:
+			AssetCatalog packCatalog(packAssets);
+			std::vector<std::string> packErrors;
+			if (!packCatalog.LoadManifest("pack:manifests/assets.json", &packErrors)) {
+				cerr << "Asset pack failed: catalog manifest\n";
+				return 1;
+			}
+			const ImageAsset* inheritedAsset = packCatalog.FindImage("skyview");
+			if (!inheritedAsset || inheritedAsset->logicalPath != "pack:assets/skyview.jpg") {
+				cerr << "Asset pack failed: asset path did not inherit pack:\n";
+				return 1;
+			}
+			const auto packRevision = packCatalog.Revision("skyview");
+			AssetLoader packLoader(*device, packCatalog);
+			const rhi::Image* packImage = packLoader.AcquireImage("skyview", &packError);
+			if (!packImage || packImage->Desc().format != ImageFormat::RGBA8Srgb
+				|| !packRevision || packRevision->hash == 0) {
+				cerr << "Asset pack failed: image load " << packError << "\n";
+				return 1;
+			}
+
+			// 着色器清单同样继承，从包解析成内存 SPIR-V，并实际建出管线
+			ShaderLibrary packShaders(packAssets);
+			if (!packShaders.LoadManifest("pack:manifests/shaders.json", &packErrors)) {
+				cerr << "Asset pack failed: shader manifest\n";
+				return 1;
+			}
+			const auto stage = packShaders.Resolve("blur.comp", &packError);
+			if (!stage || !stage->spirvPath.empty() || stage->spirv.empty()) {
+				cerr << "Asset pack failed: memory SPIR-V " << packError << "\n";
+				return 1;
+			}
+			rhi::ComputePipelineDesc memoryPipelineDesc;
+			memoryPipelineDesc.shader = *stage;
+			auto memoryPipeline = device->CreateComputePipeline(memoryPipelineDesc);
+			if (!memoryPipeline) {
+				cerr << "Asset pack failed: memory SPIR-V pipeline\n";
+				return 1;
+			}
+
+			cout << "Asset pack ok: pack: routing, in-memory SPIR-V, no extraction\n";
+		}
+
+		// 模块自动打包：依赖闭包 -> 自包含包 -> 运行时恢复
+		{
+			ContentResolver moduleAssets;
+			moduleAssets.Mount("shaders", shaderDir);
+			moduleAssets.Mount("assets", assetDir);
+			moduleAssets.Mount("out", "out");
+			AssetCatalog moduleCatalog(moduleAssets);
+			std::vector<std::string> moduleErrors;
+			if (!moduleCatalog.LoadManifest("out/assets_catalog_smoke.json", &moduleErrors)) {
+				cerr << "Module pack failed: catalog\n";
+				return 1;
+			}
+
+			RenderGraphBuilder moduleBuilder;
+			BufferDesc dstDesc;
+			dstDesc.size = 256;
+			dstDesc.usage = BufferUsage::Storage;
+			dstDesc.hostVisible = true;
+			moduleBuilder.DeclareBufferResource("Dst", dstDesc);
+			moduleBuilder.DeclareImageResource("Env", "skyview");
+
+			ComputePassDesc compute;
+			compute.shaderRef = "blur.comp";
+			compute.groupCountX = 8;
+			compute.groupCountY = 8;
+			compute.groupCountZ = 1;
+			compute.shaderBindings = {
+				ShaderBinding::Sampled("Env"),
+				ShaderBinding::StorageWrite("Dst"),
+			};
+			moduleBuilder.DeclarePass("Calc", Pass::Compute, compute);
+
+			RenderGraphModule module;
+			std::vector<std::string> compileErrors;
+			if (!moduleBuilder.CompileModule("BlurMod", { { "Dst", ModulePortKind::Output } },
+					&module, &compileErrors)) {
+				cerr << "Module pack failed: compile\n";
+				return 1;
+			}
+			const auto moduleDoc = RenderGraphModuleDocument::Capture(module);
+
+			ModulePackResult packedModule;
+			std::string moduleError;
+			if (!BuildModulePack(moduleDoc, shaders, moduleCatalog, &packedModule, &moduleError)) {
+				cerr << "Module pack failed: build " << moduleError << "\n";
+				return 1;
+			}
+			if (packedModule.shaderRefs.size() != 1 || packedModule.shaderRefs[0] != "blur.comp"
+				|| packedModule.assetKeys.size() != 1 || packedModule.assetKeys[0] != "skyview") {
+				cerr << "Module pack failed: dependency closure\n";
+				return 1;
+			}
+
+			const auto modulePack = AssetPack::Load(packedModule.bytes, &moduleError);
+			if (!modulePack) {
+				cerr << "Module pack failed: load " << moduleError << "\n";
+				return 1;
+			}
+			const char* expectedEntries[] = {
+				"modules/BlurMod.json", "modules/index.json",
+				"manifests/shaders.json", "manifests/assets.json",
+				"shaders/blur.comp.spv", "assets/skyview.jpg",
+			};
+			for (const char* entry : expectedEntries) {
+				if (!modulePack->Contains(entry)) {
+					cerr << "Module pack failed: missing entry " << entry << "\n";
+					return 1;
+				}
+			}
+
+			ContentResolver modulePackAssets;
+			modulePackAssets.SetPack(&*modulePack);
+			ShaderLibrary moduleShaders(modulePackAssets);
+			AssetCatalog modulePackCatalog(modulePackAssets);
+			if (!moduleShaders.LoadManifest("pack:manifests/shaders.json", &moduleErrors)
+				|| !modulePackCatalog.LoadManifest("pack:manifests/assets.json", &moduleErrors)) {
+				cerr << "Module pack failed: packed manifests\n";
+				return 1;
+			}
+			const auto moduleBytes = modulePackAssets.ReadBinary("pack:modules/BlurMod.json", &moduleError);
+			if (!moduleBytes) {
+				cerr << "Module pack failed: module json\n";
+				return 1;
+			}
+			const auto loadedModuleDoc = RenderGraphModuleDocument::FromJson(
+				std::string_view(reinterpret_cast<const char*>(moduleBytes->data()), moduleBytes->size()),
+				&moduleError);
+			if (!loadedModuleDoc) {
+				cerr << "Module pack failed: parse module " << moduleError << "\n";
+				return 1;
+			}
+
+			AssetLoader modulePackLoader(*device, modulePackCatalog);
+			RenderGraphModuleDocument::FixedBindings bindings;
+			bindings.imageAsset = [&](const std::string& key) {
+				return modulePackLoader.AcquireImage(key);
+			};
+			RenderGraphModule restoredModule;
+			std::vector<std::string> restoreErrors;
+			if (!loadedModuleDoc->Restore(restoredModule, &bindings, &restoreErrors)
+				|| !restoredModule.IsInitialized()) {
+				cerr << "Module pack failed: restore"
+					<< (restoreErrors.empty() ? "" : " - " + restoreErrors.front()) << "\n";
+				return 1;
+			}
+
+			cout << "Module pack ok: dependency closure, filtered manifests, restore\n";
+		}
+
+		// 文档资产键：external 记录 asset，Restore 可按资产键回退解析
+		{
+			rhi::ImageCreateInfo assetImageInfo;
+			assetImageInfo.width = 64;
+			assetImageInfo.height = 64;
+			assetImageInfo.format = rhi::ImageFormat::RGBA8;
+			assetImageInfo.usage = rhi::ImageUsage::Sampled;
+			auto assetImage = device->CreateImage(assetImageInfo);
+			if (!assetImage) {
+				cerr << "Asset binding failed: image create\n";
+				return 1;
+			}
+
+			RenderGraphBuilder assetDocBuilder;
+			assetDocBuilder.DeclareImageResource("EnvTexture", assetImage.get(), {}, "skyview");
+			assetDocBuilder.DeclarePass("Capture", { "EnvTexture" }, {}, Pass::Host, HostPassDesc{});
+
+			const RenderGraphDocument assetDoc = RenderGraphDocument::Capture(assetDocBuilder);
+			bool assetOk = assetDoc.ToJson().find("\"asset\": \"skyview\"") != std::string::npos;
+
+			RenderGraphBuilder assetRestored;
+			RenderGraphDocument::ExternalBindings assetBindings;
+			int assetLookups = 0;
+			assetBindings.imageAsset = [&](const std::string& key) -> const rhi::Image* {
+				if (key != "skyview")
+					return nullptr;
+				++assetLookups;
+				return assetImage.get();
+			};
+			std::vector<std::string> assetErrors;
+			assetOk = assetOk && assetDoc.Restore(assetRestored, assetBindings, &assetErrors)
+				&& assetLookups == 1;
+
+			const RenderGraphDocument assetRoundTrip = RenderGraphDocument::Capture(assetRestored);
+			assetOk = assetOk && assetRoundTrip.ToJson() == assetDoc.ToJson();
+
+			for (const auto& error : assetErrors)
+				cerr << "[AssetDocument] " << error << "\n";
+			if (!assetOk) {
+				cerr << "Asset binding failed\n";
+				return 1;
+			}
+			cout << "Asset binding ok: " << assetLookups << " asset lookup\n";
+		}
+
+		// 静态纹理堆：清单化 + 自动恢复（Build 时按声明顺序注册）
+		if (device->GetStaticHeapTier() != rhi::StaticHeapTier::None) {
+			rhi::ImageCreateInfo staticInfo;
+			staticInfo.width = 32;
+			staticInfo.height = 32;
+			staticInfo.format = rhi::ImageFormat::RGBA8;
+			staticInfo.usage = rhi::ImageUsage::Sampled;
+			auto staticImage = device->CreateImage(staticInfo);
+			if (!staticImage) {
+				cerr << "Static texture restore failed: image create\n";
+				return 1;
+			}
+
+			RenderGraphBuilder staticBuilder;
+			staticBuilder.DeclareStaticTexture("skyview", staticImage.get(), {},
+				rhi::ImageFormat::None, rhi::SamplerDesc::Linear(), "skyview");
+
+			const RenderGraphDocument staticDoc = RenderGraphDocument::Capture(staticBuilder);
+			bool staticOk = staticDoc.StaticTextureCount() == 1
+				&& staticDoc.ToJson().find("\"staticTextures\"") != std::string::npos;
+
+			RenderGraphBuilder staticRestored;
+			RenderGraphDocument::ExternalBindings staticBindings;
+			int staticLookups = 0;
+			staticBindings.staticImageAsset = [&](const std::string& key) -> const rhi::Image* {
+				if (key != "skyview")
+					return nullptr;
+				++staticLookups;
+				return staticImage.get();
+			};
+			std::vector<std::string> staticErrors;
+			staticOk = staticOk && staticDoc.Restore(staticRestored, staticBindings, &staticErrors)
+				&& staticLookups == 1;
+
+			const RenderGraphDocument staticRoundTrip = RenderGraphDocument::Capture(staticRestored);
+			staticOk = staticOk && staticRoundTrip.ToJson() == staticDoc.ToJson();
+
+			RenderGraph staticGraph(device.get(), &shaders);
+			staticOk = staticOk && staticRestored.Build(staticGraph)
+				&& staticGraph.RegisterStaticTexture("skyview", *staticImage) == 0;
+
+			for (const auto& error : staticErrors)
+				cerr << "[StaticTexture] " << error << "\n";
+			if (!staticOk) {
+				cerr << "Static texture restore failed\n";
+				return 1;
+			}
+			cout << "Static texture restore ok: " << staticDoc.StaticTextureCount() << " entries\n";
+		}
 
 		RenderPassDesc gbufferDesc;
 		{
@@ -2401,7 +3244,7 @@ int main()
 			}
 
 			{
-				if (!device->SupportsBindlessTextures()) {
+				if (device->GetStaticHeapTier() == rhi::StaticHeapTier::None) {
 					cout << "Static texture heap: unsupported by device, skipped\n";
 				}
 				else {
@@ -2494,7 +3337,9 @@ int main()
 						device->Submit(heapSubmit);
 						device->WaitForFrame();
 						cout << "Static texture heap bind ok: slots=" << slotA << "," << slotB
-						     << " bindless=" << (device->SupportsBindlessTextures() ? "yes" : "no") << "\n";
+						     << " tier="
+						     << (device->GetStaticHeapTier() == rhi::StaticHeapTier::DescriptorIndexing
+						         ? "bindless" : "fixed-array") << "\n";
 
 						{
 							RenderGraph readbackGraph(device.get(), &shaders);
@@ -2699,6 +3544,85 @@ int main()
 				     << ": batches=" << plan.batches.size()
 				     << ", syncPoints=" << plan.syncPoints.size()
 				     << ", memoryBarrier=" << (noMemoryBarrier ? "none" : "present") << "\n";
+			}
+
+			{
+				// 借用同一底层 image 的两个视图节点：布局按 backing 归组，
+				// initialLayout 冲突取最低 id 节点的声明并告警。
+				rhi::ImageCreateInfo borrowInfo;
+				borrowInfo.width = 16; borrowInfo.height = 16;
+				borrowInfo.format = rhi::ImageFormat::RGBA8;
+				borrowInfo.usage = rhi::ImageUsage::Sampled | rhi::ImageUsage::Storage
+					| rhi::ImageUsage::TransferSrc | rhi::ImageUsage::TransferDst;
+				auto borrowImage = device->CreateImage(borrowInfo);
+				if (borrowImage) {
+					RenderGraph borrowGraph(device.get(), &shaders);
+					ComputePassDesc writeDesc;
+					writeDesc.shader = { rhi::ShaderStage::Compute, "" };
+					ShaderBinding writeBinding;
+					writeBinding.resourceName = "BorrowA";
+					writeBinding.usage = Usage::StorageWrite;
+					writeDesc.shaderBindings.push_back(writeBinding);
+
+					ComputePassDesc readDesc;
+					readDesc.shader = { rhi::ShaderStage::Compute, "" };
+					ShaderBinding readBinding;
+					readBinding.resourceName = "BorrowB";
+					readBinding.usage = Usage::SampledRead;
+					readDesc.shaderBindings.push_back(readBinding);
+
+					borrowGraph.RegisterPass("WriteA", {}, { "BorrowA" }, Pass::Compute, writeDesc);
+					RenderGraph::PassOrder afterWrite;
+					afterWrite.after = { "WriteA" };
+					borrowGraph.RegisterPass("ReadB", { "BorrowB" }, {}, Pass::Compute, readDesc, afterWrite);
+					borrowGraph.RegisterResource("BorrowA", {}, "WriteA", borrowImage.get(),
+						{}, rhi::ImageLayout::TransferDst);
+					borrowGraph.RegisterResource("BorrowB", { "ReadB" }, "", borrowImage.get(),
+						{}, rhi::ImageLayout::ShaderReadOnly);
+
+					borrowGraph.ProcessRegister();
+					borrowGraph.GenerateSubmitSequence();
+					borrowGraph.RealizeAllResources();
+					borrowGraph.CompileBarriers();
+
+					auto passIdOf = [&](const std::string& name) -> uint32_t {
+						for (uint32_t i = 0; borrowGraph.GetPass(i) != nullptr; ++i)
+							if (borrowGraph.GetPass(i)->get_name() == name) return i;
+						return UINT32_MAX;
+					};
+					const auto& batches = borrowGraph.GetBarrierBatches();
+					auto barrierAt = [&](const std::string& name, bool& found) {
+						found = false;
+						RenderGraph::GraphImageBarrier result;
+						const uint32_t id = passIdOf(name);
+						if (id == UINT32_MAX)
+							return result;
+						auto it = batches.find(id);
+						if (it == batches.end() || it->second.images.size() != 1)
+							return result;
+						found = true;
+						return it->second.images.front();
+					};
+
+					bool writeFound = false;
+					const RenderGraph::GraphImageBarrier writeBarrier = barrierAt("WriteA", writeFound);
+					bool readFound = false;
+					const RenderGraph::GraphImageBarrier readBarrier = barrierAt("ReadB", readFound);
+					size_t totalImages = 0;
+					for (const auto& kv : batches)
+						totalImages += kv.second.images.size();
+
+					const bool ok = writeFound && readFound
+						&& writeBarrier.oldLayout == rhi::ImageLayout::TransferDst
+						&& writeBarrier.newLayout == rhi::ImageLayout::General
+						&& readBarrier.oldLayout == rhi::ImageLayout::General
+						&& readBarrier.newLayout == rhi::ImageLayout::ShaderReadOnly
+						&& totalImages == 2;
+					cout << "Borrow backing layout " << (ok ? "ok" : "FAILED")
+					     << ": " << (writeFound ? "TransferDst->General" : "missing")
+					     << ", " << (readFound ? "General->ShaderReadOnly" : "missing")
+					     << ", barriers=" << totalImages << "\n";
+				}
 			}
 
 			{
@@ -3239,6 +4163,122 @@ int main()
 			}
 
 			{
+				// Buffer mux（拥有型候选 + Host 写入）：候选用途由输出消费者投影而来，
+				// 消费者读取 mux 输出时必须看到候选的写入
+				RenderGraph ownedUboGraph(device.get(), &shaders);
+
+				BufferDesc ownedUboDesc;
+				ownedUboDesc.size = 256;
+				ownedUboDesc.usage = rhi::BufferUsage::Uniform;
+				ownedUboDesc.hostVisible = true;
+
+				ownedUboGraph.RegisterMuxOutput("ubo", { "TintOwned" }, "SelectOwned", ownedUboDesc);
+				ownedUboGraph.RegisterResource("UboOwnedA", { "SelectOwned" }, "FillA",
+					Resource::Buffer, ownedUboDesc);
+				ownedUboGraph.RegisterResource("UboOwnedB", { "SelectOwned" }, "FillB",
+					Resource::Buffer, ownedUboDesc);
+				ownedUboGraph.RegisterPass("FillA", {}, { "UboOwnedA" }, Pass::Host, HostPassDesc{});
+				ownedUboGraph.RegisterPass("FillB", {}, { "UboOwnedB" }, Pass::Host, HostPassDesc{});
+
+				MuxPassDesc ownedMuxDesc;
+				ownedMuxDesc.alternatives = { "UboOwnedA", "UboOwnedB" };
+				ownedUboGraph.RegisterPass("SelectOwned", { "UboOwnedA", "UboOwnedB" }, { "ubo" },
+					Pass::Mux, ownedMuxDesc);
+
+				RenderPassDesc ownedTintDesc;
+				{
+					AttachmentBinding att;
+					att.resourceName = "OwnedOut";
+					att.slot = 0;
+					att.load = LoadOp::Clear;
+					att.clear.value = std::array<float, 4>{ 0.0f, 0.0f, 0.0f, 1.0f };
+					ownedTintDesc.attachments.push_back(att);
+
+					ShaderBinding ub;
+					ub.resourceName = "ubo";
+					ub.usage = Usage::UniformRead;
+					ownedTintDesc.shaderBindings.push_back(ub);
+					ownedTintDesc.pipeline.shaderRefs = { "fullscreen.vert", "ubo.frag" };
+					ownedTintDesc.pipeline.cullMode = CullMode::None;
+					ownedTintDesc.pipeline.depthStencil.depthTestEnable = false;
+				}
+				ownedUboGraph.RegisterPass("TintOwned", { "ubo" }, { "OwnedOut" }, Pass::Render,
+					ownedTintDesc);
+				ownedUboGraph.RegisterPass("VerifyOwned", { "OwnedOut" }, {}, Pass::Host, HostPassDesc{});
+
+				ImageDesc ownedOutDesc;
+				ownedOutDesc.width = 64; ownedOutDesc.height = 64;
+				ownedOutDesc.format = ImageFormat::RGBA8;
+				ownedUboGraph.RegisterResource("OwnedOut", { "VerifyOwned" }, "TintOwned",
+					Resource::Image, ownedOutDesc);
+
+				ownedUboGraph.ProcessRegister();
+				ownedUboGraph.GenerateSubmitSequence();
+				ownedUboGraph.RealizeAll();
+
+				for (uint32_t i = 0; ownedUboGraph.GetPass(i) != nullptr; ++i) {
+					Pass* p = ownedUboGraph.GetPass(i);
+					if (p->get_type() != Pass::Render)
+						continue;
+					DrawSource draw;
+					draw.count = 3;
+					static_cast<RenderPass*>(p)->SetDraw(draw);
+				}
+
+				const std::array<float, 4> ownedRed = { 1.0f, 0.0f, 0.0f, 1.0f };
+				const std::array<float, 4> ownedBlue = { 0.0f, 0.0f, 1.0f, 1.0f };
+				static_cast<HostPass*>(ownedUboGraph.FindPass("FillA"))->SetCallback(
+					[ownedRed](HostContext& ctx) {
+						ctx.WaitForGpu();
+						if (rhi::Buffer* buf = ctx.WriteBuffer("UboOwnedA"))
+							std::memcpy(buf->Map(), ownedRed.data(), sizeof(float) * 4);
+						ctx.SignalGpu();
+					});
+				static_cast<HostPass*>(ownedUboGraph.FindPass("FillB"))->SetCallback(
+					[ownedBlue](HostContext& ctx) {
+						ctx.WaitForGpu();
+						if (rhi::Buffer* buf = ctx.WriteBuffer("UboOwnedB"))
+							std::memcpy(buf->Map(), ownedBlue.data(), sizeof(float) * 4);
+						ctx.SignalGpu();
+					});
+
+				unsigned char ownedPixel[4] = {};
+				bool ownedOk = false;
+				if (HostPass* verifyOwned =
+					static_cast<HostPass*>(ownedUboGraph.FindPass("VerifyOwned"))) {
+					verifyOwned->SetCallback([&ownedPixel](HostContext& ctx) {
+						ctx.WaitForGpu();
+						const unsigned char* px = static_cast<const unsigned char*>(
+							ctx.ReadImage("OwnedOut"));
+						if (px != nullptr)
+							std::memcpy(ownedPixel, px, sizeof(ownedPixel));
+						ctx.SignalGpu();
+					});
+
+					const uint32_t slot0 = device->BeginFrame();
+					ownedUboGraph.SetMuxSelection("SelectOwned", slot0, 0);
+					ownedUboGraph.BeginFrame(slot0);
+					ownedUboGraph.SubmitGraph();
+					ownedUboGraph.WaitHostPasses();
+					device->WaitForFrame();
+					const bool ownedRedOk = ownedPixel[0] == 255 && ownedPixel[1] == 0
+						&& ownedPixel[2] == 0 && ownedPixel[3] == 255;
+
+					const uint32_t slot1 = device->BeginFrame();
+					ownedUboGraph.SetMuxSelection("SelectOwned", slot1, 1);
+					ownedUboGraph.BeginFrame(slot1);
+					ownedUboGraph.SubmitGraph();
+					ownedUboGraph.WaitHostPasses();
+					device->WaitForFrame();
+					const bool ownedBlueOk = ownedPixel[0] == 0 && ownedPixel[1] == 0
+						&& ownedPixel[2] == 255 && ownedPixel[3] == 255;
+					ownedOk = ownedRedOk && ownedBlueOk;
+				}
+				cout << "Mux buffer owned candidates " << (ownedOk ? "ok" : "FAILED")
+				     << ": red->blue switch\n";
+			}
+
+			{
 				ComputePassDesc emptyCompute;
 				emptyCompute.shader = { rhi::ShaderStage::Compute, "" };
 				BufferDesc dataDesc;
@@ -3499,7 +4539,7 @@ int main()
 				toB.sourceName = "SrcB";
 				toB.destName = "AliasB";
 				aliasGraph.RegisterPass("UseB", { "SrcB" }, { "AliasB" }, Pass::Transfer,
-					toB, {}, rhi::QueueClass::AsyncCompute);
+					toB, {}, rhi::QueueClass::Transfer);
 
 				aliasGraph.RegisterResource("SrcA", { "UseA" }, "", Resource::Buffer, aliasSrcDesc);
 				aliasGraph.RegisterResource("AliasA", {}, "UseA", Resource::Image, aliasImageDesc);
@@ -3521,6 +4561,302 @@ int main()
 				cout << "Alias shared handle: "
 					<< (aliasA != nullptr && aliasA == aliasB ? "ok" : "FAILED")
 					<< " (" << aliasGraph.GetSubmitPlan().batches.size() << " batches)\n";
+			}
+			{
+				// 跨队列并发无法由 submitSeq 顺序保证不重叠：保守拒绝，退回独立资源
+				RenderGraph crossQueueGraph(device.get(), &shaders);
+
+				BufferDesc srcDesc;
+				srcDesc.size = 16;
+				srcDesc.usage = rhi::BufferUsage::TransferSrc;
+				srcDesc.hostVisible = true;
+
+				ImageDesc imageDesc;
+				imageDesc.width = 64; imageDesc.height = 64;
+				imageDesc.format = ImageFormat::RGBA8;
+
+				TransferPassDesc toA;
+				toA.kind = TransferKind::BufferToImage;
+				toA.sourceName = "SrcA";
+				toA.destName = "AliasA";
+				crossQueueGraph.RegisterPass("UseA", { "SrcA" }, { "AliasA" }, Pass::Transfer,
+					toA, {}, rhi::QueueClass::Transfer);
+
+				TransferPassDesc toB = toA;
+				toB.sourceName = "SrcB";
+				toB.destName = "AliasB";
+				crossQueueGraph.RegisterPass("UseB", { "SrcB" }, { "AliasB" }, Pass::Transfer,
+					toB, {}, rhi::QueueClass::AsyncCompute);
+
+				crossQueueGraph.RegisterResource("SrcA", { "UseA" }, "", Resource::Buffer, srcDesc);
+				crossQueueGraph.RegisterResource("AliasA", {}, "UseA", Resource::Image, imageDesc);
+				crossQueueGraph.RegisterResource("SrcB", { "UseB" }, "", Resource::Buffer, srcDesc);
+				crossQueueGraph.RegisterResource("AliasB", {}, "UseB", Resource::Image, imageDesc);
+
+				crossQueueGraph.ProcessRegister();
+				crossQueueGraph.GenerateSubmitSequence();
+				crossQueueGraph.AliasResources({ "AliasA", "AliasB" });
+				crossQueueGraph.RealizeAll();
+
+				const rhi::Image* crossA = nullptr;
+				const rhi::Image* crossB = nullptr;
+				for (uint32_t i = 0; crossQueueGraph.GetResource(i) != nullptr; ++i) {
+					Resource* res = crossQueueGraph.GetResource(i);
+					if (res->get_name() == "AliasA") crossA = static_cast<Image*>(res)->get_rhi();
+					else if (res->get_name() == "AliasB") crossB = static_cast<Image*>(res)->get_rhi();
+				}
+				cout << "Alias cross-queue degraded: "
+					<< (crossA != nullptr && crossB != nullptr && crossA != crossB
+						? "ok (independent)" : "FAILED") << "\n";
+			}
+			{
+				// mux 投影寿命：候选的寿命被延长到输出的消费者，别名必须据此拒绝复用
+				RenderGraph muxAliasGraph(device.get(), &shaders);
+
+				BufferDesc muxAliasSrcDesc;
+				muxAliasSrcDesc.size = 16;
+				muxAliasSrcDesc.usage = rhi::BufferUsage::TransferSrc;
+				muxAliasSrcDesc.hostVisible = true;
+
+				BufferDesc muxAliasDstDesc;
+				muxAliasDstDesc.size = 16;
+				muxAliasDstDesc.usage = rhi::BufferUsage::TransferDst;
+				muxAliasDstDesc.hostVisible = true;
+
+				ImageDesc muxAliasImageDesc;
+				muxAliasImageDesc.width = 64; muxAliasImageDesc.height = 64;
+				muxAliasImageDesc.format = ImageFormat::RGBA8;
+
+				TransferPassDesc makeA;
+				makeA.kind = TransferKind::BufferToImage;
+				makeA.sourceName = "SrcA";
+				makeA.destName = "CandA";
+				muxAliasGraph.RegisterPass("MakeA", { "SrcA" }, { "CandA" }, Pass::Transfer, makeA,
+					{}, rhi::QueueClass::Graphics);
+
+				TransferPassDesc makeB = makeA;
+				makeB.sourceName = "SrcB";
+				makeB.destName = "CandB";
+				muxAliasGraph.RegisterPass("MakeB", { "SrcB" }, { "CandB" }, Pass::Transfer, makeB,
+					{}, rhi::QueueClass::Graphics);
+
+				muxAliasGraph.RegisterMuxOutput("MixOut", { "Consume" }, "Select", muxAliasImageDesc);
+				MuxPassDesc muxAliasDesc;
+				muxAliasDesc.alternatives = { "CandA", "CandB" };
+				muxAliasGraph.RegisterPass("Select", { "CandA", "CandB" }, { "MixOut" }, Pass::Mux,
+					muxAliasDesc, {}, rhi::QueueClass::Graphics);
+
+				TransferPassDesc makeOther;
+				makeOther.kind = TransferKind::BufferToImage;
+				makeOther.sourceName = "SrcC";
+				makeOther.destName = "Other";
+				muxAliasGraph.RegisterPass("MakeOther", { "SrcC" }, { "Other" }, Pass::Transfer, makeOther,
+					{}, rhi::QueueClass::Graphics);
+
+				TransferPassDesc consume;
+				consume.kind = TransferKind::ImageToBuffer;
+				consume.sourceName = "MixOut";
+				consume.destName = "Dst";
+				muxAliasGraph.RegisterPass("Consume", { "MixOut" }, { "Dst" }, Pass::Transfer, consume,
+					{}, rhi::QueueClass::Graphics);
+
+				muxAliasGraph.RegisterResource("SrcA", { "MakeA" }, "", Resource::Buffer, muxAliasSrcDesc);
+				muxAliasGraph.RegisterResource("CandA", { "Select" }, "MakeA", Resource::Image,
+					muxAliasImageDesc);
+				muxAliasGraph.RegisterResource("SrcB", { "MakeB" }, "", Resource::Buffer, muxAliasSrcDesc);
+				muxAliasGraph.RegisterResource("CandB", { "Select" }, "MakeB", Resource::Image,
+					muxAliasImageDesc);
+				muxAliasGraph.RegisterResource("SrcC", { "MakeOther" }, "", Resource::Buffer,
+					muxAliasSrcDesc);
+				muxAliasGraph.RegisterResource("Other", {}, "MakeOther", Resource::Image,
+					muxAliasImageDesc);
+				muxAliasGraph.RegisterResource("Dst", {}, "Consume", Resource::Buffer, muxAliasDstDesc);
+
+				muxAliasGraph.ProcessRegister();
+				muxAliasGraph.GenerateSubmitSequence();
+				muxAliasGraph.AliasResources({ "CandA", "Other" });
+				muxAliasGraph.RealizeAll();
+
+				const rhi::Image* candA = nullptr;
+				const rhi::Image* other = nullptr;
+				for (uint32_t i = 0; muxAliasGraph.GetResource(i) != nullptr; ++i) {
+					Resource* res = muxAliasGraph.GetResource(i);
+					if (res->get_name() == "CandA") candA = static_cast<Image*>(res)->get_rhi();
+					else if (res->get_name() == "Other") other = static_cast<Image*>(res)->get_rhi();
+				}
+				cout << "Alias mux proxy lifetime: "
+					<< (candA != nullptr && other != nullptr && candA != other
+						? "ok (independent)" : "FAILED") << "\n";
+			}
+			{
+				// mux 输出不参与别名：只把输出从组里剔除，其余成员仍共享内存
+				RenderGraph skipGraph(device.get(), &shaders);
+
+				BufferDesc skipSrcDesc;
+				skipSrcDesc.size = 16;
+				skipSrcDesc.usage = rhi::BufferUsage::TransferSrc;
+				skipSrcDesc.hostVisible = true;
+
+				ImageDesc skipImageDesc;
+				skipImageDesc.width = 64; skipImageDesc.height = 64;
+				skipImageDesc.format = ImageFormat::RGBA8;
+
+				TransferPassDesc makeSkipA;
+				makeSkipA.kind = TransferKind::BufferToImage;
+				makeSkipA.sourceName = "SkipSrcA";
+				makeSkipA.destName = "SkipA";
+				skipGraph.RegisterPass("MakeSkipA", { "SkipSrcA" }, { "SkipA" }, Pass::Transfer,
+					makeSkipA, {}, rhi::QueueClass::Graphics);
+
+				TransferPassDesc makeSkipB = makeSkipA;
+				makeSkipB.sourceName = "SkipSrcB";
+				makeSkipB.destName = "SkipB";
+				skipGraph.RegisterPass("MakeSkipB", { "SkipSrcB" }, { "SkipB" }, Pass::Transfer,
+					makeSkipB, {}, rhi::QueueClass::Graphics);
+
+				skipGraph.RegisterMuxOutput("SkipMuxOut", {}, "SkipSelect", skipImageDesc);
+				MuxPassDesc skipMuxDesc;
+				skipMuxDesc.alternatives = { "SkipCandA", "SkipCandB" };
+				skipGraph.RegisterPass("SkipSelect", { "SkipCandA", "SkipCandB" }, { "SkipMuxOut" },
+					Pass::Mux, skipMuxDesc, {}, rhi::QueueClass::Graphics);
+
+				skipGraph.RegisterResource("SkipSrcA", { "MakeSkipA" }, "", Resource::Buffer,
+					skipSrcDesc);
+				skipGraph.RegisterResource("SkipA", {}, "MakeSkipA", Resource::Image, skipImageDesc);
+				skipGraph.RegisterResource("SkipSrcB", { "MakeSkipB" }, "", Resource::Buffer,
+					skipSrcDesc);
+				skipGraph.RegisterResource("SkipB", {}, "MakeSkipB", Resource::Image, skipImageDesc);
+				skipGraph.RegisterResource("SkipCandA", { "SkipSelect" }, "", Resource::Image,
+					skipImageDesc);
+				skipGraph.RegisterResource("SkipCandB", { "SkipSelect" }, "", Resource::Image,
+					skipImageDesc);
+
+				skipGraph.ProcessRegister();
+				skipGraph.GenerateSubmitSequence();
+				skipGraph.AliasResources({ "SkipMuxOut", "SkipA", "SkipB" });
+				skipGraph.RealizeAll();
+
+				const rhi::Image* skipA = nullptr;
+				const rhi::Image* skipB = nullptr;
+				for (uint32_t i = 0; skipGraph.GetResource(i) != nullptr; ++i) {
+					Resource* res = skipGraph.GetResource(i);
+					if (res->get_name() == "SkipA") skipA = static_cast<Image*>(res)->get_rhi();
+					else if (res->get_name() == "SkipB") skipB = static_cast<Image*>(res)->get_rhi();
+				}
+				cout << "Mux output skipped in alias group: "
+					<< (skipA != nullptr && skipA == skipB ? "ok (shared)" : "FAILED") << "\n";
+			}
+			{
+				// StorageReadWrite：同一 storage buffer 在同 Pass 内既读又写（就地累加）
+				RenderGraph rmwGraph(device.get(), &shaders);
+
+				BufferDesc counterDesc;
+				counterDesc.size = 256 * sizeof(uint32_t);
+				counterDesc.usage = rhi::BufferUsage::Storage | rhi::BufferUsage::TransferSrc;
+				counterDesc.hostVisible = true;
+				rmwGraph.RegisterResource("Counter", { "Read" }, "RMW", Resource::Buffer, counterDesc);
+
+				rmwGraph.RegisterPass("Init", {}, { "Counter" }, Pass::Host, HostPassDesc{});
+
+				ComputePassDesc rmwDesc;
+				rmwDesc.shaderRef = "rmw.comp";
+				rmwDesc.groupCountX = 256 / 64;
+				rmwDesc.shaderBindings = { ShaderBinding::StorageReadWrite("Counter") };
+				rmwGraph.RegisterPass("RMW", { "Counter" }, { "Counter" }, Pass::Compute, rmwDesc);
+
+				rmwGraph.RegisterPass("Read", { "Counter" }, {}, Pass::Host, HostPassDesc{});
+
+				rmwGraph.ProcessRegister();
+				rmwGraph.GenerateSubmitSequence();
+				rmwGraph.RealizeAll();
+
+				HostPass* initPass = static_cast<HostPass*>(rmwGraph.FindPass("Init"));
+				HostPass* readPass = static_cast<HostPass*>(rmwGraph.FindPass("Read"));
+				bool rmwOk = false;
+				initPass->SetCallback([](HostContext& ctx) {
+					ctx.WaitForGpu();
+					if (rhi::Buffer* buffer = ctx.WriteBuffer("Counter")) {
+						uint32_t* data = static_cast<uint32_t*>(buffer->Map());
+						for (uint32_t i = 0; i < 256; ++i)
+							data[i] = i;
+					}
+					ctx.SignalGpu();
+				});
+				readPass->SetCallback([&rmwOk](HostContext& ctx) {
+					ctx.WaitForGpu();
+					if (const rhi::Buffer* buffer = ctx.ReadBuffer("Counter")) {
+						const uint32_t* data = static_cast<const uint32_t*>(buffer->Map());
+						rmwOk = data != nullptr && data[0] == 1 && data[128] == 129 && data[255] == 256;
+					}
+					ctx.SignalGpu();
+				});
+
+				rmwGraph.SubmitGraph();
+				rmwGraph.WaitHostPasses();
+				device->WaitForFrame();
+				cout << "Storage read-write ok: " << (rmwOk ? "yes" : "FAILED") << "\n";
+			}
+			{
+				// Builder 就地读写：同 Pass 读写同名资源，由 StorageReadWrite 显式声明
+				RenderGraph builderRmwGraph(device.get(), &shaders);
+				RenderGraphBuilder rmwBuilder;
+
+				BufferDesc counterDesc;
+				counterDesc.size = 256 * sizeof(uint32_t);
+				counterDesc.usage = rhi::BufferUsage::Storage | rhi::BufferUsage::TransferSrc;
+				counterDesc.hostVisible = true;
+				rmwBuilder.DeclareBufferResource("Counter", counterDesc);
+
+				rmwBuilder.DeclarePass("Init", {}, { "Counter" }, Pass::Host, HostPassDesc{});
+
+				ComputePassDesc rmwDesc;
+				rmwDesc.shaderRef = "rmw.comp";
+				rmwDesc.groupCountX = 256 / 64;
+				rmwDesc.shaderBindings = { ShaderBinding::StorageReadWrite("Counter") };
+				rmwBuilder.DeclarePass("RMW", Pass::Compute, rmwDesc);
+
+				rmwBuilder.DeclarePass("Read", { "Counter" }, {}, Pass::Host, HostPassDesc{});
+				rmwBuilder.DeclareTopology(
+					RenderGraphBuilder::Topology::Sequence({ "Init", "RMW", "Read" }));
+
+				LowerResult lower = rmwBuilder.Lower();
+				if (!lower.ok) {
+					for (const auto& diagnostic : lower.diagnostics)
+						cerr << "RenderGraphBuilder: " << diagnostic.message << "\n";
+					return 1;
+				}
+				rmwBuilder.Build(builderRmwGraph);
+				builderRmwGraph.ProcessRegister();
+				builderRmwGraph.GenerateSubmitSequence();
+				builderRmwGraph.RealizeAll();
+
+				HostPass* initPass = static_cast<HostPass*>(builderRmwGraph.FindPass("Init"));
+				HostPass* readPass = static_cast<HostPass*>(builderRmwGraph.FindPass("Read"));
+				bool builderRmwOk = false;
+				initPass->SetCallback([](HostContext& ctx) {
+					ctx.WaitForGpu();
+					if (rhi::Buffer* buffer = ctx.WriteBuffer("Counter")) {
+						uint32_t* data = static_cast<uint32_t*>(buffer->Map());
+						for (uint32_t i = 0; i < 256; ++i)
+							data[i] = i;
+					}
+					ctx.SignalGpu();
+				});
+				readPass->SetCallback([&builderRmwOk](HostContext& ctx) {
+					ctx.WaitForGpu();
+					if (const rhi::Buffer* buffer = ctx.ReadBuffer("Counter")) {
+						const uint32_t* data = static_cast<const uint32_t*>(buffer->Map());
+						builderRmwOk = data != nullptr
+							&& data[0] == 1 && data[128] == 129 && data[255] == 256;
+					}
+					ctx.SignalGpu();
+				});
+
+				builderRmwGraph.SubmitGraph();
+				builderRmwGraph.WaitHostPasses();
+				device->WaitForFrame();
+				cout << "Builder storage read-write ok: "
+					<< (builderRmwOk ? "yes" : "FAILED") << "\n";
 			}
 			{
 				RenderGraph rejectGraph(device.get(), &shaders);

@@ -1,0 +1,17 @@
+#version 450
+
+// 就地累加：同一 storage buffer 既读又写，用于验证 Usage::StorageReadWrite。
+// 实例名与图资源名一致（图的按名对账要求 shader 变量名 == 图资源名）。
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) buffer CounterBlock
+{
+	uint values[];
+} Counter;
+
+void main()
+{
+	uint i = gl_GlobalInvocationID.x;
+	if (i < Counter.values.length())
+		Counter.values[i] += 1u;
+}

@@ -1,5 +1,6 @@
 #include "RenderGraphAbstracted.h"
 #include "RenderGraphNodes.h"
+#include "RenderGraphCompare.h"
 #include "ShaderLibrary.h"
 #include <stdexcept>
 #include <iostream>
@@ -22,6 +23,9 @@ static void ValidateResourceName(const std::string& name) {
 		RenderGraph::HandleError(RenderGraph::ErrorCode::ReservedResourceName);
 }
 
+static rhi::ImageUsage UsageToImageBits(Usage u, bool isWrite);
+static rhi::BufferUsage UsageToBufferBits(Usage u);
+
 static const char* UsageName(Usage u) {
 	switch (u) {
 	case Usage::Auto:                   return "Auto";
@@ -32,6 +36,7 @@ static const char* UsageName(Usage u) {
 	case Usage::SampledRead:            return "SampledRead";
 	case Usage::StorageRead:            return "StorageRead";
 	case Usage::StorageWrite:           return "StorageWrite";
+	case Usage::StorageReadWrite:       return "StorageReadWrite";
 	case Usage::UniformRead:            return "UniformRead";
 	case Usage::VertexInputRead:        return "VertexInputRead";
 	case Usage::IndexRead:              return "IndexRead";
@@ -58,7 +63,8 @@ enum class AliasRejectReason {
 	CrossFrameMismatch,
 	AlreadyAssigned,
 	DescMismatch,
-	LifetimeOverlap
+	LifetimeOverlap,
+	QueueMismatch
 };
 
 static const char* AliasRejectText(AliasRejectReason reason) {
@@ -71,6 +77,7 @@ static const char* AliasRejectText(AliasRejectReason reason) {
 	case AliasRejectReason::AlreadyAssigned:   return "already in another alias group";
 	case AliasRejectReason::DescMismatch:      return "desc mismatch";
 	case AliasRejectReason::LifetimeOverlap:   return "lifetime overlap";
+	case AliasRejectReason::QueueMismatch:     return "cross-queue or host use";
 	default:                                   return "none";
 	}
 }
@@ -175,6 +182,12 @@ void RenderGraph::HandleError(ErrorCode code) {
 		std::cerr << "RenderGraph: MSAA 解算源与目标的格式/尺寸/层数不一致" << std::endl; break;
 	case ErrorCode::ShaderResolutionFailed:
 		std::cerr << "RenderGraph: 着色器逻辑名解析失败（检查 ShaderLibrary 是否登记、清单是否加载、文件是否存在）" << std::endl; break;
+	case ErrorCode::AliasResolutionFailed:
+		std::cerr << "RenderGraph: 同一资源的版本链别名失败（跨帧 / Load 原地续写依赖该别名才能正确工作）" << std::endl; break;
+	case ErrorCode::ResourceNotRealized:
+		std::cerr << "RenderGraph: 录制期资源句柄为空，须在录制前调用 RealizeAllResources()（或 RealizeAll()）" << std::endl; break;
+	case ErrorCode::MuxCandidateUsageMismatch:
+		std::cerr << "RenderGraph: Mux 候选的 usage 覆盖不足（候选自身用途 + 输出消费者的用途都必须被候选资源的创建 usage 包含）" << std::endl; break;
 	default:
 		std::cerr << "RenderGraph: 未知校验错误" << std::endl; break;
 	}
@@ -537,6 +550,7 @@ void RenderGraph::ValidateShaderBindings(const std::set<uint32_t>& read, const s
 		case Usage::SampledRead:
 		case Usage::StorageRead:
 		case Usage::StorageWrite:
+		case Usage::StorageReadWrite:
 		case Usage::UniformRead:
 			break;
 		default:
@@ -545,6 +559,12 @@ void RenderGraph::ValidateShaderBindings(const std::set<uint32_t>& read, const s
 
 		uint32_t id = *sb.resourceId;
 		if (sb.usage == Usage::StorageWrite) {
+			if (write.count(id) == 0)
+				throw ErrorCode::ShaderWriteSetMismatch;
+		}
+		else if (sb.usage == Usage::StorageReadWrite) {
+			if (read.count(id) == 0)
+				throw ErrorCode::ShaderReadSetMismatch;
 			if (write.count(id) == 0)
 				throw ErrorCode::ShaderWriteSetMismatch;
 		}
@@ -578,27 +598,6 @@ void RenderGraph::ValidateBindingConflict(const RenderPassDesc& desc)
 	for (auto& att : desc.attachments) {
 		if (att.resourceId.has_value() && boundIds.count(*att.resourceId))
 			throw ErrorCode::AttachmentShaderConflict;
-	}
-}
-
-static rhi::QueueClass DefaultQueueForPass(Pass::Type type, const PassDesc& desc) {
-	switch (type) {
-		case Pass::Transfer: {
-			if (auto* t = std::get_if<TransferPassDesc>(&desc)) {
-				if (t->kind == TransferKind::ImageToImage && t->blit)
-					return rhi::QueueClass::Graphics;
-				if (t->kind == TransferKind::ClearImage)
-					return rhi::QueueClass::Graphics;
-			}
-			return rhi::QueueClass::Transfer;
-		}
-		case Pass::Render:
-		case Pass::Present:
-		case Pass::Compute:
-		case Pass::Mux:
-		case Pass::Host:
-		default:
-			return rhi::QueueClass::Graphics;
 	}
 }
 
@@ -965,6 +964,27 @@ void RenderGraph::ProcessRegister() {
 		if (!outBorrowed || outRes->m_topo.writer != p->get_id())
 			HandleError(ErrorCode::MuxOutputNotBorrowed);
 
+		// usage 覆盖检查：候选必须承载"自身用途 + mux 输出消费者的用途"。
+		// Mux 自身的 MuxPrepare/MuxSelect 不触达内存，不计入需求。
+		auto scanRequired = [&](uint32_t candId, auto&& onUse) {
+			for (auto& qh : passPool) {
+				Pass* q = qh.get();
+				if (q == nullptr)
+					continue;
+				const PassTopology& qt = q->get_topology();
+				auto scan = [&](const std::vector<ResourceUse>& uses, bool isWrite) {
+					for (const auto& use : uses) {
+						if (use.usage == Usage::MuxPrepare || use.usage == Usage::MuxSelect)
+							continue;
+						if (use.resourceId == candId || use.resourceId == entry.outputResId)
+							onUse(use, isWrite);
+					}
+				};
+				scan(qt.reads, false);
+				scan(qt.writes, true);
+			}
+		};
+
 		if (entry.outputType == Resource::Image) {
 			Image* outImg = static_cast<Image*>(outRes);
 			const ImageDesc& od = outImg->get_desc();
@@ -995,6 +1015,19 @@ void RenderGraph::ProcessRegister() {
 					|| outBarrier.base.layer != altBarrier.base.layer
 					|| outBarrier.layerCount != altBarrier.layerCount)
 					HandleError(ErrorCode::MuxCandidateDescMismatch);
+
+				// 借用候选的 usage 由宿主决定：必须覆盖图中所有用途；拥有型候选的 usage 由
+				// DeriveImageUsage 自动并集，无需在此校验
+				if (altImg->is_borrowed() && altImg->get_rhi() != nullptr) {
+					rhi::ImageUsage needBits = rhi::ImageUsage::None;
+					scanRequired(altRes->get_id(), [&needBits](const ResourceUse& use, bool isWrite) {
+						needBits = needBits | UsageToImageBits(use.usage, isWrite);
+					});
+					const uint32_t need = static_cast<uint32_t>(needBits);
+					const uint32_t have = static_cast<uint32_t>(altImg->get_rhi()->Desc().usage);
+					if ((have & need) != need)
+						HandleError(ErrorCode::MuxCandidateUsageMismatch);
+				}
 				entry.alternativeIds.push_back(altRes->get_id());
 			}
 		}
@@ -1008,10 +1041,24 @@ void RenderGraph::ProcessRegister() {
 				Resource* altRes = GetResource(altIds[ai]);
 				if (altRes == nullptr || altRes->get_type() != Resource::Buffer)
 					HandleError(ErrorCode::MuxPassInvalid);
-				const BufferDesc& ad = static_cast<Buffer*>(altRes)->get_desc();
+				Buffer* altBuf = static_cast<Buffer*>(altRes);
+				const BufferDesc& ad = altBuf->get_desc();
 				if (ad.size != od.size || ad.usage != od.usage
 					|| ad.hostVisible != od.hostVisible)
 					HandleError(ErrorCode::MuxCandidateDescMismatch);
+
+				// Buffer 的创建 usage 完全由声明决定（不像图像有自动并集），三种来源都要校验：
+				// 拥有型候选用节点 desc，借用候选用宿主句柄的创建参数
+				rhi::BufferUsage needBits = rhi::BufferUsage::None;
+				scanRequired(altRes->get_id(), [&needBits](const ResourceUse& use, bool) {
+					needBits = needBits | UsageToBufferBits(use.usage);
+				});
+				uint32_t have = static_cast<uint32_t>(altBuf->get_desc().usage);
+				if (altBuf->is_borrowed() && altBuf->get_rhi() != nullptr)
+					have = static_cast<uint32_t>(altBuf->get_rhi()->Desc().usage);
+				const uint32_t need = static_cast<uint32_t>(needBits);
+				if ((have & need) != need)
+					HandleError(ErrorCode::MuxCandidateUsageMismatch);
 				entry.alternativeIds.push_back(altRes->get_id());
 			}
 		}
@@ -1488,6 +1535,34 @@ void RenderGraph::ResolveAliasGroups() {
 
 	BuildSubmitPlan();
 
+	// Mux 候选的投影使用点：mux 输出被某个 pass 消费时，所有候选都在该 pass 上被虚拟访问。
+	// 别名寿命/同队列检查必须把这些投影点算进来，否则会把"寿命不重叠"误判成立。
+	std::map<uint32_t, std::set<uint32_t>> proxyUsePasses;
+	std::set<uint32_t> muxOutputIds;
+	for (const MuxEntry& mux : m_muxes)
+		muxOutputIds.insert(mux.outputResId);
+	if (!m_muxes.empty() && !submitSeq.empty()) {
+		for (const MuxEntry& mux : m_muxes) {
+			for (uint32_t i = 0; i < submitSeq.size(); ++i) {
+				Pass* p = GetPass(submitSeq[i]);
+				if (p == nullptr || p->get_id() == mux.passId)
+					continue;
+				const PassTopology& topo = p->get_topology();
+				auto consumed = [&mux](const std::vector<ResourceUse>& uses) {
+					for (const auto& use : uses)
+						if (use.resourceId == mux.outputResId
+							&& use.usage != Usage::MuxPrepare && use.usage != Usage::MuxSelect)
+							return true;
+					return false;
+				};
+				if (!consumed(topo.reads) && !consumed(topo.writes))
+					continue;
+				for (uint32_t candId : mux.alternativeIds)
+					proxyUsePasses[candId].insert(i);
+			}
+		}
+	}
+
 	for (size_t g = 0; g < m_aliasRequests.size(); ++g) {
 		const std::vector<ResourceRef>& refs = m_aliasRequests[g];
 		auto degrade = [&refs](AliasRejectReason reason) {
@@ -1501,23 +1576,55 @@ void RenderGraph::ResolveAliasGroups() {
 		};
 
 		AliasRejectReason reason = AliasRejectReason::None;
-
 		std::vector<Resource*> members;
+		std::vector<ResourceRef> keptRefs;
 		for (const auto& ref : refs) {
 			Resource* res = nullptr;
 			for (auto& r : resourcePool)
 				if (r != nullptr && r->get_name() == ref.name
 					&& r->get_version() == ref.version) { res = r.get(); break; }
 			if (res == nullptr) { reason = AliasRejectReason::NameNotFound; break; }
+			// mux 输出是虚拟资源：句柄来自候选换绑、屏障由候选代理，本身没有独立内存。
+			// 遇到时只把该成员从组里剔除，其余成员照常参与别名，不整组降级。
+			if (muxOutputIds.count(res->get_id()) != 0) {
+				std::cerr << "RenderGraph: mux 输出 \"" << ref.name
+					<< "\" 不参与别名，已从 alias 组中跳过" << std::endl;
+				continue;
+			}
 			if (res->m_topo.aliasGroup != static_cast<uint32_t>(-1)) {
 				reason = AliasRejectReason::AlreadyAssigned; break;
 			}
 			members.push_back(res);
+			keptRefs.push_back(ref);
 		}
+		// 同一资源的多个版本构成版本链（Load 原地续写 / crossFrame）：
+		// 身份相同，别名是正确性要求，不适用「不同资源复用内存」的校验规则。
+		const bool sameNameChain = keptRefs.size() >= 2
+			&& std::all_of(keptRefs.begin(), keptRefs.end(),
+				[&](const ResourceRef& ref) { return ref.name == keptRefs.front().name; });
 		if (reason == AliasRejectReason::None && members.size() < 2)
 			reason = AliasRejectReason::TooFewMembers;
 
-		if (reason == AliasRejectReason::None) {
+		if (reason != AliasRejectReason::None) {
+			if (sameNameChain) {
+				std::cerr << "RenderGraph: 版本链别名失败：" << refs.front().name
+					<< " (" << AliasRejectText(reason) << ")" << std::endl;
+				HandleError(ErrorCode::AliasResolutionFailed);
+			}
+			degrade(reason);
+			continue;
+		}
+
+		if (sameNameChain) {
+			// 外部资源各版本本就复用同一句柄，不需要也不允许再分块
+			bool external = false;
+			for (Resource* r : members)
+				if (r->m_topo.external) { external = true; break; }
+			if (external)
+				continue;
+			// 跳过 Desc / 寿命检查：同一身份，版本重叠是正常语义
+		}
+		else {
 			const Resource* first = members.front();
 			for (Resource* r : members) {
 				if (r->get_type() != first->get_type()) {
@@ -1552,21 +1659,25 @@ void RenderGraph::ResolveAliasGroups() {
 			}
 		}
 
-		if (reason == AliasRejectReason::None && !submitSeq.empty()) {
+		// 跨资源复用的寿命检查：细到 pass 级，且要求同一队列。
+		// 同队列内 submitSeq 顺序即执行顺序，块级屏障在复用点插入同步；
+		// 跨队列（或涉及异步 Host）无法由索引顺序保证不重叠，保守拒绝。
+		if (!sameNameChain && reason == AliasRejectReason::None && !submitSeq.empty()) {
 			struct Span {
 				uint32_t first = static_cast<uint32_t>(-1);
 				uint32_t last = 0;
 				bool     used = false;
 			};
 			std::vector<Span> spans(members.size());
+			std::optional<rhi::QueueClass> groupQueue;
+			bool queueMismatch = false;
+			bool hostTouched = false;
 			for (uint32_t i = 0; i < submitSeq.size(); ++i) {
 				Pass* p = GetPass(submitSeq[i]);
 				if (p == nullptr)
 					continue;
-				const uint32_t batch = m_passBatch[p->get_id()];
-				if (batch == static_cast<uint32_t>(-1))
-					continue;
 				const PassTopology& topo = p->get_topology();
+				bool touchedPass = false;
 				for (uint32_t m = 0; m < members.size(); ++m) {
 					const uint32_t id = members[m]->get_id();
 					bool touched = false;
@@ -1575,22 +1686,41 @@ void RenderGraph::ResolveAliasGroups() {
 					if (!touched)
 						for (const auto& use : topo.writes)
 							if (use.resourceId == id) { touched = true; break; }
+					if (!touched) {
+						auto pit = proxyUsePasses.find(id);
+						if (pit != proxyUsePasses.end() && pit->second.count(i) != 0)
+							touched = true;
+					}
 					if (!touched)
 						continue;
+					touchedPass = true;
 					Span& s = spans[m];
 					s.used = true;
-					s.first = std::min(s.first, batch);
-					s.last = std::max(s.last, batch);
+					s.first = std::min(s.first, i);
+					s.last = std::max(s.last, i);
 				}
-			}
-			for (size_t a = 0; a < spans.size() && reason == AliasRejectReason::None; ++a) {
-				if (!spans[a].used)
+				if (!touchedPass)
 					continue;
-				for (size_t b = a + 1; b < spans.size(); ++b) {
-					if (!spans[b].used)
+				if (p->get_type() == Pass::Host)
+					hostTouched = true;
+				if (!groupQueue)
+					groupQueue = topo.queue;
+				else if (*groupQueue != topo.queue)
+					queueMismatch = true;
+			}
+			if (hostTouched || queueMismatch) {
+				reason = AliasRejectReason::QueueMismatch;
+			}
+			else {
+				for (size_t a = 0; a < spans.size() && reason == AliasRejectReason::None; ++a) {
+					if (!spans[a].used)
 						continue;
-					if (spans[a].first <= spans[b].last && spans[b].first <= spans[a].last) {
-						reason = AliasRejectReason::LifetimeOverlap; break;
+					for (size_t b = a + 1; b < spans.size(); ++b) {
+						if (!spans[b].used)
+							continue;
+						if (spans[a].first <= spans[b].last && spans[b].first <= spans[a].last) {
+							reason = AliasRejectReason::LifetimeOverlap; break;
+						}
 					}
 				}
 			}
@@ -1783,6 +1913,7 @@ static rhi::ImageUsage UsageToImageBits(Usage u, bool isWrite) {
 	case Usage::SampledRead:            return rhi::ImageUsage::Sampled;
 	case Usage::StorageRead:            return rhi::ImageUsage::Storage;
 	case Usage::StorageWrite:           return rhi::ImageUsage::Storage;
+	case Usage::StorageReadWrite:       return rhi::ImageUsage::Storage;
 	case Usage::UniformRead:            return rhi::ImageUsage::Storage;
 	case Usage::VertexInputRead:
 	case Usage::IndexRead:
@@ -1800,6 +1931,22 @@ static rhi::ImageUsage UsageToImageBits(Usage u, bool isWrite) {
 	default:
 		return isWrite ? rhi::ImageUsage::Storage
 			: (rhi::ImageUsage::Sampled | rhi::ImageUsage::Storage);
+	}
+}
+
+static rhi::BufferUsage UsageToBufferBits(Usage u) {
+	switch (u) {
+	case Usage::UniformRead:            return rhi::BufferUsage::Uniform;
+	case Usage::StorageRead:
+	case Usage::StorageWrite:
+	case Usage::StorageReadWrite:       return rhi::BufferUsage::Storage;
+	case Usage::VertexInputRead:        return rhi::BufferUsage::Vertex;
+	case Usage::IndexRead:              return rhi::BufferUsage::Index;
+	case Usage::IndirectRead:           return rhi::BufferUsage::Indirect;
+	case Usage::TransferRead:           return rhi::BufferUsage::TransferSrc;
+	case Usage::TransferWrite:          return rhi::BufferUsage::TransferDst;
+	case Usage::SampledRead:            return rhi::BufferUsage::Storage;
+	default:                            return rhi::BufferUsage::None;
 	}
 }
 
@@ -1966,6 +2113,8 @@ void RenderGraph::RealizePass(Pass* pass) {
 
 		const rhi::DescriptorSetLayout* externalSet0 =
 			desc.bindStaticHeap ? m_staticHeapLayout.get() : nullptr;
+		if (desc.bindStaticHeap && externalSet0 == nullptr)
+			HandleError(ErrorCode::StaticHeapUnsupported);
 		rp->m_rhiHandle = m_graphicDevice->CreatePipeline(info, externalSet0);
 		if (!rp->m_rhiHandle)
 			HandleError(ErrorCode::PipelineCreationFailed);
@@ -1998,6 +2147,8 @@ void RenderGraph::RealizePass(Pass* pass) {
 		info.pushConstantSize = cp->mDesc.pushConstantSize;
 		const rhi::DescriptorSetLayout* externalSet0 =
 			cp->mDesc.bindStaticHeap ? m_staticHeapLayout.get() : nullptr;
+		if (cp->mDesc.bindStaticHeap && externalSet0 == nullptr)
+			HandleError(ErrorCode::StaticHeapUnsupported);
 		cp->m_rhiHandle = m_graphicDevice->CreateComputePipeline(info, externalSet0);
 		if (!cp->m_rhiHandle)
 			HandleError(ErrorCode::PipelineCreationFailed);
@@ -2044,8 +2195,9 @@ uint32_t RenderGraph::RegisterStaticTexture(const std::string& name, const rhi::
 		HandleError(ErrorCode::DeviceNotSet);
 		return kStaticTextureHeapCapacity;
 	}
-	if (!m_graphicDevice->SupportsBindlessTextures()) {
-		HandleError(ErrorCode::StaticHeapUnsupported);
+	const rhi::StaticHeapTier heapTier = m_graphicDevice->GetStaticHeapTier();
+	if (heapTier == rhi::StaticHeapTier::None) {
+		std::cerr << "RenderGraph: 设备不支持静态纹理堆（采样器数组不可用）" << std::endl;
 		return kStaticTextureHeapCapacity;
 	}
 
@@ -2065,7 +2217,9 @@ uint32_t RenderGraph::RegisterStaticTexture(const std::string& name, const rhi::
 		b.type = rhi::ResourceType::SampledImage;
 		b.arrayCount = kStaticTextureHeapCapacity;
 		b.stages = rhi::ShaderStageMask::None;
-		m_staticHeapLayout = m_graphicDevice->CreateDescriptorSetLayout({ b }, true);
+		// 稀疏绑定需要 descriptor indexing；固定数组回退必须全槽位绑定
+		const bool partiallyBound = heapTier == rhi::StaticHeapTier::DescriptorIndexing;
+		m_staticHeapLayout = m_graphicDevice->CreateDescriptorSetLayout({ b }, partiallyBound);
 		if (!m_staticHeapLayout) {
 			HandleError(ErrorCode::PipelineCreationFailed);
 			return kStaticTextureHeapCapacity;
@@ -2074,6 +2228,24 @@ uint32_t RenderGraph::RegisterStaticTexture(const std::string& name, const rhi::
 		if (!m_staticHeapSet) {
 			HandleError(ErrorCode::DescriptorSetAllocationFailed);
 			return kStaticTextureHeapCapacity;
+		}
+		if (!partiallyBound) {
+			// 未使用槽位绑定 1x1 白色：固定数组模式下描述符不能留空
+			rhi::ImageCreateInfo info;
+			info.width = 1;
+			info.height = 1;
+			info.format = rhi::ImageFormat::RGBA8;
+			info.usage = rhi::ImageUsage::Sampled;
+			const uint32_t white = 0xFFFFFFFFu;
+			m_staticHeapDummy = m_graphicDevice->UploadImage(&white, sizeof(white), info);
+			if (!m_staticHeapDummy) {
+				HandleError(ErrorCode::PipelineCreationFailed);
+				return kStaticTextureHeapCapacity;
+			}
+			for (uint32_t i = 0; i < kStaticTextureHeapCapacity; ++i) {
+				m_staticHeapSet->Write(0, *m_staticHeapDummy, rhi::ImageSubresource{ 0, 0 }, 1,
+					nullptr, rhi::ImageFormat::None, i);
+			}
 		}
 	}
 
@@ -2119,37 +2291,6 @@ void RenderGraph::RegisterMuxOutput(std::string name, std::set<std::string> read
 static bool MergeReject(const std::string& reason) {
 	std::cerr << "RenderGraph: 合并任务被拒绝：" << reason << std::endl;
 	return false;
-}
-
-static bool MergeImageDescEqual(const ImageDesc& a, const ImageDesc& b) {
-	return a.width == b.width && a.height == b.height && a.depth == b.depth
-		&& a.arrayLayers == b.arrayLayers && a.mipLevels == b.mipLevels
-		&& a.samples == b.samples && a.format == b.format && a.viewType == b.viewType
-		&& a.crossFrame == b.crossFrame;
-}
-
-static bool MergeBufferDescEqual(const BufferDesc& a, const BufferDesc& b) {
-	return a.size == b.size && a.usage == b.usage
-		&& a.hostVisible == b.hostVisible && a.crossFrame == b.crossFrame;
-}
-
-static bool MergeResourceDescEqual(const ResourceDesc& a, const ResourceDesc& b) {
-	if (a.index() != b.index())
-		return false;
-	if (auto* x = std::get_if<ImageDesc>(&a))
-		return MergeImageDescEqual(*x, *std::get_if<ImageDesc>(&b));
-	if (auto* x = std::get_if<BufferDesc>(&a))
-		return MergeBufferDescEqual(*x, *std::get_if<BufferDesc>(&b));
-	return true;
-}
-
-static bool MergeSubresourceEqual(const ImageSubresource& a, const ImageSubresource& b) {
-	return a.mipLevel == b.mipLevel && a.layer == b.layer;
-}
-
-static bool MergeRangeEqual(const ImageSubresourceRange& a, const ImageSubresourceRange& b) {
-	return MergeSubresourceEqual(a.base, b.base)
-		&& a.mipLevelCount == b.mipLevelCount && a.layerCount == b.layerCount;
 }
 
 // 声明期合并：先在局部构造完整结果，全部校验通过后再替换本图状态（失败不留半成品）。
@@ -2444,1188 +2585,6 @@ bool RenderGraph::ApplyMergeTask(const GraphMergeTask& task) {
 	return true;
 }
 
-// ================= RenderGraphBuilder：逻辑声明 + 版本化 lowering =================
-
-static bool BuilderReachable(const std::vector<std::vector<uint32_t>>& adj,
-	uint32_t from, uint32_t to) {
-	if (from == to) return true;
-	std::vector<bool> seen(adj.size(), false);
-	std::vector<uint32_t> stack{ from };
-	seen[from] = true;
-	while (!stack.empty()) {
-		const uint32_t u = stack.back();
-		stack.pop_back();
-		for (uint32_t v : adj[u]) {
-			if (v == to) return true;
-			if (!seen[v]) { seen[v] = true; stack.push_back(v); }
-		}
-	}
-	return false;
-}
-
-static bool BuilderFindCycle(const std::vector<std::vector<uint32_t>>& adj,
-	std::vector<uint32_t>& cycle) {
-	const size_t n = adj.size();
-	std::vector<int> color(n, 0);
-	std::vector<uint32_t> path;
-	bool found = false;
-	std::function<bool(uint32_t)> dfs = [&](uint32_t u) -> bool {
-		color[u] = 1;
-		path.push_back(u);
-		for (uint32_t v : adj[u]) {
-			if (color[v] == 1) {
-				cycle.clear();
-				auto it = std::find(path.begin(), path.end(), v);
-				cycle.assign(it, path.end());
-				cycle.push_back(v);
-				return true;
-			}
-			if (color[v] == 0 && dfs(v)) return true;
-		}
-		color[u] = 2;
-		path.pop_back();
-		return false;
-	};
-	for (uint32_t u = 0; u < n && !found; ++u)
-		if (color[u] == 0 && dfs(u)) found = true;
-	return found;
-}
-
-static bool BuilderWritesWithLoad(const PassDesc& desc, const std::string& name) {
-	if (auto* rp = std::get_if<RenderPassDesc>(&desc)) {
-		for (const auto& att : rp->attachments)
-			if (att.resourceName == name && att.load == LoadOp::Load)
-				return true;
-	}
-	return false;
-}
-
-RenderGraphBuilder::Topology RenderGraphBuilder::Topology::Sequence(std::vector<std::string> order) {
-	Topology t;
-	for (size_t i = 1; i < order.size(); ++i)
-		t.edges.push_back(BuilderEdge{ order[i - 1], order[i] });
-	return t;
-}
-
-RenderGraphBuilder::Topology& RenderGraphBuilder::Topology::Then(const std::string& from, const std::string& to) {
-	edges.push_back(BuilderEdge{ from, to });
-	return *this;
-}
-
-RenderGraphBuilder::Topology& RenderGraphBuilder::Topology::ThenAll(
-	const std::vector<std::string>& from, const std::vector<std::string>& to) {
-	for (const auto& a : from)
-		for (const auto& b : to)
-			if (!a.empty() && !b.empty() && a != b)
-				edges.push_back(BuilderEdge{ a, b });
-	return *this;
-}
-
-void RenderGraphBuilder::DeclareResource(std::string name, ResourceDesc desc,
-	ResourceOptions options) {
-	ResourceDecl d;
-	d.name = std::move(name);
-	if (std::get_if<ImageDesc>(&desc)) {
-		d.type = Resource::Image;
-		d.crossFrame = options.crossFrame || std::get_if<ImageDesc>(&desc)->crossFrame;
-	}
-	else if (std::get_if<BufferDesc>(&desc)) {
-		d.type = Resource::Buffer;
-		d.crossFrame = options.crossFrame || std::get_if<BufferDesc>(&desc)->crossFrame;
-	}
-	d.desc = std::move(desc);
-	d.view = options.view;
-	d.viewFormat = options.viewFormat;
-	d.barrierRange = options.barrierRange;
-	d.initialLayout = options.initialLayout;
-	m_resources.push_back(std::move(d));
-}
-
-void RenderGraphBuilder::DeclareResource(std::string name, const rhi::Image* external,
-	ResourceOptions options) {
-	ResourceDecl d;
-	d.name = std::move(name);
-	d.type = Resource::Image;
-	d.view = options.view;
-	d.initialLayout = options.initialLayout;
-	d.viewFormat = options.viewFormat;
-	d.barrierRange = options.barrierRange;
-	d.crossFrame = options.crossFrame;
-	d.externalImage = external;
-	m_resources.push_back(std::move(d));
-}
-
-void RenderGraphBuilder::DeclareResource(std::string name, const rhi::Buffer* external) {
-	ResourceDecl d;
-	d.name = std::move(name);
-	d.type = Resource::Buffer;
-	d.externalBuffer = external;
-	m_resources.push_back(std::move(d));
-}
-
-void RenderGraphBuilder::DeclarePass(std::string name, std::set<std::string> reads,
-	std::set<std::string> writes, Pass::Type type, PassDesc desc,
-	std::optional<rhi::QueueClass> queue) {
-	PassDecl p;
-	p.name = std::move(name);
-	p.reads = std::move(reads);
-	p.writes = std::move(writes);
-	p.type = type;
-	p.desc = std::move(desc);
-	p.queue = queue.value_or(DefaultQueueForPass(type, p.desc));
-	m_passes.push_back(std::move(p));
-}
-
-// 从 PassDesc 推导读写集：与后端各 *ReadSetMismatch/*WriteSetMismatch 校验同一套分类
-static bool DerivePassIo(Pass::Type type, const PassDesc& desc,
-	std::set<std::string>& reads, std::set<std::string>& writes) {
-	auto addShaderBinding = [&](const ShaderBinding& b) {
-		const std::string& n = b.graphResourceName.empty() ? b.resourceName : b.graphResourceName;
-		if (n.empty())
-			return;
-		(b.usage == Usage::StorageWrite ? writes : reads).insert(n);
-	};
-	switch (type) {
-	case Pass::Render: {
-		const auto* d = std::get_if<RenderPassDesc>(&desc);
-		if (d == nullptr)
-			return false;
-		for (const auto& att : d->attachments) {
-			if (att.resourceName.empty())
-				continue;
-			(att.usage == Usage::ResolveSrc ? reads : writes).insert(att.resourceName);
-		}
-		for (const auto& b : d->shaderBindings)
-			addShaderBinding(b);
-		for (const auto& vs : d->vertexStreams) {
-			if (!vs.resourceName.empty())
-				reads.insert(vs.resourceName);
-		}
-		if (d->indexStream.has_value() && !d->indexStream->resourceName.empty())
-			reads.insert(d->indexStream->resourceName);
-		return true;
-	}
-	case Pass::Compute: {
-		const auto* d = std::get_if<ComputePassDesc>(&desc);
-		if (d == nullptr)
-			return false;
-		for (const auto& b : d->shaderBindings)
-			addShaderBinding(b);
-		if (!d->indirectBuffer.empty())
-			reads.insert(d->indirectBuffer);
-		return true;
-	}
-	case Pass::Transfer: {
-		const auto* d = std::get_if<TransferPassDesc>(&desc);
-		if (d == nullptr)
-			return false;
-		// ClearImage 只有写端
-		if (d->kind != TransferKind::ClearImage && !d->sourceName.empty())
-			reads.insert(d->sourceName);
-		if (!d->destName.empty())
-			writes.insert(d->destName);
-		return true;
-	}
-	default:
-		return false;
-	}
-}
-
-void RenderGraphBuilder::DeclarePass(std::string name, Pass::Type type, PassDesc desc,
-	std::optional<rhi::QueueClass> queue) {
-	PassDecl p;
-	p.name = std::move(name);
-	p.type = type;
-	p.queue = queue.value_or(DefaultQueueForPass(type, desc));
-	if (!DerivePassIo(type, desc, p.reads, p.writes))
-		RenderGraph::HandleError(RenderGraph::ErrorCode::PassIoNotDerivable);
-	p.desc = std::move(desc);
-	m_passes.push_back(std::move(p));
-}
-
-void RenderGraphBuilder::DeclareTopology(Topology topology) {
-	for (const auto& e : topology.edges)
-		m_edges.push_back(e);
-}
-
-void RenderGraphBuilder::AliasLogicalResources(std::vector<std::string> names) {
-	m_aliasGroups.push_back(std::move(names));
-}
-
-bool RenderGraphBuilder::SameDecl(const ResourceDecl& a, const ResourceDecl& b) {
-	if (a.type != b.type) return false;
-	if (!MergeResourceDescEqual(a.desc, b.desc)) return false;
-	if (!MergeSubresourceEqual(a.view, b.view)) return false;
-	if (a.viewFormat != b.viewFormat) return false;
-	if (!MergeRangeEqual(a.barrierRange, b.barrierRange)) return false;
-	if (a.initialLayout != b.initialLayout) return false;
-	if (a.crossFrame != b.crossFrame) return false;
-	if (a.externalImage != b.externalImage) return false;
-	if (a.externalBuffer != b.externalBuffer) return false;
-	if (a.borrowedLater != b.borrowedLater) return false;
-	return true;
-}
-
-void RenderGraphBuilder::RewritePassBindings(PassDesc& desc,
-	const std::map<std::string, std::string>& nameMap) {
-	auto mapped = [&](const std::string& n) -> std::string {
-		auto it = nameMap.find(n);
-		return it == nameMap.end() ? n : it->second;
-	};
-	auto mapShader = [&](ShaderBinding& sb) {
-		const std::string graph = sb.graphResourceName.empty()
-			? sb.resourceName : sb.graphResourceName;
-		auto it = nameMap.find(graph);
-		if (it != nameMap.end())
-			sb.graphResourceName = it->second;
-	};
-
-	if (auto* rp = std::get_if<RenderPassDesc>(&desc)) {
-		for (auto& att : rp->attachments)
-			att.resourceName = mapped(att.resourceName);
-		for (auto& sb : rp->shaderBindings)
-			mapShader(sb);
-		for (auto& vs : rp->vertexStreams)
-			vs.resourceName = mapped(vs.resourceName);
-		if (rp->indexStream.has_value())
-			rp->indexStream->resourceName = mapped(rp->indexStream->resourceName);
-	}
-	else if (auto* cp = std::get_if<ComputePassDesc>(&desc)) {
-		for (auto& sb : cp->shaderBindings)
-			mapShader(sb);
-		if (!cp->indirectBuffer.empty())
-			cp->indirectBuffer = mapped(cp->indirectBuffer);
-	}
-	else if (auto* tp = std::get_if<TransferPassDesc>(&desc)) {
-		if (!tp->sourceName.empty())
-			tp->sourceName = mapped(tp->sourceName);
-		if (!tp->destName.empty())
-			tp->destName = mapped(tp->destName);
-	}
-	else if (auto* mp = std::get_if<MuxPassDesc>(&desc)) {
-		for (auto& alt : mp->alternatives)
-			alt = mapped(alt);
-	}
-}
-
-bool RenderGraphBuilder::ImportDeclarations(const RenderGraphBuilder& other, const ImportOptions& options) {
-	if (&other == this) {
-		std::cerr << "RenderGraphBuilder: 不能导入自身的声明" << std::endl;
-		return false;
-	}
-	const std::string prefix = options.passPrefix;
-
-	// ---- 预检，失败不改动本 Builder ----
-	for (const ResourceDecl& r : other.m_resources) {
-		if (r.name.empty()) {
-			std::cerr << "RenderGraphBuilder: 导入的资源名为空" << std::endl;
-			return false;
-		}
-		const auto it = std::find_if(m_resources.begin(), m_resources.end(),
-			[&r](const ResourceDecl& x) { return x.name == r.name; });
-		if (it == m_resources.end())
-			continue;
-		if (!options.dedupIdenticalResources) {
-			std::cerr << "RenderGraphBuilder: 资源名重复且未开启 dedup："
-				<< r.name << std::endl;
-			return false;
-		}
-		if (!SameDecl(*it, r)) {
-			std::cerr << "RenderGraphBuilder: 同名资源声明不一致：" << r.name << std::endl;
-			return false;
-		}
-	}
-
-	std::set<std::string> passNames;
-	for (const PassDecl& p : m_passes)
-		passNames.insert(p.name);
-	for (const PassDecl& p : other.m_passes) {
-		if (p.name.empty()) {
-			std::cerr << "RenderGraphBuilder: 导入的 Pass 名为空" << std::endl;
-			return false;
-		}
-		const std::string newName = prefix + p.name;
-		if (!passNames.insert(newName).second) {
-			std::cerr << "RenderGraphBuilder: 导入后 Pass 名冲突：" << newName
-				<< "（可通过 ImportOptions::passPrefix 消除）" << std::endl;
-			return false;
-		}
-	}
-
-	// ---- 提交：资源同名合一，Pass 名加前缀，顺序边与别名组一并合并 ----
-	for (const ResourceDecl& r : other.m_resources) {
-		const auto it = std::find_if(m_resources.begin(), m_resources.end(),
-			[&r](const ResourceDecl& x) { return x.name == r.name; });
-		if (it == m_resources.end())
-			m_resources.push_back(r);
-	}
-	for (const PassDecl& p : other.m_passes) {
-		PassDecl np = p;
-		np.name = prefix + p.name;
-		m_passes.push_back(std::move(np));
-	}
-	for (const BuilderEdge& e : other.m_edges)
-		m_edges.push_back(BuilderEdge{ prefix + e.from, prefix + e.to });
-	for (const auto& group : other.m_aliasGroups)
-		m_aliasGroups.push_back(group);
-	return true;
-}
-
-bool RenderGraphBuilder::CompileModule(std::string name, std::vector<ModulePort> ports,
-	RenderGraphModule* out, std::vector<std::string>* errors) const {
-	if (out == nullptr)
-		return false;
-
-	bool bad = false;
-	auto addErr = [&](std::string msg) {
-		bad = true;
-		if (errors != nullptr) errors->push_back(std::move(msg));
-		else std::cerr << "RenderGraphBuilder: " << msg << std::endl;
-	};
-
-	if (name.empty()) addErr("模块名为空");
-	if (ports.empty()) addErr("模块至少需要一个端口");
-
-	std::set<std::string> portNames;
-	for (const ModulePort& p : ports) {
-		if (p.name.empty()) addErr("模块端口名为空");
-		else if (!portNames.insert(p.name).second) addErr("模块端口名重复：" + p.name);
-	}
-
-	std::map<std::string, size_t> resIndex, passIndex;
-	for (size_t i = 0; i < m_resources.size(); ++i) {
-		const ResourceDecl& r = m_resources[i];
-		if (r.name.empty()) { addErr("模块资源名为空"); continue; }
-		if (!resIndex.emplace(r.name, i).second)
-			addErr("模块资源名重复：" + r.name);
-	}
-	for (size_t i = 0; i < m_passes.size(); ++i) {
-		const PassDecl& p = m_passes[i];
-		if (p.name.empty()) { addErr("模块 Pass 名为空"); continue; }
-		else if (!passIndex.emplace(p.name, i).second)
-			addErr("模块 Pass 名重复：" + p.name);
-		if (p.type == Pass::None) addErr("模块 Pass 类型未指定：" + p.name);
-		else if (p.type == Pass::Present) addErr("模块内不允许 Present：" + p.name);
-		else if (p.type == Pass::Mux) addErr("模块内不允许 Mux：" + p.name);
-	}
-
-	for (const PassDecl& p : m_passes) {
-		for (const auto& n : p.reads)
-			if (resIndex.find(n) == resIndex.end())
-				addErr("pass \"" + p.name + "\" 读取未声明资源：" + n);
-		for (const auto& n : p.writes)
-			if (resIndex.find(n) == resIndex.end())
-				addErr("pass \"" + p.name + "\" 写入未声明资源：" + n);
-		for (const auto& n : p.reads)
-			if (p.writes.find(n) != p.writes.end())
-				addErr("pass \"" + p.name + "\" 同时读写同一资源：" + n);
-	}
-
-	std::vector<ModulePortInfo> infos;
-	for (const ModulePort& p : ports) {
-		auto it = resIndex.find(p.name);
-		if (it == resIndex.end()) {
-			addErr("端口未在模块中声明：" + p.name);
-			continue;
-		}
-		const ResourceDecl& rd = m_resources[it->second];
-		if (rd.IsExternal())
-			addErr("端口不能使用借用资源声明：" + p.name);
-		bool referenced = false;
-		for (const PassDecl& pass : m_passes) {
-			if (pass.reads.find(p.name) != pass.reads.end()
-				|| pass.writes.find(p.name) != pass.writes.end()) {
-				referenced = true;
-				break;
-			}
-		}
-		if (!referenced)
-			addErr("端口未被任何 pass 引用：" + p.name);
-		for (const auto& group : m_aliasGroups)
-			if (std::find(group.begin(), group.end(), p.name) != group.end())
-				addErr("端口不能进入模块级别名组：" + p.name);
-
-		ModulePortInfo info;
-		info.port = p;
-		info.type = rd.type;
-		info.desc = rd.desc;
-		info.view = rd.view;
-		info.viewFormat = rd.viewFormat;
-		info.barrierRange = rd.barrierRange;
-		info.crossFrame = rd.crossFrame;
-		infos.push_back(std::move(info));
-	}
-
-	// 声明边 + 资源数据边合成模块内部图
-	const size_t n = m_passes.size();
-	std::vector<std::vector<uint32_t>> declAdj(n);
-	auto pushAdj = [](std::vector<std::vector<uint32_t>>& a, uint32_t u, uint32_t v) {
-		if (std::find(a[u].begin(), a[u].end(), v) == a[u].end())
-			a[u].push_back(v);
-	};
-	for (const BuilderEdge& e : m_edges) {
-		auto ia = passIndex.find(e.from);
-		auto ib = passIndex.find(e.to);
-		if (ia == passIndex.end() || ib == passIndex.end()) {
-			addErr("顺序边引用未声明的 pass：" + e.from + " -> " + e.to);
-			continue;
-		}
-		const uint32_t a = static_cast<uint32_t>(ia->second);
-		const uint32_t b = static_cast<uint32_t>(ib->second);
-		if (a == b) {
-			addErr("模块内禁止 Pass 自环：" + e.from);
-			continue;
-		}
-		pushAdj(declAdj, a, b);
-	}
-
-	std::set<std::pair<uint32_t, uint32_t>> edges;
-	for (uint32_t u = 0; u < n; ++u)
-		for (uint32_t v : declAdj[u])
-			edges.insert({ u, v });
-
-	// 资源数据边：按 pass 的读写集推导 writer -> readers
-	std::map<std::string, std::vector<uint32_t>> writersByRes, readersByRes;
-	for (size_t i = 0; i < m_passes.size(); ++i) {
-		for (const auto& w : m_passes[i].writes)
-			writersByRes[w].push_back(static_cast<uint32_t>(i));
-		for (const auto& r : m_passes[i].reads)
-			readersByRes[r].push_back(static_cast<uint32_t>(i));
-	}
-	for (const auto& kv : writersByRes) {
-		auto rit = readersByRes.find(kv.first);
-		if (rit == readersByRes.end())
-			continue;
-		for (uint32_t writer : kv.second)
-			for (uint32_t reader : rit->second)
-				if (writer != reader)
-					edges.insert({ writer, reader });
-	}
-	std::vector<std::vector<uint32_t>> adj(n);
-	std::vector<uint32_t> indeg(n, 0), outdeg(n, 0);
-	for (const auto& e : edges) {
-		adj[e.first].push_back(e.second);
-		++indeg[e.second];
-		++outdeg[e.first];
-	}
-
-	// 成环检测
-	{
-		std::vector<uint32_t> deg = indeg;
-		std::queue<uint32_t> q;
-		for (uint32_t i = 0; i < n; ++i)
-			if (deg[i] == 0) q.push(i);
-		uint32_t visited = 0;
-		while (!q.empty()) {
-			const uint32_t u = q.front();
-			q.pop();
-			++visited;
-			for (uint32_t v : adj[u])
-				if (--deg[v] == 0) q.push(v);
-		}
-		if (visited != n)
-			addErr("模块内部拓扑/数据依赖成环");
-	}
-
-	// 模块内多写者必须被声明拓扑定序
-	for (const auto& kv : writersByRes) {
-		const std::vector<uint32_t>& ws = kv.second;
-		for (size_t i = 0; i < ws.size(); ++i) {
-			for (size_t j = i + 1; j < ws.size(); ++j) {
-				if (!BuilderReachable(declAdj, ws[i], ws[j])
-					&& !BuilderReachable(declAdj, ws[j], ws[i])) {
-					addErr("模块内资源 \"" + kv.first + "\" 的写者 \""
-						+ m_passes[ws[i]].name + "\" 与 \"" + m_passes[ws[j]].name
-						+ "\" 未在拓扑中定序");
-				}
-			}
-		}
-	}
-
-	// 入口/出口：入度 / 出度为 0
-	std::vector<std::string> entries, exits;
-	for (uint32_t i = 0; i < n; ++i) {
-		if (indeg[i] == 0) entries.push_back(m_passes[i].name);
-		if (outdeg[i] == 0) exits.push_back(m_passes[i].name);
-	}
-	if (entries.empty() || exits.empty())
-		addErr("模块没有入口或出口");
-
-	if (bad)
-		return false;
-
-	out->mName = std::move(name);
-	out->mDecl = *this;
-	out->mPorts = std::move(infos);
-	out->mEntryNames = std::move(entries);
-	out->mExitNames = std::move(exits);
-	return true;
-}
-
-std::optional<ModuleInstance> RenderGraphBuilder::Instantiate(
-	const RenderGraphModule& module, std::string tag,
-	const std::vector<ModuleBinding>& bindings, std::vector<std::string>* errors) {
-	bool bad = false;
-	auto addErr = [&](std::string msg) {
-		bad = true;
-		if (errors != nullptr) errors->push_back(std::move(msg));
-		else std::cerr << "RenderGraphBuilder: " << msg << std::endl;
-	};
-
-	if (module.mName.empty()) addErr("模块尚未编译");
-	if (tag.empty()) addErr("模块实例 tag 为空");
-	else if (tag.find('/') != std::string::npos) addErr("模块实例 tag 不能包含 '/'");
-	if (m_instanceTags.find(tag) != m_instanceTags.end())
-		addErr("模块实例 tag 重复：" + tag);
-
-	std::set<std::string> portNames;
-	for (const auto& info : module.mPorts)
-		portNames.insert(info.port.name);
-
-	std::map<std::string, std::string> portToParent;
-	for (const auto& b : bindings) {
-		if (portNames.find(b.port) == portNames.end()) {
-			addErr("未知端口绑定：" + b.port);
-			continue;
-		}
-		if (b.parentResource.empty()) {
-			addErr("端口 \"" + b.port + "\" 未指定父资源");
-			continue;
-		}
-		if (!portToParent.emplace(b.port, b.parentResource).second)
-			addErr("端口重复绑定：" + b.port);
-	}
-	for (const auto& info : module.mPorts)
-		if (portToParent.find(info.port.name) == portToParent.end())
-			addErr("端口未绑定：" + info.port.name);
-
-	std::map<std::string, const ResourceDecl*> parentRes;
-	for (const auto& r : m_resources)
-		if (parentRes.find(r.name) == parentRes.end())
-			parentRes.emplace(r.name, &r);
-
-	for (const auto& info : module.mPorts) {
-		auto bit = portToParent.find(info.port.name);
-		if (bit == portToParent.end())
-			continue;
-		auto pit = parentRes.find(bit->second);
-		if (pit == parentRes.end()) {
-			addErr("绑定父资源未声明：" + bit->second);
-			continue;
-		}
-		const ResourceDecl& pd = *pit->second;
-		if (pd.type != info.type)
-			addErr("端口 \"" + info.port.name + "\" 与父资源 \"" + bit->second + "\" 类型不一致");
-		if (!MergeResourceDescEqual(pd.desc, info.desc))
-			addErr("端口 \"" + info.port.name + "\" 与父资源 \"" + bit->second + "\" 描述不一致");
-		if (!MergeSubresourceEqual(pd.view, info.view)
-			|| pd.viewFormat != info.viewFormat
-			|| !MergeRangeEqual(pd.barrierRange, info.barrierRange))
-			addErr("端口 \"" + info.port.name + "\" 与父资源 \"" + bit->second + "\" 视图/同步范围不一致");
-		if (info.crossFrame && !pd.crossFrame)
-			addErr("端口 \"" + info.port.name + "\" 要求 crossFrame，父资源不满足");
-	}
-
-	// 名称映射：端口 -> 父资源；内部资源/Pass -> tag/name
-	std::map<std::string, std::string> nameMap;
-	for (const auto& info : module.mPorts) {
-		auto bit = portToParent.find(info.port.name);
-		if (bit != portToParent.end())
-			nameMap[info.port.name] = bit->second;
-	}
-	for (const auto& r : module.mDecl.m_resources) {
-		if (portNames.find(r.name) != portNames.end())
-			continue;
-		nameMap[r.name] = tag + "/" + r.name;
-	}
-
-	std::set<std::string> existingRes, existingPass;
-	for (const auto& r : m_resources)
-		existingRes.insert(r.name);
-	for (const auto& p : m_passes)
-		existingPass.insert(p.name);
-	for (const auto& r : module.mDecl.m_resources) {
-		if (portNames.find(r.name) != portNames.end())
-			continue;
-		const std::string nn = nameMap[r.name];
-		if (!existingRes.insert(nn).second)
-			addErr("实例资源名冲突：" + nn);
-	}
-	for (const auto& p : module.mDecl.m_passes) {
-		const std::string nn = tag + "/" + p.name;
-		if (!existingPass.insert(nn).second)
-			addErr("实例 Pass 名冲突：" + nn);
-	}
-
-	for (const auto& p : module.mDecl.m_passes) {
-		for (const auto& n : p.reads)
-			if (nameMap.find(n) == nameMap.end())
-				addErr("模块 pass \"" + p.name + "\" 读取未知资源：" + n);
-		for (const auto& n : p.writes)
-			if (nameMap.find(n) == nameMap.end())
-				addErr("模块 pass \"" + p.name + "\" 写入未知资源：" + n);
-	}
-
-	if (bad)
-		return std::nullopt;
-
-	for (const auto& r : module.mDecl.m_resources) {
-		if (portNames.find(r.name) != portNames.end())
-			continue;
-		ResourceDecl nr = r;
-		nr.name = nameMap.at(r.name);
-		m_resources.push_back(std::move(nr));
-	}
-	for (const auto& p : module.mDecl.m_passes) {
-		PassDecl np = p;
-		np.name = tag + "/" + p.name;
-		std::set<std::string> reads, writes;
-		for (const auto& n : p.reads)
-			reads.insert(nameMap.at(n));
-		for (const auto& n : p.writes)
-			writes.insert(nameMap.at(n));
-		np.reads = std::move(reads);
-		np.writes = std::move(writes);
-		RewritePassBindings(np.desc, nameMap);
-		m_passes.push_back(std::move(np));
-	}
-	for (const auto& e : module.mDecl.m_edges)
-		m_edges.push_back(BuilderEdge{ tag + "/" + e.from, tag + "/" + e.to });
-	for (const auto& g : module.mDecl.m_aliasGroups) {
-		std::vector<std::string> ng;
-		ng.reserve(g.size());
-		for (const auto& n : g) {
-			auto it = nameMap.find(n);
-			if (it != nameMap.end())
-				ng.push_back(it->second);
-		}
-		m_aliasGroups.push_back(std::move(ng));
-	}
-
-	m_instanceTags.insert(tag);
-
-	ModuleInstance inst;
-	inst.tag = tag;
-	for (const auto& e : module.mEntryNames)
-		inst.Entries.push_back(tag + "/" + e);
-	for (const auto& e : module.mExitNames)
-		inst.Exits.push_back(tag + "/" + e);
-	return inst;
-}
-
-LowerResult RenderGraphBuilder::Lower() const {
-	LowerResult out;
-	uint32_t errorCount = 0;
-
-	auto addDiag = [&](BuilderSeverity sev, BuilderDiagKind kind, std::string msg,
-		std::optional<BuilderEdge> edge = std::nullopt) {
-		BuilderDiagnostic d;
-		d.severity = sev;
-		d.kind = kind;
-		d.message = std::move(msg);
-		d.edge = std::move(edge);
-		if (sev == BuilderSeverity::Error) ++errorCount;
-		out.diagnostics.push_back(std::move(d));
-	};
-
-	// ---- 名称与引用校验 ----
-	std::map<std::string, size_t> resMap, passMap;
-	for (size_t i = 0; i < m_resources.size(); ++i) {
-		const ResourceDecl& r = m_resources[i];
-		if (r.name.empty()) { addDiag(BuilderSeverity::Error, BuilderDiagKind::EmptyName, "资源名为空"); continue; }
-		if (resMap.find(r.name) != resMap.end()) {
-			addDiag(BuilderSeverity::Error, BuilderDiagKind::DuplicateName, "资源名重复：" + r.name);
-			continue;
-		}
-		resMap.emplace(r.name, i);
-	}
-	for (size_t i = 0; i < m_passes.size(); ++i) {
-		const PassDecl& p = m_passes[i];
-		if (p.name.empty()) { addDiag(BuilderSeverity::Error, BuilderDiagKind::EmptyName, "Pass 名为空"); continue; }
-		if (passMap.find(p.name) != passMap.end()) {
-			addDiag(BuilderSeverity::Error, BuilderDiagKind::DuplicateName, "Pass 名重复：" + p.name);
-			continue;
-		}
-		passMap.emplace(p.name, i);
-	}
-	for (const auto& p : m_passes) {
-		for (const auto& n : p.reads)
-			if (resMap.find(n) == resMap.end())
-				addDiag(BuilderSeverity::Error, BuilderDiagKind::UnknownName,
-					"pass \"" + p.name + "\" 读取未声明资源：" + n);
-		for (const auto& n : p.writes)
-			if (resMap.find(n) == resMap.end())
-				addDiag(BuilderSeverity::Error, BuilderDiagKind::UnknownName,
-					"pass \"" + p.name + "\" 写入未声明资源：" + n);
-	}
-
-	// ---- 同 pass 读写、写者收集、Mux 多写 ----
-	std::map<std::string, std::vector<uint32_t>> writers;
-	std::set<std::string> muxOutputs;
-	for (size_t i = 0; i < m_passes.size(); ++i) {
-		const PassDecl& p = m_passes[i];
-		for (const auto& n : p.writes) {
-			if (p.reads.find(n) != p.reads.end())
-				addDiag(BuilderSeverity::Error, BuilderDiagKind::SamePassReadWrite,
-					"pass \"" + p.name + "\" 同时读写同一逻辑资源：" + n);
-			writers[n].push_back(static_cast<uint32_t>(i));
-			if (p.type == Pass::Mux)
-				muxOutputs.insert(n);
-		}
-	}
-	for (const auto& name : muxOutputs) {
-		if (writers[name].size() > 1)
-			addDiag(BuilderSeverity::Error, BuilderDiagKind::MuxMultiWriter,
-				"Mux 输出不允许存在多个写者：" + name);
-	}
-
-	// ---- 用户拓扑边 ----
-	std::set<BuilderEdge> userEdges;
-	for (const auto& e : m_edges) {
-		if (passMap.find(e.from) == passMap.end() || passMap.find(e.to) == passMap.end()) {
-			addDiag(BuilderSeverity::Error, BuilderDiagKind::UnknownName,
-				"顺序边引用未声明的 pass：" + e.from + " -> " + e.to, e);
-			continue;
-		}
-		if (e.from == e.to) {
-			addDiag(BuilderSeverity::Error, BuilderDiagKind::Contradiction,
-				"顺序边自引用：" + e.from, e);
-			out.topology.conflicts.push_back(e);
-			continue;
-		}
-		userEdges.insert(e);
-	}
-	out.topology.declared.assign(userEdges.begin(), userEdges.end());
-
-	const size_t n = m_passes.size();
-	std::vector<std::vector<uint32_t>> userAdj(n);
-	std::vector<uint32_t> indeg(n, 0);
-	for (const auto& e : userEdges) {
-		const uint32_t a = static_cast<uint32_t>(passMap.at(e.from));
-		const uint32_t b = static_cast<uint32_t>(passMap.at(e.to));
-		auto& adj = userAdj[a];
-		if (std::find(adj.begin(), adj.end(), b) == adj.end()) {
-			adj.push_back(b);
-			++indeg[b];
-		}
-	}
-
-	// ---- 多写者必须被用户拓扑定序 ----
-	for (const auto& kv : writers) {
-		const std::vector<uint32_t>& ws = kv.second;
-		for (size_t i = 0; i < ws.size(); ++i) {
-			for (size_t j = i + 1; j < ws.size(); ++j) {
-				if (!BuilderReachable(userAdj, ws[i], ws[j])
-					&& !BuilderReachable(userAdj, ws[j], ws[i])) {
-					addDiag(BuilderSeverity::Error, BuilderDiagKind::WriterOrderUndetermined,
-						"资源 \"" + kv.first + "\" 的写者 \"" + m_passes[ws[i]].name
-						+ "\" 与 \"" + m_passes[ws[j]].name + "\" 未在拓扑中定序");
-				}
-			}
-		}
-	}
-
-	if (errorCount > 0) return out;
-
-	// ---- 用户拓扑排序（同层按声明顺序）----
-	std::vector<uint32_t> order;
-	{
-		std::vector<uint32_t> deg = indeg;
-		std::priority_queue<uint32_t, std::vector<uint32_t>, std::greater<uint32_t>> pq;
-		for (uint32_t i = 0; i < n; ++i)
-			if (deg[i] == 0) pq.push(i);
-		while (!pq.empty()) {
-			const uint32_t u = pq.top();
-			pq.pop();
-			order.push_back(u);
-			for (uint32_t v : userAdj[u])
-				if (--deg[v] == 0) pq.push(v);
-		}
-	}
-	if (order.size() != n) {
-		std::vector<uint32_t> cycle;
-		if (BuilderFindCycle(userAdj, cycle)) {
-			std::string path;
-			for (size_t i = 0; i < cycle.size(); ++i) {
-				if (i) path += " -> ";
-				path += m_passes[cycle[i]].name;
-			}
-			addDiag(BuilderSeverity::Error, BuilderDiagKind::Contradiction, "用户拓扑成环：" + path);
-			for (size_t i = 1; i < cycle.size(); ++i)
-				out.topology.conflicts.push_back(BuilderEdge{
-					m_passes[cycle[i - 1]].name, m_passes[cycle[i]].name });
-		}
-		else {
-			addDiag(BuilderSeverity::Error, BuilderDiagKind::Contradiction, "用户拓扑成环");
-		}
-		return out;
-	}
-
-	// ---- 版本分配：读当前版本，写下一版本 ----
-	struct ResState { uint32_t current = 0; uint32_t next = 1; };
-	std::map<std::string, ResState> state;
-	struct VerRecord {
-		std::string resource;
-		uint32_t    version = 0;
-		std::string producer;
-		std::vector<std::string> readers;
-		bool        used = false;
-		uint32_t    firstUse = static_cast<uint32_t>(-1);
-		uint32_t    lastUse = 0;
-	};
-	std::map<ResourceRef, VerRecord> recs;
-	auto ensureVersion = [&](const std::string& name, uint32_t v) -> ResourceRef {
-		ResourceRef ref{ name, v };
-		auto it = recs.find(ref);
-		if (it == recs.end()) {
-			VerRecord r;
-			r.resource = name;
-			r.version = v;
-			recs.emplace(ref, std::move(r));
-		}
-		return ref;
-	};
-	auto touch = [&](const ResourceRef& ref, uint32_t index) {
-		VerRecord& r = recs.at(ref);
-		r.used = true;
-		r.firstUse = std::min(r.firstUse, index);
-		r.lastUse = std::max(r.lastUse, index);
-	};
-
-	std::vector<LoweredPass> lowered;
-	lowered.reserve(order.size());
-	for (uint32_t idx = 0; idx < order.size(); ++idx) {
-		const PassDecl& pd = m_passes[order[idx]];
-		LoweredPass lp;
-		lp.name = pd.name;
-		lp.type = pd.type;
-		lp.desc = pd.desc;
-		lp.queue = pd.queue;
-
-		for (const auto& name : pd.reads) {
-			const uint32_t v = state[name].current;
-			const ResourceRef ref = ensureVersion(name, v);
-			recs.at(ref).readers.push_back(pd.name);
-			touch(ref, idx);
-			lp.reads.insert(ref);
-			lp.bindingVersions[name] = v;
-
-			const ResourceDecl& rd = m_resources[resMap.at(name)];
-			const bool hasInitial = rd.IsExternal() || rd.crossFrame
-				|| rd.initialLayout != rhi::ImageLayout::Undefined;
-			if (v == 0 && !hasInitial) {
-				addDiag(BuilderSeverity::Error, BuilderDiagKind::ReadBeforeProducer,
-					"pass \"" + pd.name + "\" 读取资源 \"" + name
-					+ "\" 的导入版本，但该资源没有外部句柄且 initialLayout 为 Undefined");
-			}
-		}
-
-		for (const auto& name : pd.writes) {
-			const uint32_t v = state[name].next++;
-			state[name].current = v;
-			const ResourceRef ref = ensureVersion(name, v);
-			VerRecord& rec = recs.at(ref);
-			rec.producer = pd.name;
-			touch(ref, idx);
-			lp.writes.insert(ref);
-			lp.bindingVersions[name] = v;
-		}
-
-		lowered.push_back(std::move(lp));
-	}
-
-	// ---- 别名计划：Load 原地链、跨帧整链、用户声明桶 ----
-	std::vector<std::pair<ResourceRef, ResourceRef>> unions;
-	for (const LoweredPass& lp : lowered) {
-		for (const ResourceRef& wref : lp.writes) {
-			if (!BuilderWritesWithLoad(lp.desc, wref.name))
-				continue;
-			const ResourceRef prev{ wref.name, wref.version - 1 };
-			ensureVersion(prev.name, prev.version);
-			unions.emplace_back(prev, wref);
-		}
-	}
-	for (const ResourceDecl& rd : m_resources) {
-		if (!rd.crossFrame) continue;
-		std::vector<ResourceRef> versions;
-		for (const auto& kv : recs)
-			if (kv.first.name == rd.name)
-				versions.push_back(kv.first);
-		for (size_t i = 1; i < versions.size(); ++i)
-			unions.emplace_back(versions[0], versions[i]);
-	}
-
-	for (const auto& group : m_aliasGroups) {
-		std::set<std::string> unique;
-		const ResourceDecl* first = nullptr;
-		bool okGroup = true;
-		for (const auto& name : group) {
-			auto it = resMap.find(name);
-			if (it == resMap.end()) {
-				addDiag(BuilderSeverity::Error, BuilderDiagKind::VersionAliasConflict,
-					"别名组引用未声明资源：" + name);
-				okGroup = false;
-				continue;
-			}
-			unique.insert(name);
-			const ResourceDecl& rd = m_resources[it->second];
-			if (first == nullptr) first = &rd;
-			else if (!SameDecl(*first, rd)) {
-				addDiag(BuilderSeverity::Error, BuilderDiagKind::VersionAliasConflict,
-					"别名组成员声明不一致：" + name);
-				okGroup = false;
-			}
-		}
-		if (unique.size() < 2) {
-			addDiag(BuilderSeverity::Error, BuilderDiagKind::VersionAliasConflict,
-				"别名组至少需要两个资源");
-			okGroup = false;
-		}
-		if (!okGroup) continue;
-		std::vector<ResourceRef> versions;
-		for (const auto& kv : recs)
-			if (unique.find(kv.first.name) != unique.end())
-				versions.push_back(kv.first);
-		for (size_t i = 1; i < versions.size(); ++i)
-			unions.emplace_back(versions[0], versions[i]);
-	}
-
-	// ---- 并查集汇总别名块 ----
-	std::vector<ResourceRef> refs;
-	for (const auto& kv : recs) refs.push_back(kv.first);
-	std::map<ResourceRef, uint32_t> refIndex;
-	for (uint32_t i = 0; i < refs.size(); ++i) refIndex.emplace(refs[i], i);
-	std::vector<uint32_t> dsuParent(refs.size());
-	for (uint32_t i = 0; i < refs.size(); ++i) dsuParent[i] = i;
-	std::function<uint32_t(uint32_t)> findRoot = [&](uint32_t x) -> uint32_t {
-		while (dsuParent[x] != x) { dsuParent[x] = dsuParent[dsuParent[x]]; x = dsuParent[x]; }
-		return x;
-	};
-	for (const auto& u : unions) {
-		auto ia = refIndex.find(u.first);
-		auto ib = refIndex.find(u.second);
-		if (ia == refIndex.end() || ib == refIndex.end()) continue;
-		const uint32_t ra = findRoot(ia->second);
-		const uint32_t rb = findRoot(ib->second);
-		if (ra != rb) dsuParent[rb] = ra;
-	}
-	std::map<uint32_t, std::vector<ResourceRef>> groups;
-	for (uint32_t i = 0; i < refs.size(); ++i)
-		groups[findRoot(i)].push_back(refs[i]);
-
-	// ---- 别名块校验：同 pass 多触达、寿命重叠 ----
-	for (auto& kv : groups) {
-		const std::vector<ResourceRef>& members = kv.second;
-		if (members.size() < 2) continue;
-		for (const LoweredPass& lp : lowered) {
-			uint32_t touched = 0;
-			for (const ResourceRef& m : members)
-				if (lp.reads.count(m) || lp.writes.count(m)) ++touched;
-			if (touched > 1)
-				addDiag(BuilderSeverity::Error, BuilderDiagKind::VersionAliasConflict,
-					"pass \"" + lp.name + "\" 同时触达同一别名块的多个版本");
-		}
-		std::vector<uint32_t> firsts, lasts;
-		for (const ResourceRef& m : members) {
-			const VerRecord& r = recs.at(m);
-			if (!r.used) continue;
-			firsts.push_back(r.firstUse);
-			lasts.push_back(r.lastUse);
-		}
-		for (size_t i = 0; i < firsts.size(); ++i)
-			for (size_t j = i + 1; j < firsts.size(); ++j)
-				if (std::max(firsts[i], firsts[j]) <= std::min(lasts[i], lasts[j]))
-					addDiag(BuilderSeverity::Error, BuilderDiagKind::VersionAliasConflict,
-						"别名块内版本寿命重叠：" + members.front().name);
-	}
-
-	// ---- 输出别名组与版本表 ----
-	for (auto& kv : groups) {
-		if (kv.second.size() < 2) continue;
-		LoweredAliasGroup g;
-		g.members = kv.second;
-		g.mustAlias = true;
-		out.graph.aliasGroups.push_back(std::move(g));
-	}
-	for (const auto& kv : recs) {
-		BuilderVersionInfo vi;
-		vi.resource = kv.first.name;
-		vi.version = kv.first.version;
-		vi.producer = kv.second.producer;
-		if (kv.first.version > 0) {
-			const ResourceRef prev{ kv.first.name, kv.first.version - 1 };
-			auto pit = refIndex.find(prev);
-			if (pit != refIndex.end()
-				&& findRoot(pit->second) == findRoot(refIndex.at(kv.first)))
-				vi.aliasPrevious = true;
-		}
-		out.versions.push_back(std::move(vi));
-	}
-
-	// ---- 顺序边：用户边 + 别名块钉住边 ----
-	std::set<BuilderEdge> finalEdges = userEdges;
-	for (auto& kv : groups) {
-		const std::vector<ResourceRef>& members = kv.second;
-		if (members.size() < 2) continue;
-		std::vector<const VerRecord*> used;
-		for (const ResourceRef& m : members) {
-			const VerRecord& r = recs.at(m);
-			if (r.used) used.push_back(&r);
-		}
-		std::sort(used.begin(), used.end(), [](const VerRecord* a, const VerRecord* b) {
-			return a->firstUse < b->firstUse;
-		});
-		std::vector<std::vector<std::string>> levels;
-		for (const VerRecord* r : used) {
-			if (!r->producer.empty())
-				levels.push_back(std::vector<std::string>{ r->producer });
-			if (!r->readers.empty())
-				levels.push_back(r->readers);
-		}
-		for (size_t i = 1; i < levels.size(); ++i)
-			for (const auto& a : levels[i - 1])
-				for (const auto& b : levels[i])
-					if (a != b) finalEdges.insert(BuilderEdge{ a, b });
-	}
-	out.graph.orderEdges.assign(finalEdges.begin(), finalEdges.end());
-
-	// ---- 三情况报告：资源依赖补边 / 纯顺序边 ----
-	std::set<BuilderEdge> resEdges;
-	for (const auto& kv : recs) {
-		const VerRecord& r = kv.second;
-		if (r.producer.empty()) continue;
-		for (const auto& reader : r.readers)
-			if (reader != r.producer)
-				resEdges.insert(BuilderEdge{ r.producer, reader });
-	}
-	std::vector<std::vector<uint32_t>> resAdj(n);
-	for (const auto& e : resEdges) {
-		if (passMap.find(e.from) == passMap.end() || passMap.find(e.to) == passMap.end())
-			continue;
-		const uint32_t a = static_cast<uint32_t>(passMap.at(e.from));
-		const uint32_t b = static_cast<uint32_t>(passMap.at(e.to));
-		auto& adj = resAdj[a];
-		if (std::find(adj.begin(), adj.end(), b) == adj.end())
-			adj.push_back(b);
-	}
-	auto reach = [](const std::map<std::string, size_t>& pm,
-		const std::vector<std::vector<uint32_t>>& adj,
-		const BuilderEdge& e) {
-		auto ia = pm.find(e.from);
-		auto ib = pm.find(e.to);
-		if (ia == pm.end() || ib == pm.end()) return false;
-		return BuilderReachable(adj, static_cast<uint32_t>(ia->second),
-			static_cast<uint32_t>(ib->second));
-	};
-	for (const auto& e : resEdges) {
-		if (!reach(passMap, userAdj, e)) {
-			out.topology.impliedAdded.push_back(e);
-			addDiag(BuilderSeverity::Warning, BuilderDiagKind::ImpliedEdgeAdded,
-				"资源依赖补出顺序边：" + e.from + " -> " + e.to, e);
-		}
-	}
-	for (const auto& e : userEdges)
-		if (!reach(passMap, resAdj, e))
-			out.topology.orderingOnly.push_back(e);
-
-	// ---- 依据版本化声明重建资源 ----
-	for (const auto& kv : recs) {
-		auto ri = resMap.find(kv.first.name);
-		if (ri == resMap.end()) continue;
-		const ResourceDecl& rd = m_resources[ri->second];
-		LoweredResource lr;
-		lr.ref = kv.first;
-		lr.desc = rd.desc;
-		lr.view = rd.view;
-		lr.viewFormat = rd.viewFormat;
-		lr.barrierRange = rd.barrierRange;
-		lr.initialLayout = rd.initialLayout;
-		lr.crossFrame = rd.crossFrame;
-		lr.external = rd.IsExternal();
-		lr.externalImage = rd.externalImage;
-		lr.externalBuffer = rd.externalBuffer;
-		lr.borrowedLater = rd.borrowedLater;
-		out.graph.resources.push_back(std::move(lr));
-	}
-	out.graph.passes = std::move(lowered);
-	out.ok = errorCount == 0;
-	return out;
-}
-
-bool RenderGraphBuilder::Build(RenderGraph& out, LowerResult* result) const {
-	LowerResult r = Lower();
-	if (result != nullptr)
-		*result = r;
-	if (!r.ok)
-		return false;
-
-	// 每个版本引用对应的写者 / 读者（pass 名）
-	std::map<ResourceRef, std::string> writerOf;
-	std::map<ResourceRef, std::set<std::string>> readersOf;
-	std::map<std::string, Pass::Type> passType;
-	for (const LoweredPass& p : r.graph.passes) {
-		passType[p.name] = p.type;
-		for (const ResourceRef& w : p.writes)
-			writerOf[w] = p.name;
-		for (const ResourceRef& rd : p.reads)
-			readersOf[rd].insert(p.name);
-	}
-
-	for (const LoweredResource& lr : r.graph.resources) {
-		std::string writer;
-		auto wit = writerOf.find(lr.ref);
-		if (wit != writerOf.end())
-			writer = wit->second;
-		std::set<std::string> readers;
-		auto rit = readersOf.find(lr.ref);
-		if (rit != readersOf.end())
-			readers = rit->second;
-
-		const bool muxOutput = !writer.empty()
-			&& passType.find(writer) != passType.end()
-			&& passType.at(writer) == Pass::Mux;
-
-		if (lr.externalImage != nullptr) {
-			out.RegisterResource(lr.ref.name, readers, writer, lr.externalImage,
-				lr.view, lr.initialLayout, lr.viewFormat, lr.barrierRange,
-				lr.crossFrame, lr.ref.version);
-		}
-		else if (lr.externalBuffer != nullptr) {
-			out.RegisterResource(lr.ref.name, readers, writer, lr.externalBuffer, lr.ref.version);
-		}
-		else if (muxOutput) {
-			out.RegisterMuxOutput(lr.ref.name, readers, writer, lr.desc, lr.ref.version);
-		}
-		else {
-			Resource::Type type = Resource::None;
-			if (std::get_if<ImageDesc>(&lr.desc)) type = Resource::Image;
-			else if (std::get_if<BufferDesc>(&lr.desc)) type = Resource::Buffer;
-			out.RegisterResource(lr.ref.name, readers, writer, type, lr.desc,
-				lr.view, lr.viewFormat, lr.barrierRange,
-				lr.initialLayout, lr.crossFrame, lr.ref.version);
-		}
-	}
-
-	// 顺序边按目标 pass 聚合成 PassOrder.after
-	std::map<std::string, std::set<std::string>> after;
-	for (const BuilderEdge& e : r.graph.orderEdges)
-		after[e.to].insert(e.from);
-
-	for (const LoweredPass& p : r.graph.passes) {
-		RenderGraph::PassOrder order;
-		auto ait = after.find(p.name);
-		if (ait != after.end())
-			order.after = ait->second;
-		out.RegisterPass(p.name, p.reads, p.writes, p.type, p.desc,
-			std::move(order), p.queue, p.bindingVersions);
-	}
-
-	for (const LoweredAliasGroup& g : r.graph.aliasGroups)
-		out.AliasResourceVersions(g.members);
-
-	return true;
-}
-
 void RenderGraph::RealizeShaderSets(rhi::Pipeline& pipeline, std::vector<ShaderBinding>& shaderBindings,
 	std::vector<std::unique_ptr<rhi::DescriptorSet>>& sets, PassTopology& topo, uint32_t firstSetIndex)
 {
@@ -3764,10 +2723,9 @@ void RenderGraph::RecordPass(rhi::CommandList& cmd, Pass* pass) {
 			Resource* argsRes = GetResource(*d.indirectBufferId);
 			if (argsRes == nullptr || argsRes->get_type() != Resource::Buffer)
 				HandleError(ErrorCode::ResourceNotRegistered);
-			RealizeResource(argsRes);
 			const rhi::Buffer* args = static_cast<Buffer*>(argsRes)->get_rhi();
 			if (args == nullptr)
-				HandleError(ErrorCode::ResourceNotRegistered);
+				HandleError(ErrorCode::ResourceNotRealized);
 			cmd.DispatchIndirect(*args, d.indirectOffset);
 		}
 		else {
@@ -3790,11 +2748,10 @@ void RenderGraph::RecordPass(rhi::CommandList& cmd, Pass* pass) {
 			Resource* res = GetResource(*att.resourceId);
 			if (res == nullptr || res->get_type() != Resource::Image)
 				HandleError(ErrorCode::ResourceNotRegistered);
-			RealizeResource(res);
 			Image* img = static_cast<Image*>(res);
 			const rhi::Image* raw = img->get_rhi();
 			if (raw == nullptr)
-				HandleError(ErrorCode::ResourceNotRegistered);
+				HandleError(ErrorCode::ResourceNotRealized);
 
 			rhi::RenderingAttachment ra;
 			ra.image  = const_cast<rhi::Image*>(raw);
@@ -3827,11 +2784,10 @@ void RenderGraph::RecordPass(rhi::CommandList& cmd, Pass* pass) {
 			Resource* res = GetResource(*att.resourceId);
 			if (res == nullptr || res->get_type() != Resource::Image)
 				HandleError(ErrorCode::ResourceNotRegistered);
-			RealizeResource(res);
 			Image* img = static_cast<Image*>(res);
 			const rhi::Image* raw = img->get_rhi();
 			if (raw == nullptr)
-				HandleError(ErrorCode::ResourceNotRegistered);
+				HandleError(ErrorCode::ResourceNotRealized);
 			rhi::ImageSubresourceRange range{ img->get_view(), 1, 1 };
 			if (att.range.has_value())
 				range = *att.range;
@@ -3913,10 +2869,9 @@ void RenderGraph::RecordPass(rhi::CommandList& cmd, Pass* pass) {
 			Resource* res = GetResource(*d.vertexStreams[i].resourceId);
 			if (res == nullptr || res->get_type() != Resource::Buffer)
 				HandleError(ErrorCode::ResourceNotRegistered);
-			RealizeResource(res);
 			const rhi::Buffer* buf = static_cast<Buffer*>(res)->get_rhi();
 			if (buf == nullptr)
-				HandleError(ErrorCode::ResourceNotRegistered);
+				HandleError(ErrorCode::ResourceNotRealized);
 			cmd.BindVertexBuffer(*buf, d.vertexStreams[i].offset, i);
 		}
 
@@ -3924,10 +2879,9 @@ void RenderGraph::RecordPass(rhi::CommandList& cmd, Pass* pass) {
 			Resource* res = GetResource(*d.indexStream->resourceId);
 			if (res == nullptr || res->get_type() != Resource::Buffer)
 				HandleError(ErrorCode::ResourceNotRegistered);
-			RealizeResource(res);
 			const rhi::Buffer* buf = static_cast<Buffer*>(res)->get_rhi();
 			if (buf == nullptr)
-				HandleError(ErrorCode::ResourceNotRegistered);
+				HandleError(ErrorCode::ResourceNotRealized);
 			cmd.BindIndexBuffer(*buf, d.indexStream->offset, d.indexStream->type);
 		}
 
@@ -3944,8 +2898,9 @@ void RenderGraph::RecordPass(rhi::CommandList& cmd, Pass* pass) {
 				if (r->get_name() != draw.indirectBuffer) continue;
 				if (r->get_type() != Resource::Buffer)
 					HandleError(ErrorCode::ResourceTypeDescMismatch);
-				RealizeResource(r.get());
 				args = static_cast<Buffer*>(r.get())->get_rhi();
+				if (args == nullptr)
+					HandleError(ErrorCode::ResourceNotRealized);
 				break;
 			}
 			if (args == nullptr)
@@ -3974,10 +2929,9 @@ void RenderGraph::RecordPass(rhi::CommandList& cmd, Pass* pass) {
 			Resource* dstRes = GetResource(*d.destId);
 			if (dstRes == nullptr || dstRes->get_type() != Resource::Image)
 				HandleError(ErrorCode::ResourceNotRegistered);
-			RealizeResource(dstRes);
 			rhi::Image* dst = const_cast<rhi::Image*>(static_cast<Image*>(dstRes)->get_rhi());
 			if (dst == nullptr)
-				HandleError(ErrorCode::ResourceNotRegistered);
+				HandleError(ErrorCode::ResourceNotRealized);
 			cmd.ClearImage(*dst, d.clearRange, rhi::ImageLayout::TransferDst, d.clearValue);
 			break;
 		}
@@ -3986,15 +2940,13 @@ void RenderGraph::RecordPass(rhi::CommandList& cmd, Pass* pass) {
 		Resource* dstRes = GetResource(*d.destId);
 		if (srcRes == nullptr || dstRes == nullptr)
 			HandleError(ErrorCode::ResourceNotRegistered);
-		RealizeResource(srcRes);
-		RealizeResource(dstRes);
 
 		switch (d.kind) {
 		case TransferKind::BufferToImage: {
 			const rhi::Buffer* src = static_cast<Buffer*>(srcRes)->get_rhi();
 			rhi::Image* dst = const_cast<rhi::Image*>(static_cast<Image*>(dstRes)->get_rhi());
 			if (src == nullptr || dst == nullptr)
-				HandleError(ErrorCode::ResourceNotRegistered);
+				HandleError(ErrorCode::ResourceNotRealized);
 			if (d.bufferImageRegions.empty())
 				cmd.CopyBufferToImage(*src, *dst, rhi::ImageLayout::TransferDst, d.srcOffset);
 			else
@@ -4005,7 +2957,7 @@ void RenderGraph::RecordPass(rhi::CommandList& cmd, Pass* pass) {
 			const rhi::Image* src = static_cast<Image*>(srcRes)->get_rhi();
 			const rhi::Buffer* dst = static_cast<Buffer*>(dstRes)->get_rhi();
 			if (src == nullptr || dst == nullptr)
-				HandleError(ErrorCode::ResourceNotRegistered);
+				HandleError(ErrorCode::ResourceNotRealized);
 			if (d.bufferImageRegions.empty())
 				cmd.CopyImageToBuffer(*src, *dst, rhi::ImageLayout::TransferSrc, d.dstOffset);
 			else
@@ -4016,7 +2968,7 @@ void RenderGraph::RecordPass(rhi::CommandList& cmd, Pass* pass) {
 			const rhi::Buffer* src = static_cast<Buffer*>(srcRes)->get_rhi();
 			const rhi::Buffer* dst = static_cast<Buffer*>(dstRes)->get_rhi();
 			if (src == nullptr || dst == nullptr)
-				HandleError(ErrorCode::ResourceNotRegistered);
+				HandleError(ErrorCode::ResourceNotRealized);
 			cmd.CopyBuffer(*src, *dst, d.srcOffset, d.dstOffset, d.byteSize);
 			break;
 		}
@@ -4024,7 +2976,7 @@ void RenderGraph::RecordPass(rhi::CommandList& cmd, Pass* pass) {
 			const rhi::Image* src = static_cast<Image*>(srcRes)->get_rhi();
 			rhi::Image* dst = const_cast<rhi::Image*>(static_cast<Image*>(dstRes)->get_rhi());
 			if (src == nullptr || dst == nullptr)
-				HandleError(ErrorCode::ResourceNotRegistered);
+				HandleError(ErrorCode::ResourceNotRealized);
 			if (d.blit) {
 				if (d.blitRegions.empty())
 					cmd.BlitImage(*src, *dst, rhi::ImageLayout::TransferSrc,
@@ -4060,6 +3012,20 @@ namespace {
 		rhi::Access        access = rhi::Access::None;
 		rhi::ImageLayout   layout = rhi::ImageLayout::Undefined;
 	};
+
+	const char* ImageLayoutName(rhi::ImageLayout layout) {
+		switch (layout) {
+		case rhi::ImageLayout::Undefined:              return "Undefined";
+		case rhi::ImageLayout::General:                return "General";
+		case rhi::ImageLayout::ColorAttachment:        return "ColorAttachment";
+		case rhi::ImageLayout::DepthStencilAttachment: return "DepthStencilAttachment";
+		case rhi::ImageLayout::ShaderReadOnly:         return "ShaderReadOnly";
+		case rhi::ImageLayout::TransferSrc:            return "TransferSrc";
+		case rhi::ImageLayout::TransferDst:            return "TransferDst";
+		case rhi::ImageLayout::PresentSrc:             return "PresentSrc";
+		}
+		return "Unknown";
+	}
 
 	rhi::PipelineStage ShaderStageFor(Pass::Type type, rhi::ShaderStageMask stages) {
 		if (type == Pass::Compute) return rhi::PipelineStage::ComputeShader;
@@ -4117,6 +3083,11 @@ namespace {
 		case Usage::StorageWrite:
 			s.stage = ShaderStageFor(type, stages);
 			s.access = rhi::Access::ShaderWrite;
+			s.layout = rhi::ImageLayout::General;
+			break;
+		case Usage::StorageReadWrite:
+			s.stage = ShaderStageFor(type, stages);
+			s.access = rhi::Access::ShaderRead | rhi::Access::ShaderWrite;
 			s.layout = rhi::ImageLayout::General;
 			break;
 		case Usage::UniformRead:
@@ -4706,6 +3677,16 @@ void RenderGraph::CompileBarriersSubresource() {
 	}
 	BuildSubmitPlan();
 
+	// 一个节点可能横跨多个子资源分区：布局取并集，冲突退回 General
+	auto mergePassLayout = [&](uint32_t passId, uint32_t resId, rhi::ImageLayout layout) {
+		const auto key = std::make_pair(passId, resId);
+		auto it = m_passImageLayouts.find(key);
+		if (it == m_passImageLayouts.end())
+			m_passImageLayouts.emplace(key, layout);
+		else if (it->second != layout)
+			it->second = rhi::ImageLayout::General;
+	};
+
 	struct BarrierUsePoint {
 		uint32_t     passId = 0;
 		UsageSync    sync;
@@ -4736,9 +3717,9 @@ void RenderGraph::CompileBarriersSubresource() {
 	std::map<std::pair<uint32_t, uint32_t>, rhi::ImageLayout> proxyLayouts;
 
 	for (const MuxEntry& mux : m_muxes) {
-		if (mux.outputType != Resource::Image)
-			continue;
-		muxOutputIds.insert(mux.outputResId);
+		const bool imageMux = mux.outputType == Resource::Image;
+		if (imageMux)
+			muxOutputIds.insert(mux.outputResId);
 		for (uint32_t passId : submitSeq) {
 			Pass* p = GetPass(passId);
 			if (p == nullptr || p->get_id() == mux.passId)
@@ -4750,6 +3731,13 @@ void RenderGraph::CompileBarriersSubresource() {
 						continue;
 					if (use.usage == Usage::MuxPrepare || use.usage == Usage::MuxSelect)
 						continue;
+					if (!imageMux) {
+						// Buffer 输出没有子资源范围与布局，直接把用途投影到候选
+						for (uint32_t candId : mux.alternativeIds)
+							proxyByPassRes[{ passId, candId }].push_back(
+								MuxProxyUse{ candId, passId, {}, use.usage, isWrite, use.stages });
+						continue;
+					}
 					auto accIt = accessByPassRes.find({ passId, mux.outputResId });
 					if (accIt == accessByPassRes.end())
 						continue;
@@ -4775,19 +3763,17 @@ void RenderGraph::CompileBarriersSubresource() {
 		}
 	}
 	for (const auto& kv : proxyLayouts)
-		m_passImageLayouts[kv.first] = kv.second;
+		mergePassLayout(kv.first.first, kv.first.second, kv.second);
 
 	std::set<uint32_t> warnedCrossFrameBlocks;
 	auto emitChain = [&](Resource* owner, bool isImage, const std::vector<BarrierUsePoint>& chain,
-		const rhi::ImageSubresourceRange* range) {
+		const rhi::ImageSubresourceRange* range, rhi::ImageLayout initLayout, bool crossFrame) {
 		if (chain.empty())
 			return;
 		auto setRange = [range](GraphImageBarrier& b) {
 			if (range != nullptr) b.range = *range;
 		};
 		const UsageSync first = chain.front().sync;
-		const rhi::ImageLayout initLayout = owner->get_topology().initialLayout;
-		const bool crossFrame = owner->get_topology().crossFrame;
 
 		if (!crossFrame) {
 			if (isImage && initLayout != first.layout) {
@@ -5038,7 +4024,15 @@ void RenderGraph::CompileBarriersSubresource() {
 					for (const auto& use : topo.reads)
 						if (use.resourceId == id) { readUse = &use; break; }
 			}
-			if (writeUse == nullptr && readUse == nullptr)
+			bool hasProxy = false;
+			for (Resource* m : members) {
+				auto pit = proxyByPassRes.find({ passId, m->get_id() });
+				if (pit != proxyByPassRes.end() && !pit->second.empty()) {
+					hasProxy = true;
+					break;
+				}
+			}
+			if (writeUse == nullptr && readUse == nullptr && !hasProxy)
 				continue;
 			UsageSync merged = writeUse != nullptr
 				? UsageSyncOf(writeUse->usage, p->get_type(), writeUse->stages)
@@ -5056,19 +4050,34 @@ void RenderGraph::CompileBarriersSubresource() {
 				merged.stage = merged.stage | rhi::PipelineStage::AllCommands;
 				merged.access = merged.access | rhi::Access::MemoryRead;
 			}
-			chain.push_back(BarrierUsePoint{ passId, merged, writeUse != nullptr, p->get_type() });
+			bool write = writeUse != nullptr;
+			// mux 输出消费者的用途投影到候选：把该 pass 作为候选的使用点并入链
+			for (Resource* m : members) {
+				auto pit = proxyByPassRes.find({ passId, m->get_id() });
+				if (pit == proxyByPassRes.end())
+					continue;
+				for (const auto& pu : pit->second) {
+					const UsageSync s = UsageSyncOf(pu.usage, p->get_type(), pu.stages);
+					merged.stage = merged.stage | s.stage;
+					merged.access = merged.access | s.access;
+					if (pu.write)
+						write = true;
+				}
+			}
+			chain.push_back(BarrierUsePoint{ passId, merged, write, p->get_type() });
 		}
 		return chain;
 	};
 
-	std::map<uint32_t, std::vector<Resource*>> blocks;
+	// 缓冲：沿用 memoryBlockId 分块（本轮不改）
+	std::map<uint32_t, std::vector<Resource*>> bufferBlocks;
 	for (auto& holder : resourcePool) {
 		Resource* res = holder.get();
-		if (res != nullptr)
-			blocks[res->m_topo.memoryBlockId].push_back(res);
+		if (res != nullptr && res->get_type() == Resource::Buffer)
+			bufferBlocks[res->m_topo.memoryBlockId].push_back(res);
 	}
 
-	for (auto& entry : blocks) {
+	for (auto& entry : bufferBlocks) {
 		const uint32_t blockId = entry.first;
 		const std::vector<Resource*>& members = entry.second;
 
@@ -5077,28 +4086,113 @@ void RenderGraph::CompileBarriersSubresource() {
 			if (m->get_id() == blockId) { owner = m; break; }
 		if (owner == nullptr)
 			owner = members.front();
-		const bool isImage = owner->get_type() == Resource::Image;
 		if (muxOutputIds.count(blockId) != 0)
 			continue;
-		const bool realized = isImage ? static_cast<Image*>(owner)->get_rhi() != nullptr
-			: static_cast<Buffer*>(owner)->get_rhi() != nullptr;
-		if (!realized)
+		if (static_cast<Buffer*>(owner)->get_rhi() == nullptr)
 			continue;
 
-		if (!isImage) {
-			auto chain = buildBlockChain(members);
-			emitChain(owner, false, chain, nullptr);
+		auto chain = buildBlockChain(members);
+		emitChain(owner, false, chain, nullptr, rhi::ImageLayout::Undefined,
+			owner->get_topology().crossFrame);
+	}
+
+	// 图像：按底层 backing 句柄归组。同一 rhi::Image 的多个视图节点共享一套布局
+	// 状态机，避免各自推导链首导致重叠子资源的转换互相覆盖。
+	std::map<const rhi::Image*, std::vector<Resource*>> imageBackings;
+	for (auto& holder : resourcePool) {
+		Resource* res = holder.get();
+		if (res == nullptr || res->get_type() != Resource::Image)
 			continue;
+		if (muxOutputIds.count(res->get_id()) != 0)
+			continue; // mux 输出是虚拟节点，用途已投影到候选
+		const rhi::Image* handle = static_cast<Image*>(res)->get_rhi();
+		if (handle == nullptr)
+			continue;
+		imageBackings[handle].push_back(res);
+	}
+
+	struct InitDecl {
+		Resource* node = nullptr;
+		rhi::ImageSubresourceRange range {};
+		rhi::ImageLayout layout = rhi::ImageLayout::Undefined;
+	};
+
+	for (auto& entry : imageBackings) {
+		std::vector<Resource*>& members = entry.second;
+		std::sort(members.begin(), members.end(),
+			[](Resource* a, Resource* b) { return a->get_id() < b->get_id(); });
+		Resource* owner = members.front();
+
+		std::set<uint32_t> memberIds;
+		for (Resource* m : members)
+			memberIds.insert(m->get_id());
+
+		bool crossFrame = false;
+		for (Resource* m : members)
+			crossFrame = crossFrame || m->get_topology().crossFrame;
+
+		// 初态声明按节点 id 升序；重叠子资源上冲突时警告并取首个声明
+		std::vector<InitDecl> initDecls;
+		for (Resource* m : members) {
+			const rhi::ImageLayout layout = m->get_topology().initialLayout;
+			if (layout == rhi::ImageLayout::Undefined)
+				continue;
+			const Image* img = static_cast<const Image*>(m);
+			rhi::ImageSubresourceRange range = img->get_barrier_range();
+			if (!rhi::NormalizeImageSubresourceRange(range,
+					img->get_desc().mipLevels, img->get_desc().arrayLayers))
+				continue;
+			initDecls.push_back(InitDecl{ m, range, layout });
 		}
 
+		auto rangesOverlap = [](const rhi::ImageSubresourceRange& a,
+			const rhi::ImageSubresourceRange& b) {
+			return a.base.mipLevel < b.base.mipLevel + b.mipLevelCount
+				&& b.base.mipLevel < a.base.mipLevel + a.mipLevelCount
+				&& a.base.layer < b.base.layer + b.layerCount
+				&& b.base.layer < a.base.layer + a.layerCount;
+		};
+
+		bool conflictReported = false;
+		for (size_t i = 0; i < initDecls.size() && !conflictReported; ++i) {
+			for (size_t j = i + 1; j < initDecls.size(); ++j) {
+				const InitDecl& a = initDecls[i];
+				const InitDecl& b = initDecls[j];
+				if (a.layout == b.layout || !rangesOverlap(a.range, b.range))
+					continue;
+				std::cerr << "RenderGraph: 借用同一底层图像的节点 \""
+					<< a.node->get_name() << "\"(mip " << a.range.base.mipLevel
+					<< "+" << a.range.mipLevelCount << ", layer " << a.range.base.layer
+					<< "+" << a.range.layerCount << ", " << ImageLayoutName(a.layout)
+					<< ") 与 \"" << b.node->get_name() << "\"(mip " << b.range.base.mipLevel
+					<< "+" << b.range.mipLevelCount << ", layer " << b.range.base.layer
+					<< "+" << b.range.layerCount << ", " << ImageLayoutName(b.layout)
+					<< ") 的 initialLayout 冲突；按节点 \"" << a.node->get_name()
+					<< "\" 的声明继续编译" << std::endl;
+				conflictReported = true;
+				break;
+			}
+		}
+
+		auto initLayoutFor = [&](uint32_t mip, uint32_t layerStart, uint32_t layerCount) {
+			const rhi::ImageSubresourceRange part{ { mip, layerStart }, 1, layerCount };
+			for (const InitDecl& decl : initDecls)
+				if (rangesOverlap(decl.range, part))
+					return decl.layout;
+			return rhi::ImageLayout::Undefined;
+		};
+
+		// 分区来源：成员的全部访问范围（accessByPassRes 已含 mux 代理投影）
 		std::map<uint32_t, std::vector<std::pair<uint32_t, uint32_t>>> layerIntervals;
-		for (const auto& a : m_imageAccessRanges) {
-			if (a.blockId != blockId)
+		for (const auto& kv : accessByPassRes) {
+			if (memberIds.count(kv.first.second) == 0)
 				continue;
-			const uint32_t mipEnd = a.range.base.mipLevel + a.range.mipLevelCount;
-			for (uint32_t mip = a.range.base.mipLevel; mip < mipEnd; ++mip)
-				layerIntervals[mip].push_back(
-					{ a.range.base.layer, a.range.base.layer + a.range.layerCount });
+			for (const auto& r : kv.second) {
+				const uint32_t mipEnd = r.base.mipLevel + r.mipLevelCount;
+				for (uint32_t mip = r.base.mipLevel; mip < mipEnd; ++mip)
+					layerIntervals[mip].push_back(
+						{ r.base.layer, r.base.layer + r.layerCount });
+			}
 		}
 		if (layerIntervals.empty())
 			continue;
@@ -5194,12 +4288,13 @@ void RenderGraph::CompileBarriersSubresource() {
 					continue;
 				const rhi::ImageLayout passLayout = layoutKnown ? layout : rhi::ImageLayout::Undefined;
 				for (uint32_t id : touchedMembers)
-					m_passImageLayouts[{ passId, id }] = passLayout;
+					mergePassLayout(passId, id, passLayout);
 				merged.layout = passLayout;
 				chain.push_back(BarrierUsePoint{ passId, merged, write, p->get_type() });
 			}
 			const rhi::ImageSubresourceRange partRange{ { part.mip, part.layerStart }, 1, part.layerCount };
-			emitChain(owner, true, chain, &partRange);
+			emitChain(owner, true, chain, &partRange,
+				initLayoutFor(part.mip, part.layerStart, part.layerCount), crossFrame);
 		}
 	}
 

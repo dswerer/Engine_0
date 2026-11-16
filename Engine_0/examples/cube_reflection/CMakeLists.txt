@@ -3,8 +3,13 @@
 add_executable(CubeReflection
 	"main.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/../../RenderGraph.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../RenderGraphBuilder.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/../../RenderGraphNodes.cpp"
-	"${CMAKE_CURRENT_SOURCE_DIR}/../../AssetResolver.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../ContentResolver.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../AssetCatalog.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../AssetPack.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../AssetLoader.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../StbImageImpl.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/../../ShaderLibrary.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/../../rhi/RHI.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/../../vmaExporter.cpp"
@@ -40,7 +45,8 @@ set(CUBE_REFLECTION_SHADER_SOURCES
 	"${CMAKE_CURRENT_SOURCE_DIR}/shaders/fullscreen.vert"
 	"${CMAKE_CURRENT_SOURCE_DIR}/shaders/cube.vert"
 	"${CMAKE_CURRENT_SOURCE_DIR}/shaders/cube.frag"
-	"${CMAKE_CURRENT_SOURCE_DIR}/shaders/composite.frag")
+	"${CMAKE_CURRENT_SOURCE_DIR}/shaders/composite.frag"
+	"${CMAKE_CURRENT_SOURCE_DIR}/shaders/composite_heap.frag")
 
 engine0_write_shader_manifest("${CUBE_REFLECTION_SHADER_DIR}/shaders.manifest.json" ${CUBE_REFLECTION_SHADER_SOURCES})
 

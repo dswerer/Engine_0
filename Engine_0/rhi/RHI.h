@@ -21,6 +21,7 @@ namespace dEngine::rhi {
 		uint32_t width = 0, height = 0;
 		bool     enableValidation = true;      // debug 下默认开
 		uint32_t maxFramesInFlight = 2;        // 帧槽数量（创建期决定；内部钳制到 [1,8]）
+		bool     forceFixedArrayHeap = false;  // 测试用：强制静态纹理堆走固定数组回退路径
 	};
 
 #pragma endregion
@@ -510,8 +511,10 @@ namespace dEngine::rhi {
 		// 手工描述符布局（非反射）：partiallyBound=true 启用 PARTIALLY_BOUND。
 		std::unique_ptr<DescriptorSetLayout> CreateDescriptorSetLayout(
 			const std::vector<DescriptorBinding>& bindings, bool partiallyBound = false);
-		// descriptor indexing / 采样图像数组动态索引是否可用（静态纹理堆的前提）
+		// descriptor indexing / 采样图像数组动态索引是否可用（静态纹理堆的稀疏绑定前提）
 		bool                           SupportsBindlessTextures() const { return m_bindlessSupported; }
+		// 静态纹理堆能力分级：FixedArray 走全槽位绑定 + dummy 填充
+		StaticHeapTier                 GetStaticHeapTier() const { return m_staticHeapTier; }
 		// 逐附件独立混合状态是否可用（不同附件不同 blend/writeMask 的前提）
 		bool                           SupportsIndependentBlend() const { return m_independentBlendSupported; }
 		// depth bounds test 是否可用（不可用时 RHI 自动关闭该测试）
@@ -592,6 +595,8 @@ namespace dEngine::rhi {
 		bool   m_timestampsSupported = false;
 		float  m_maxSamplerAnisotropy = 1.0f;
 		bool   m_bindlessSupported = false;
+		StaticHeapTier m_staticHeapTier = StaticHeapTier::FixedArray;
+		bool   m_sampledArrayDynamicIndexing = false;
 		bool   m_depthBoundsSupported = false;
 		bool   m_independentBlendSupported = false;
 		bool   m_tessellationSupported = false;

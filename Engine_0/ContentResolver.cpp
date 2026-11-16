@@ -1,4 +1,6 @@
-#include "AssetResolver.h"
+#include "ContentResolver.h"
+
+#include "AssetPack.h"
 
 #include <chrono>
 #include <fstream>
@@ -29,7 +31,7 @@ namespace dEngine {
 		}
 	}
 
-	std::string AssetResolver::Normalize(std::string_view logical) {
+	std::string ContentResolver::Normalize(std::string_view logical) {
 		if (logical.empty())
 			return {};
 
@@ -70,7 +72,7 @@ namespace dEngine {
 		return normalized;
 	}
 
-	void AssetResolver::Mount(std::string prefix, std::filesystem::path root) {
+	void ContentResolver::Mount(std::string prefix, std::filesystem::path root) {
 		while (!prefix.empty() && (prefix.back() == '/' || prefix.back() == '\\'))
 			prefix.pop_back();
 		if (prefix.empty())
@@ -78,18 +80,75 @@ namespace dEngine {
 		m_mounts.push_back({ std::move(prefix), std::move(root) });
 	}
 
-	void AssetResolver::SetFallbackRoot(std::filesystem::path root) {
+	void ContentResolver::SetFallbackRoot(std::filesystem::path root) {
 		m_fallback = std::move(root);
 	}
 
-	std::optional<AssetResolver::Resolved> AssetResolver::Resolve(
+	void ContentResolver::SetPack(const AssetPack* pack) {
+		m_pack = pack;
+	}
+
+	std::optional<ContentResolver::ParsedPath> ContentResolver::ParsePath(std::string_view raw) {
+		constexpr std::string_view kPackScheme = "pack:";
+		if (raw.substr(0, kPackScheme.size()) == kPackScheme) {
+			const std::string logical = Normalize(raw.substr(kPackScheme.size()));
+			if (logical.empty())
+				return std::nullopt;
+			return ParsedPath{ ParsedPath::Scheme::Pack, logical };
+		}
+		const std::string logical = Normalize(raw);
+		if (logical.empty())
+			return std::nullopt;
+		return ParsedPath{ ParsedPath::Scheme::File, logical };
+	}
+
+	std::string ContentResolver::NormalizePath(std::string_view raw) {
+		const auto parsed = ParsePath(raw);
+		if (!parsed)
+			return {};
+		if (parsed->scheme == ParsedPath::Scheme::Pack)
+			return "pack:" + parsed->logical;
+		return parsed->logical;
+	}
+
+	std::string ContentResolver::InheritPath(std::string_view basePath, std::string_view entryPath) {
+		const auto base = ParsePath(basePath);
+		if (!base || base->scheme != ParsedPath::Scheme::Pack)
+			return std::string(entryPath);
+		const auto entry = ParsePath(entryPath);
+		if (!entry)
+			return std::string(entryPath); // 交给登记方报非法路径
+		return "pack:" + entry->logical;
+	}
+
+	std::optional<ContentResolver::Resolved> ContentResolver::Resolve(
 		std::string_view logical, std::string* error) const {
-		const std::string normalized = Normalize(logical);
-		if (normalized.empty()) {
+		const auto parsed = ParsePath(logical);
+		if (!parsed) {
 			SetError(error, "invalid asset path: " + std::string(logical));
 			return std::nullopt;
 		}
 
+		if (parsed->scheme == ParsedPath::Scheme::Pack) {
+			if (m_pack == nullptr) {
+				SetError(error, "no asset pack registered: " + parsed->logical);
+				return std::nullopt;
+			}
+			const auto entry = m_pack->Stat(parsed->logical);
+			if (!entry) {
+				SetError(error, "asset not found in pack: " + parsed->logical);
+				return std::nullopt;
+			}
+			Resolved resolved;
+			resolved.kind = Resolved::Kind::Pack;
+			resolved.identity = "pack:" + std::to_string(m_pack->Hash()) + ":" + parsed->logical;
+			resolved.logicalPath = "pack:" + parsed->logical;
+			resolved.size = entry->size;
+			resolved.hash = entry->hash;
+			return resolved;
+		}
+
+		const std::string& normalized = parsed->logical;
 		std::filesystem::path root = m_fallback;
 		std::string relative = normalized;
 		size_t bestPrefix = 0;
@@ -121,6 +180,8 @@ namespace dEngine {
 		}
 
 		Resolved resolved;
+		resolved.kind = Resolved::Kind::File;
+		resolved.identity = "fs:" + absolute.generic_string();
 		resolved.absolutePath = absolute;
 		resolved.logicalPath = normalized;
 		resolved.size = size;
@@ -128,17 +189,52 @@ namespace dEngine {
 		return resolved;
 	}
 
-	bool AssetResolver::Exists(std::string_view logical) const {
+	std::optional<std::span<const uint8_t>> ContentResolver::ViewBinary(
+		std::string_view logical, std::string* error) const {
+		const auto parsed = ParsePath(logical);
+		if (!parsed) {
+			SetError(error, "invalid asset path: " + std::string(logical));
+			return std::nullopt;
+		}
+		if (parsed->scheme != ParsedPath::Scheme::Pack)
+			return std::nullopt; // 磁盘源没有零拷贝视图，调用方回退 ReadBinary
+		if (m_pack == nullptr) {
+			SetError(error, "no asset pack registered: " + parsed->logical);
+			return std::nullopt;
+		}
+		const auto view = m_pack->View(parsed->logical);
+		if (!view)
+			SetError(error, "asset not found in pack: " + parsed->logical);
+		return view;
+	}
+
+	bool ContentResolver::Exists(std::string_view logical) const {
 		return Resolve(logical, nullptr).has_value();
 	}
 
-	std::optional<std::vector<uint8_t>> AssetResolver::ReadBinary(
+	std::optional<std::vector<uint8_t>> ContentResolver::ReadBinary(
 		std::string_view logical, std::string* error) const {
-		const auto resolved = Resolve(logical, error);
-		if (!resolved)
+		const auto parsed = ParsePath(logical);
+		if (!parsed) {
+			SetError(error, "invalid asset path: " + std::string(logical));
+			return std::nullopt;
+		}
+		if (parsed->scheme == ParsedPath::Scheme::Pack) {
+			if (m_pack == nullptr) {
+				SetError(error, "no asset pack registered: " + parsed->logical);
+				return std::nullopt;
+			}
+			auto data = m_pack->Read(parsed->logical);
+			if (!data)
+				SetError(error, "asset not found in pack: " + parsed->logical);
+			return data;
+		}
+
+		const auto resolved = Resolve(parsed->logical, error);
+		if (!resolved || !resolved->absolutePath)
 			return std::nullopt;
 
-		std::ifstream file(resolved->absolutePath, std::ios::binary);
+		std::ifstream file(*resolved->absolutePath, std::ios::binary);
 		if (!file) {
 			SetError(error, "cannot open asset: " + resolved->logicalPath);
 			return std::nullopt;

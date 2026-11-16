@@ -74,7 +74,7 @@ namespace dEngine {
 	enum class Usage {
 		Auto,
 		ColorAttachment, DepthStencilAttachment, ResolveSrc, ResolveDst,
-		SampledRead, StorageRead, StorageWrite,
+		SampledRead, StorageRead, StorageWrite, StorageReadWrite,
 		UniformRead,
 		VertexInputRead, IndexRead,
 		IndirectRead,                 // 间接参数缓冲读取（dispatch indirect；映射 DRAW_INDIRECT 阶段）
@@ -163,6 +163,13 @@ namespace dEngine {
 			ShaderBinding b;
 			b.resourceName = std::move(name);
 			b.usage = Usage::StorageWrite;
+			return b;
+		}
+		// 就地读写：同一 storage 资源既读又写（读写集合都要包含该资源）
+		static ShaderBinding StorageReadWrite(std::string name) {
+			ShaderBinding b;
+			b.resourceName = std::move(name);
+			b.usage = Usage::StorageReadWrite;
 			return b;
 		}
 	};

@@ -55,7 +55,7 @@ auto buffer = device->CreateBuffer(binfo);
 要点：
 - `Image::NativeFormat()` 返回**真实后端格式**（借用路径含 sRGB 变体），barrier 推 aspect 用它。
 - 交换链 backbuffer 通过 `Image::Borrow` 包装为非拥有 Image。
-- 描述层无 sRGB 格式变体：`*_SRGB` 与对应 UNORM 归一到同一 `ImageFormat`（交换链优选 UNORM 规避签名错配）。
+- 描述层提供 8 位 sRGB 变体（`R8Srgb/RG8Srgb/RGBA8Srgb/BGRA8Srgb`）；`FromVkFormat` 保留 `*_SRGB` 语义。交换链仍优选 `B8G8R8A8_UNORM` + sRGB 色彩空间，避免既有示例的色彩表现变化。
 
 ## 5. 管线与描述符（预编译路径）
 
@@ -78,7 +78,7 @@ set->Write(0, *uniformBuffer, 0, size);                   // uniform/storage 缓
 set->Write(0, *layeredTexture, rhi::ImageSubresource{ 0, 0 }, 4); // 数组绑定：从 layer 0 起连续 4 层
 ```
 
-- `ShaderStageDesc` 为 `{ stage, spirvPath, entryPoint }`：`entryPoint` 默认 `"main"`，创建管线时直接填入 `VkPipelineShaderStageCreateInfo::pName`，不再硬编码入口点。
+- `ShaderStageDesc` 为 `{ stage, spirvPath, spirv, entryPoint }`：磁盘源用 `spirvPath`，内存源（如资产包）用 `spirv`，非空时优先；`entryPoint` 默认 `"main"`。
 - **描述符布局完全由 SPIR-V 反射得出**（spv_reflect，`external/` 引入）：`CreatePipeline` 对各 stage 的 SPIR-V 一读两用——同一份 code 喂反射与 `vkCreateShaderModule`，产出每 set 的绑定表（变量名/set/binding/类型/数组长度），`DescriptorSetLayout` 由管线持有。**不再接受手工 `bindings` 声明**。
 - `DescriptorBinding::name` 携带 shader 顶层变量名，供上层按名匹配（渲染图约定「shader 变量名 == 图资源名」）。
 - 跨 stage 撞 (set,binding) 的共用槽位须同名同类型同长度；绑定的 stageFlags 取**实际使用该槽位的 stage 并集**（非 ALL_GRAPHICS 粗放值）。
@@ -217,7 +217,7 @@ uint32_t family = device->QueueFamily(rhi::QueueClass::AsyncCompute); // QFOT ba
 | Task/Mesh 着色阶段 | 枚举与组合校验预留；状态创建未实现，入口拒绝 |
 | 分离式描述符类型（SAMPLED_IMAGE/SAMPLER 分离、texel buffer 等） | 反射报暂不支持；当前仅 combined sampler / storage image / UBO / SSBO |
 | 上传路径（staging → CopyBufferToImage） | 已提供 `Device::UploadImage` / `UploadBuffer` 一次性上传 |
-| sRGB 格式词表 | 缺失，`*_SRGB` 归一为 UNORM |
+| sRGB 格式词表 | 已支持 R8/RG8/RGBA8/BGRA8 的 sRGB 变体；交换链仍优选 UNORM |
 | Buffer 节点（渲染图侧） | 已实现 Own / Borrow / Borrow-later |
 | 运行时长度描述符数组（`T[]`） | 反射报暂不支持：变长数组的 descriptorCount 无从得知，被静默当成标量会导致越界；固定长度数组（`T[4]`）已可写入 |
 | 图侧描述符写入时机 | 在 `RealizePass` 一次性完成；若将来出现每帧轮转的绑定（ping-pong、跨帧资源），需把写入拆到每帧提交前 |

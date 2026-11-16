@@ -2,8 +2,13 @@
 #define WIN32_LEAN_AND_MEAN
 
 #include "RenderGraphAbstracted.h"
+#include "RenderGraphBuilder.h"
 #include "RenderGraphNodes.h"
-#include "AssetResolver.h"
+#include "RenderGraphDocument.h"
+#include "ContentResolver.h"
+#include "AssetCatalog.h"
+#include "AssetPack.h"
+#include "ModulePack.h"
 #include "ShaderLibrary.h"
 #include "rhi/RHI.h"
 #include "AssimpMesh.h"
@@ -15,7 +20,6 @@
 #include <GLFW/glfw3native.h>
 #undef CreateSemaphore
 
-#define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image/stb_image_write.h"
 
 #include <glm/glm.hpp>
@@ -41,6 +45,9 @@
 #ifndef RETRIEVE_ASSET_DIR
 #define RETRIEVE_ASSET_DIR "assets"
 #endif
+#ifndef RETRIEVE_MODULE_DIR
+#define RETRIEVE_MODULE_DIR "modules"
+#endif
 
 using namespace dEngine;
 using namespace std;
@@ -62,9 +69,11 @@ constexpr uint32_t kSkyAmbientSize = 128;
 
 const string kAssetDir = RETRIEVE_ASSET_DIR;
 const string kShaderDir = RETRIEVE_SHADER_DIR;
+const string kModuleDir = RETRIEVE_MODULE_DIR;
 
 struct Options {
 	bool     smoke = false;
+	bool     emitModules = false;
 	uint32_t frames = 60;
 	float    boidsMinSpeed = 0.0f; // 0 = 完全按原工程；>0 为演示用最低巡游速度
 };
@@ -99,10 +108,164 @@ std::unique_ptr<rhi::Image> CreateLut(rhi::Device& device, uint32_t size, rhi::I
 	return device.CreateImage(info);
 }
 
+// ---- 模块定义：大气预计算 ----
+RenderGraphModule BuildAtmosphereModuleDefinition(std::vector<std::string>* errors) {
+	RenderGraphBuilder builder;
+
+	BufferDesc paramsDesc;
+	paramsDesc.size = sizeof(AtmosphereParams);
+	paramsDesc.usage = rhi::BufferUsage::Uniform;
+	paramsDesc.hostVisible = true;
+	builder.DeclareBufferResource("AtmosphereParams", paramsDesc);
+
+	ImageOptions lutOptions;
+	lutOptions.initialLayout = rhi::ImageLayout::Undefined;
+	const rhi::Image* noImage = nullptr;
+	builder.DeclareImageResource("TransmittanceLUT", noImage, lutOptions);
+	builder.DeclareImageResource("MultipleScatteringLUT", noImage, lutOptions);
+	builder.DeclareImageResource("SkyAmbientLUT", noImage, lutOptions);
+
+	builder.DeclarePass("HostParams", {}, { "AtmosphereParams" }, Pass::Host, HostPassDesc{});
+
+	ComputePassDesc transmittanceDesc;
+	transmittanceDesc.shaderRef = "transmittance.comp";
+	transmittanceDesc.groupCountX = kLutSize / 4;
+	transmittanceDesc.groupCountY = kLutSize / 8;
+	transmittanceDesc.shaderBindings = {
+		ShaderBinding::Uniform("AtmosphereParams"),
+		ShaderBinding::StorageWrite("TransmittanceLUT") };
+	builder.DeclarePass("Transmittance", { "AtmosphereParams" }, { "TransmittanceLUT" },
+		Pass::Compute, transmittanceDesc);
+
+	ComputePassDesc msDesc;
+	msDesc.shaderRef = "multiple_scattering.comp";
+	msDesc.groupCountX = kLutSize / 4;
+	msDesc.groupCountY = kLutSize / 8;
+	msDesc.shaderBindings = {
+		ShaderBinding::Uniform("AtmosphereParams"),
+		ShaderBinding::Sampled("TransmittanceLUT", rhi::SamplerDesc::Linear()),
+		ShaderBinding::StorageWrite("MultipleScatteringLUT") };
+	builder.DeclarePass("MultipleScattering", { "AtmosphereParams", "TransmittanceLUT" },
+		{ "MultipleScatteringLUT" }, Pass::Compute, msDesc);
+
+	ComputePassDesc saDesc;
+	saDesc.shaderRef = "sky_ambient.comp";
+	saDesc.groupCountX = kSkyAmbientSize / 4;
+	saDesc.groupCountY = kSkyAmbientSize / 8;
+	saDesc.shaderBindings = {
+		ShaderBinding::Uniform("AtmosphereParams"),
+		ShaderBinding::Sampled("TransmittanceLUT", rhi::SamplerDesc::Linear()),
+		ShaderBinding::Sampled("MultipleScatteringLUT", rhi::SamplerDesc::Linear()),
+		ShaderBinding::StorageWrite("SkyAmbientLUT") };
+	builder.DeclarePass("SkyAmbient", { "AtmosphereParams", "TransmittanceLUT", "MultipleScatteringLUT" },
+		{ "SkyAmbientLUT" }, Pass::Compute, saDesc);
+
+	RenderGraphModule module;
+	builder.CompileModule("AtmospherePrecompute",
+		{ { "AtmosphereParams", ModulePortKind::Inout } }, &module, errors);
+	return module;
+}
+
+// ---- 模块定义：鱼群更新 ----
+RenderGraphModule BuildFishUpdateModuleDefinition(std::vector<std::string>* errors) {
+	RenderGraphBuilder builder;
+
+	BufferDesc boidsDesc;
+	boidsDesc.size = sizeof(BoidsParams);
+	boidsDesc.usage = rhi::BufferUsage::Uniform;
+	boidsDesc.hostVisible = true;
+	builder.DeclareBufferResource("BoidsParams", boidsDesc);
+
+	BufferDesc fishDesc;
+	fishDesc.size = kFishDataBytes;
+	fishDesc.usage = rhi::BufferUsage::Storage;
+	fishDesc.hostVisible = true;
+	fishDesc.crossFrame = true;
+	builder.DeclareBufferResource("fishes", fishDesc);
+
+	BufferDesc outVelDesc;
+	outVelDesc.size = kOutVelBytes;
+	outVelDesc.usage = rhi::BufferUsage::Storage;
+	outVelDesc.hostVisible = false;
+	outVelDesc.crossFrame = true;
+	builder.DeclareBufferResource("outvel", outVelDesc);
+
+	ComputePassDesc evalDesc;
+	evalDesc.shaderRef = "boids_eval.comp";
+	evalDesc.groupCountX = (kFishCount + kWorkGroupSize - 1) / kWorkGroupSize;
+	evalDesc.shaderBindings = {
+		ShaderBinding::Uniform("BoidsParams"),
+		ShaderBinding::StorageRead("fishes"),
+		ShaderBinding::StorageWrite("outvel") };
+	builder.DeclarePass("BoidsEval", { "BoidsParams", "fishes" }, { "outvel" },
+		Pass::Compute, evalDesc);
+
+	ComputePassDesc updateDesc;
+	updateDesc.shaderRef = "boids_update.comp";
+	updateDesc.groupCountX = (kFishCount + kWorkGroupSize - 1) / kWorkGroupSize;
+	updateDesc.shaderBindings = {
+		ShaderBinding::Uniform("BoidsParams"),
+		ShaderBinding::StorageReadWrite("fishes"),
+		ShaderBinding::StorageRead("outvel") };
+	builder.DeclarePass("BoidsUpdate", { "BoidsParams", "fishes", "outvel" }, { "fishes" },
+		Pass::Compute, updateDesc);
+
+	// in-place pass 的顺序必须显式声明
+	builder.DeclareTopology(RenderGraphBuilder::Topology::Sequence({ "BoidsEval", "BoidsUpdate" }));
+
+	RenderGraphModule module;
+	builder.CompileModule("FishUpdate",
+		{ { "fishes", ModulePortKind::Inout }, { "BoidsParams", ModulePortKind::Input } },
+		&module, errors);
+	return module;
+}
+
+bool EmitModules(const ShaderLibrary& shaders) {
+	std::error_code ec;
+	std::filesystem::create_directories(kModuleDir, ec);
+
+	std::vector<std::string> errors;
+	RenderGraphModule atmosphere = BuildAtmosphereModuleDefinition(&errors);
+	RenderGraphModule fish = BuildFishUpdateModuleDefinition(&errors);
+	if (atmosphere.Name().empty() || fish.Name().empty()) {
+		for (const auto& error : errors)
+			cerr << "[Module] " << error << "\n";
+		return false;
+	}
+
+	// 只产出 .pak：模块文档在内存中生成并直接嵌入包内，不再写 sidecar JSON
+	AssetCatalog emptyCatalog(shaders.Resolver());
+	ModulePackResult result;
+	std::string error;
+	if (!BuildModulePackFile(RenderGraphModuleDocument::Capture(atmosphere), shaders,
+			emptyCatalog, kModuleDir + "/atmosphere.pak", &result, &error)
+		|| !BuildModulePackFile(RenderGraphModuleDocument::Capture(fish), shaders,
+			emptyCatalog, kModuleDir + "/fish_update.pak", &result, &error)) {
+		cerr << "模块打包失败: " << error << "\n";
+		return false;
+	}
+
+	cout << "Modules emitted: " << kModuleDir << "\n";
+	return true;
+}
+
+std::optional<RenderGraphModuleDocument> LoadModuleDocument(const std::string& packPath,
+	const std::string& packEntry, const std::string& fallbackPath, std::string* error) {
+	const auto pack = AssetPack::LoadFile(packPath, error);
+	if (pack) {
+		ContentResolver packed;
+		packed.SetPack(&*pack);
+		if (auto document = RenderGraphModuleDocument::Load(packed, "pack:" + packEntry, error))
+			return document;
+	}
+	if (error) error->clear();
+	return RenderGraphModuleDocument::Load(fallbackPath, error);
+}
+
 bool PrecomputeAtmosphere(rhi::Device& device, const AtmosphereParams& params,
 	std::unique_ptr<rhi::Image>& t2a, std::unique_ptr<rhi::Image>& ms,
 	std::unique_ptr<rhi::Image>& sa, std::unique_ptr<rhi::Buffer>& atmoUBO,
-	const ShaderLibrary& shaders)
+	const ShaderLibrary& shaders, const RenderGraphModuleDocument& atmosphereDoc)
 {
 	t2a = CreateLut(device, kLutSize, rhi::ImageFormat::RGBA16F);
 	ms = CreateLut(device, kLutSize, rhi::ImageFormat::RGBA16F);
@@ -122,57 +285,63 @@ bool PrecomputeAtmosphere(rhi::Device& device, const AtmosphereParams& params,
 		return false;
 	}
 
+	RenderGraphModule atmosphereModule;
+	{
+		RenderGraphModuleDocument::FixedBindings bindings;
+		bindings.image = [&](const std::string& name) -> const rhi::Image* {
+			if (name == "TransmittanceLUT") return t2a.get();
+			if (name == "MultipleScatteringLUT") return ms.get();
+			if (name == "SkyAmbientLUT") return sa.get();
+			return nullptr;
+		};
+		std::vector<std::string> restoreErrors;
+		if (!atmosphereDoc.Restore(atmosphereModule, &bindings, &restoreErrors)) {
+			cerr << "大气模块恢复失败";
+			if (!restoreErrors.empty()) cerr << ": " << restoreErrors.front();
+			cerr << "\n";
+			return false;
+		}
+	}
+
 	RenderGraph graph(&device, &shaders);
 
-	graph.RegisterPass("HostParams", {}, { "AtmosphereParams" }, Pass::Host, HostPassDesc{});
-	graph.RegisterResource("AtmosphereParams", { "Transmittance", "MultipleScattering", "SkyAmbient" },
-		"HostParams", atmoUBO.get());
+	RenderGraphBuilder builder;
+	builder.DeclareBufferResource("AtmosphereParams", atmoUBO.get());
 
-	ComputePassDesc transmittanceDesc;
-	transmittanceDesc.shaderRef = "transmittance.comp";
-	transmittanceDesc.groupCountX = kLutSize / 4;
-	transmittanceDesc.groupCountY = kLutSize / 8;
-	transmittanceDesc.shaderBindings = {
-		ShaderBinding::Uniform("AtmosphereParams"),
-		ShaderBinding::StorageWrite("TransmittanceLUT") };
-	graph.RegisterPass("Transmittance", { "AtmosphereParams" }, { "TransmittanceLUT" },
-		Pass::Compute, transmittanceDesc);
-	graph.RegisterResource("TransmittanceLUT", { "MultipleScattering", "SkyAmbient" },
-		"Transmittance", t2a.get(), {}, rhi::ImageLayout::Undefined);
+	ImageOptions lutOptions;
+	lutOptions.initialLayout = rhi::ImageLayout::Undefined;
+	builder.DeclareImageResource("TransmittanceLUT", t2a.get(), lutOptions);
+	builder.DeclareImageResource("MultipleScatteringLUT", ms.get(), lutOptions);
+	builder.DeclareImageResource("SkyAmbientLUT", sa.get(), lutOptions);
 
-	ComputePassDesc msDesc;
-	msDesc.shaderRef = "multiple_scattering.comp";
-	msDesc.groupCountX = kLutSize / 4;
-	msDesc.groupCountY = kLutSize / 8;
-	msDesc.shaderBindings = {
-		ShaderBinding::Uniform("AtmosphereParams"),
-		ShaderBinding::Sampled("TransmittanceLUT", rhi::SamplerDesc::Linear()),
-		ShaderBinding::StorageWrite("MultipleScatteringLUT") };
-	graph.RegisterPass("MultipleScattering", { "AtmosphereParams", "TransmittanceLUT" },
-		{ "MultipleScatteringLUT" }, Pass::Compute, msDesc);
+	std::vector<std::string> moduleErrors;
+	const auto instance = builder.Instantiate(atmosphereModule, "Atmosphere",
+		{ { "AtmosphereParams", "AtmosphereParams" } }, &moduleErrors);
+	if (!instance) {
+		for (const auto& error : moduleErrors)
+			cerr << "[Atmosphere] " << error << "\n";
+		return false;
+	}
 
-	ComputePassDesc saDesc;
-	saDesc.shaderRef = "sky_ambient.comp";
-	saDesc.groupCountX = kSkyAmbientSize / 4;
-	saDesc.groupCountY = kSkyAmbientSize / 8;
-	saDesc.shaderBindings = {
-		ShaderBinding::Uniform("AtmosphereParams"),
-		ShaderBinding::Sampled("TransmittanceLUT", rhi::SamplerDesc::Linear()),
-		ShaderBinding::Sampled("MultipleScatteringLUT", rhi::SamplerDesc::Linear()),
-		ShaderBinding::StorageWrite("SkyAmbientLUT") };
-	graph.RegisterPass("SkyAmbient", { "AtmosphereParams", "TransmittanceLUT", "MultipleScatteringLUT" },
-		{ "SkyAmbientLUT" }, Pass::Compute, saDesc);
-
-	graph.RegisterResource("MultipleScatteringLUT", { "SkyAmbient" }, "MultipleScattering", ms.get(), {},
-		rhi::ImageLayout::Undefined);
-	graph.RegisterResource("SkyAmbientLUT", {}, "SkyAmbient", sa.get(), {},
-		rhi::ImageLayout::Undefined);
-
+	LowerResult lower = builder.Lower();
+	if (!lower.ok) {
+		for (const auto& diagnostic : lower.diagnostics)
+			cerr << "RenderGraphBuilder: " << diagnostic.message << "\n";
+		return false;
+	}
+	builder.Build(graph);
 	graph.ProcessRegister();
 	graph.GenerateSubmitSequence();
 	graph.RealizeAll();
 
-	HostPass* hostParams = static_cast<HostPass*>(graph.FindPass("HostParams"));
+	HostPass* hostParams = nullptr;
+	for (const auto& name : instance->Entries) {
+		Pass* pass = graph.FindPass(name);
+		if (pass != nullptr && pass->get_type() == Pass::Host) {
+			hostParams = static_cast<HostPass*>(pass);
+			break;
+		}
+	}
 	if (hostParams == nullptr) {
 		cerr << "HostParams 节点缺失\n";
 		return false;
@@ -213,115 +382,92 @@ bool PrecomputeAtmosphere(rhi::Device& device, const AtmosphereParams& params,
 bool BuildFrameGraph(RenderGraph& graph, const rhi::Buffer* vb, const rhi::Buffer* ib,
 	uint32_t indexCount, const rhi::Buffer* atmoUBO, const rhi::Image* t2a,
 	const rhi::Image* ms, const rhi::Image* sa, const rhi::Image* backbuffer,
-	bool smoke)
+	bool smoke, const RenderGraphModule& fishModule)
 {
 	(void)indexCount;
+
+	RenderGraphBuilder builder;
 
 	BufferDesc frameUBO;
 	frameUBO.size = sizeof(FrameUniforms);
 	frameUBO.usage = rhi::BufferUsage::Uniform;
 	frameUBO.hostVisible = true;
-	graph.RegisterResource("FrameUniforms", { "Scene", "Back" }, "UpdateFrame",
-		Resource::Buffer, frameUBO);
+	builder.DeclareBufferResource("FrameUniforms", frameUBO);
 
 	BufferDesc shadowUBO;
 	shadowUBO.size = sizeof(ShadowUniforms);
 	shadowUBO.usage = rhi::BufferUsage::Uniform;
 	shadowUBO.hostVisible = true;
-	graph.RegisterResource("ShadowUniforms", { "Shadow" }, "UpdateFrame",
-		Resource::Buffer, shadowUBO);
+	builder.DeclareBufferResource("ShadowUniforms", shadowUBO);
 
 	BufferDesc boidsUBO;
 	boidsUBO.size = sizeof(BoidsParams);
 	boidsUBO.usage = rhi::BufferUsage::Uniform;
 	boidsUBO.hostVisible = true;
-	graph.RegisterResource("BoidsParams", { "BoidsEval", "BoidsUpdate", "Shadow", "Scene" },
-		"UpdateFrame", Resource::Buffer, boidsUBO);
+	builder.DeclareBufferResource("BoidsParams", boidsUBO);
 
-	graph.RegisterResource("AtmosphereParams", { "Scene", "Back" }, "", atmoUBO);
+	builder.DeclareBufferResource("AtmosphereParams", atmoUBO);
 
 	BufferDesc fishDataDesc;
 	fishDataDesc.size = kFishDataBytes;
 	fishDataDesc.usage = rhi::BufferUsage::Storage;
 	fishDataDesc.hostVisible = true;
 	fishDataDesc.crossFrame = true;
-	// BoidsEval 通过 outvel 建立 Eval -> Update 的依赖；fishes 的写者只声明最终生产者，
-	// 避免 BoidsUpdate -> BoidsEval 的反向边造成环。
-	graph.RegisterResource("fishes", { "Shadow", "Scene" },
-		"BoidsUpdate", Resource::Buffer, fishDataDesc);
+	builder.DeclareBufferResource("fishes", fishDataDesc);
 
-	BufferDesc outVelDesc;
-	outVelDesc.size = kOutVelBytes;
-	outVelDesc.usage = rhi::BufferUsage::Storage;
-	outVelDesc.hostVisible = false;
-	outVelDesc.crossFrame = true;
-	graph.RegisterResource("outvel", { "BoidsUpdate" }, "BoidsEval", Resource::Buffer, outVelDesc);
+	// 必须先声明参数写者，模块内的 BoidsEval/BoidsUpdate 才能读到本帧版本
+	builder.DeclarePass("UpdateFrame", {}, { "FrameUniforms", "ShadowUniforms", "BoidsParams" },
+		Pass::Host, HostPassDesc{});
 
-	graph.RegisterResource("FishVB", { "Shadow", "Scene" }, "", vb);
-	graph.RegisterResource("FishIB", { "Shadow", "Scene" }, "", ib);
+	std::vector<std::string> moduleErrors;
+	const auto fishInstance = builder.Instantiate(fishModule, "FishUpdate",
+		{ { "fishes", "fishes" }, { "BoidsParams", "BoidsParams" } }, &moduleErrors);
+	if (!fishInstance) {
+		for (const auto& error : moduleErrors)
+			cerr << "[FishUpdate] " << error << "\n";
+		return false;
+	}
 
-	ImageDesc shadowDesc;
-	shadowDesc.width = kShadowSize;
-	shadowDesc.height = kShadowSize;
-	shadowDesc.format = ImageFormat::D32F;
-	graph.RegisterResource("shadowMap", { "Scene" }, "Shadow", Resource::Image, shadowDesc);
+	builder.DeclareBufferResource("FishVB", vb);
+	builder.DeclareBufferResource("FishIB", ib);
+
+	ImageDesc shadowMapDesc;
+	shadowMapDesc.width = kShadowSize;
+	shadowMapDesc.height = kShadowSize;
+	shadowMapDesc.format = ImageFormat::D32F;
+	builder.DeclareImageResource("shadowMap", shadowMapDesc);
 
 	ImageDesc canvasDesc;
 	canvasDesc.width = kWidth;
 	canvasDesc.height = kHeight;
 	canvasDesc.format = ImageFormat::RGBA8;
-	graph.RegisterResource("canvas", { "Back" }, "Scene", Resource::Image, canvasDesc);
+	builder.DeclareImageResource("canvas", canvasDesc);
 
 	ImageDesc depthDesc;
 	depthDesc.width = kWidth;
 	depthDesc.height = kHeight;
 	depthDesc.format = ImageFormat::D32F;
-	graph.RegisterResource("depth", { "Back" }, "Scene", Resource::Image, depthDesc);
+	builder.DeclareImageResource("depth", depthDesc);
 
-	graph.RegisterResource("TransmittanceLUT", { "Back" }, "", t2a, {},
-		rhi::ImageLayout::ShaderReadOnly, rhi::ImageFormat::None,
-		rhi::ImageSubresourceRange{}, true);
-	graph.RegisterResource("MultipleScatteringLUT", { "Back" }, "", ms, {},
-		rhi::ImageLayout::ShaderReadOnly, rhi::ImageFormat::None,
-		rhi::ImageSubresourceRange{}, true);
-	graph.RegisterResource("SkyAmbientLUT", { "Back" }, "", sa, {},
-		rhi::ImageLayout::ShaderReadOnly, rhi::ImageFormat::None,
-		rhi::ImageSubresourceRange{}, true);
+	ImageOptions lutOptions;
+	lutOptions.initialLayout = rhi::ImageLayout::ShaderReadOnly;
+	lutOptions.crossFrame = true;
+	builder.DeclareImageResource("TransmittanceLUT", t2a, lutOptions);
+	builder.DeclareImageResource("MultipleScatteringLUT", ms, lutOptions);
+	builder.DeclareImageResource("SkyAmbientLUT", sa, lutOptions);
 
 	if (smoke) {
 		ImageDesc outputDesc;
 		outputDesc.width = kWidth;
 		outputDesc.height = kHeight;
 		outputDesc.format = ImageFormat::RGBA8;
-		graph.RegisterResource("Backbuffer", { "Capture" }, "Back", Resource::Image, outputDesc);
+		builder.DeclareImageResource("Backbuffer", outputDesc);
 	}
 	else {
-		graph.RegisterResource("Backbuffer", { "Present" }, "Back", backbuffer, {},
-			rhi::ImageLayout::Undefined);
+		ImageOptions backOptions;
+		backOptions.initialLayout = rhi::ImageLayout::Undefined;
+		builder.DeclareImageResource("Backbuffer", backbuffer, backOptions);
 	}
-
-	graph.RegisterPass("UpdateFrame", {}, { "FrameUniforms", "ShadowUniforms", "BoidsParams" },
-		Pass::Host, HostPassDesc{});
-
-	ComputePassDesc evalDesc;
-	evalDesc.shaderRef = "boids_eval.comp";
-	evalDesc.groupCountX = (kFishCount + kWorkGroupSize - 1) / kWorkGroupSize;
-	evalDesc.shaderBindings = {
-		ShaderBinding::Uniform("BoidsParams"),
-		ShaderBinding::StorageRead("fishes"),
-		ShaderBinding::StorageWrite("outvel") };
-	graph.RegisterPass("BoidsEval", { "BoidsParams", "fishes" }, { "outvel" },
-		Pass::Compute, evalDesc);
-
-	ComputePassDesc updateDesc;
-	updateDesc.shaderRef = "boids_update.comp";
-	updateDesc.groupCountX = (kFishCount + kWorkGroupSize - 1) / kWorkGroupSize;
-	updateDesc.shaderBindings = {
-		ShaderBinding::Uniform("BoidsParams"),
-		ShaderBinding::StorageWrite("fishes"),
-		ShaderBinding::StorageRead("outvel") };
-	graph.RegisterPass("BoidsUpdate", { "BoidsParams", "fishes", "outvel" }, { "fishes" },
-		Pass::Compute, updateDesc);
 
 	RenderPassDesc shadowDesc0;
 	{
@@ -354,7 +500,7 @@ bool BuildFrameGraph(RenderGraph& graph, const rhi::Buffer* vb, const rhi::Buffe
 		shadowDesc0.vertexStreams.push_back(VertexStreamBinding{ "FishVB", {}, 0 });
 		shadowDesc0.indexStream = IndexStreamBinding{ "FishIB", {}, 0, IndexType::UInt32 };
 	}
-	graph.RegisterPass("Shadow", { "ShadowUniforms", "BoidsParams", "fishes", "FishVB", "FishIB" },
+	builder.DeclarePass("Shadow", { "ShadowUniforms", "BoidsParams", "fishes", "FishVB", "FishIB" },
 		{ "shadowMap" }, Pass::Render, shadowDesc0);
 
 	RenderPassDesc sceneDesc;
@@ -390,7 +536,7 @@ bool BuildFrameGraph(RenderGraph& graph, const rhi::Buffer* vb, const rhi::Buffe
 		sceneDesc.vertexStreams.push_back(VertexStreamBinding{ "FishVB", {}, 0 });
 		sceneDesc.indexStream = IndexStreamBinding{ "FishIB", {}, 0, IndexType::UInt32 };
 	}
-	graph.RegisterPass("Scene",
+	builder.DeclarePass("Scene",
 		{ "FrameUniforms", "BoidsParams", "fishes", "AtmosphereParams", "shadowMap", "FishVB", "FishIB" },
 		{ "canvas", "depth" }, Pass::Render, sceneDesc);
 
@@ -416,16 +562,23 @@ bool BuildFrameGraph(RenderGraph& graph, const rhi::Buffer* vb, const rhi::Buffe
 			ShaderBinding::Sampled("canvas", rhi::SamplerDesc::Nearest()),
 			ShaderBinding::Sampled("depth", rhi::SamplerDesc::Nearest()) };
 	}
-	graph.RegisterPass("Back",
+	builder.DeclarePass("Back",
 		{ "FrameUniforms", "AtmosphereParams", "TransmittanceLUT", "MultipleScatteringLUT",
 		  "SkyAmbientLUT", "canvas", "depth" },
 		{ "Backbuffer" }, Pass::Render, backDesc);
 
 	if (smoke)
-		graph.RegisterPass("Capture", { "Backbuffer" }, {}, Pass::Host, HostPassDesc{});
+		builder.DeclarePass("Capture", { "Backbuffer" }, {}, Pass::Host, HostPassDesc{});
 	else
-		graph.RegisterPass("Present", { "Backbuffer" }, {}, Pass::Present, PresentPassDesc{});
+		builder.DeclarePass("Present", { "Backbuffer" }, {}, Pass::Present, PresentPassDesc{});
 
+	LowerResult lower = builder.Lower();
+	if (!lower.ok) {
+		for (const auto& diagnostic : lower.diagnostics)
+			cerr << "RenderGraphBuilder: " << diagnostic.message << "\n";
+		return false;
+	}
+	builder.Build(graph);
 	graph.ProcessRegister();
 	graph.GenerateSubmitSequence();
 	graph.RealizeAll();
@@ -503,10 +656,28 @@ int main(int argc, char** argv) {
 				}
 			}
 		}
+		else if (std::strcmp(argv[i], "--emit-modules") == 0) {
+			options.emitModules = true;
+		}
 		else if (std::strcmp(argv[i], "--boids-min-speed") == 0 && i + 1 < argc) {
 			options.boidsMinSpeed = static_cast<float>(std::atof(argv[i + 1]));
 			++i;
 		}
+	}
+
+	if (options.emitModules) {
+		ContentResolver emitAssets;
+		emitAssets.Mount("shaders", kShaderDir);
+		emitAssets.Mount("assets", kAssetDir);
+		ShaderLibrary emitShaders(emitAssets);
+		std::vector<std::string> warnings;
+		if (!emitShaders.LoadManifest("shaders/shaders.manifest.json", &warnings)) {
+			for (const auto& warning : warnings)
+				cerr << "[ShaderLibrary] " << warning << "\n";
+			cerr << "着色器清单加载失败\n";
+			return 1;
+		}
+		return EmitModules(emitShaders) ? 0 : 1;
 	}
 
 	GLFWwindow* window = nullptr;
@@ -553,7 +724,7 @@ int main(int argc, char** argv) {
 	cout << "Tessellation=" << (device->SupportsTessellation() ? "yes" : "no")
 	     << " Geometry=" << (device->SupportsGeometryShaders() ? "yes" : "no") << "\n";
 
-	AssetResolver assets;
+	ContentResolver assets;
 	assets.Mount("shaders", kShaderDir);
 	assets.Mount("assets", kAssetDir);
 	ShaderLibrary shaders(assets);
@@ -567,6 +738,26 @@ int main(int argc, char** argv) {
 			if (glfwInitialized) glfwTerminate();
 			return 1;
 		}
+	}
+
+	std::string moduleError;
+	const auto atmosphereDoc = LoadModuleDocument(kModuleDir + "/atmosphere.pak",
+		"modules/AtmospherePrecompute.json",
+		kModuleDir + "/AtmospherePrecompute.module.json", &moduleError);
+	if (!atmosphereDoc) {
+		cerr << "大气模块加载失败: " << moduleError << "\n";
+		if (window) glfwDestroyWindow(window);
+		if (glfwInitialized) glfwTerminate();
+		return 1;
+	}
+	const auto fishDoc = LoadModuleDocument(kModuleDir + "/fish_update.pak",
+		"modules/FishUpdate.json",
+		kModuleDir + "/FishUpdate.module.json", &moduleError);
+	if (!fishDoc) {
+		cerr << "鱼群模块加载失败: " << moduleError << "\n";
+		if (window) glfwDestroyWindow(window);
+		if (glfwInitialized) glfwTerminate();
+		return 1;
 	}
 
 	FishMesh mesh;
@@ -611,8 +802,20 @@ int main(int argc, char** argv) {
 	unique_ptr<rhi::Image> ms;
 	unique_ptr<rhi::Image> sa;
 	unique_ptr<rhi::Buffer> atmoUBO;
-	if (!PrecomputeAtmosphere(*device, atmosphereParams, t2a, ms, sa, atmoUBO, shaders)) {
+	if (!PrecomputeAtmosphere(*device, atmosphereParams, t2a, ms, sa, atmoUBO, shaders,
+			*atmosphereDoc)) {
 		return 1;
+	}
+
+	RenderGraphModule fishModule;
+	{
+		std::vector<std::string> restoreErrors;
+		if (!fishDoc->Restore(fishModule, nullptr, &restoreErrors)) {
+			cerr << "鱼群模块恢复失败";
+			if (!restoreErrors.empty()) cerr << ": " << restoreErrors.front();
+			cerr << "\n";
+			return 1;
+		}
 	}
 
 	using Clock = std::chrono::steady_clock;
@@ -685,7 +888,7 @@ int main(int argc, char** argv) {
 			const rhi::Image* backbuffer = currentFrame.has_value() ? currentFrame->backbuffer : nullptr;
 			if (!BuildFrameGraph(*graph, vertexBuffer.get(), indexBuffer.get(),
 				static_cast<uint32_t>(mesh.indices.size()), atmoUBO.get(),
-				t2a.get(), ms.get(), sa.get(), backbuffer, options.smoke)) {
+				t2a.get(), ms.get(), sa.get(), backbuffer, options.smoke, fishModule)) {
 				return 1;
 			}
 

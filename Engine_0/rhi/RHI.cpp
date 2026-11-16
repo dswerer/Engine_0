@@ -131,9 +131,13 @@ namespace {
 	VkFormat ToVkFormat(ImageFormat format) {
 		switch (format) {
 			case ImageFormat::R8:         return VK_FORMAT_R8_UNORM;
+			case ImageFormat::R8Srgb:     return VK_FORMAT_R8_SRGB;
 			case ImageFormat::RG8:        return VK_FORMAT_R8G8_UNORM;
+			case ImageFormat::RG8Srgb:    return VK_FORMAT_R8G8_SRGB;
 			case ImageFormat::RGBA8:      return VK_FORMAT_R8G8B8A8_UNORM;
+			case ImageFormat::RGBA8Srgb:  return VK_FORMAT_R8G8B8A8_SRGB;
 			case ImageFormat::BGRA8:      return VK_FORMAT_B8G8R8A8_UNORM;
+			case ImageFormat::BGRA8Srgb:  return VK_FORMAT_B8G8R8A8_SRGB;
 			case ImageFormat::R16F:       return VK_FORMAT_R16_SFLOAT;
 			case ImageFormat::RG16F:      return VK_FORMAT_R16G16_SFLOAT;
 			case ImageFormat::RGBA16F:    return VK_FORMAT_R16G16B16A16_SFLOAT;
@@ -152,11 +156,13 @@ namespace {
 	ImageFormat FromVkFormat(VkFormat format) {
 		switch (format) {
 			case VK_FORMAT_R8_UNORM:                 return ImageFormat::R8;
+			case VK_FORMAT_R8_SRGB:                  return ImageFormat::R8Srgb;
 			case VK_FORMAT_R8G8_UNORM:               return ImageFormat::RG8;
-			case VK_FORMAT_R8G8B8A8_UNORM:
-			case VK_FORMAT_R8G8B8A8_SRGB:            return ImageFormat::RGBA8;
-			case VK_FORMAT_B8G8R8A8_UNORM:
-			case VK_FORMAT_B8G8R8A8_SRGB:            return ImageFormat::BGRA8;
+			case VK_FORMAT_R8G8_SRGB:                return ImageFormat::RG8Srgb;
+			case VK_FORMAT_R8G8B8A8_UNORM:           return ImageFormat::RGBA8;
+			case VK_FORMAT_R8G8B8A8_SRGB:            return ImageFormat::RGBA8Srgb;
+			case VK_FORMAT_B8G8R8A8_UNORM:           return ImageFormat::BGRA8;
+			case VK_FORMAT_B8G8R8A8_SRGB:            return ImageFormat::BGRA8Srgb;
 			case VK_FORMAT_R16_SFLOAT:               return ImageFormat::R16F;
 			case VK_FORMAT_R16G16_SFLOAT:             return ImageFormat::RG16F;
 			case VK_FORMAT_R16G16B16A16_SFLOAT:      return ImageFormat::RGBA16F;
@@ -447,6 +453,17 @@ namespace {
 		std::vector<uint32_t> code(static_cast<size_t>(size) / 4);
 		if (!file.read(reinterpret_cast<char*>(code.data()), size)) return {};
 		return code;
+	}
+
+	// 内存 SPIR-V 优先；为空时回退磁盘路径
+	std::vector<uint32_t> LoadStageCode(const ShaderStageDesc& desc) {
+		if (!desc.spirv.empty())
+			return desc.spirv;
+		return ReadSpirv(desc.spirvPath);
+	}
+
+	std::string StageLabel(const ShaderStageDesc& desc) {
+		return desc.spirvPath.empty() ? std::string("<memory>") : desc.spirvPath;
 	}
 
 	VkShaderStageFlagBits ToVkStage(ShaderStage stage) {
@@ -884,9 +901,17 @@ std::unique_ptr<Device> Device::Create(const DeviceDesc& desc)
 	supportedFeatures.pNext = &supported12;
 	vkGetPhysicalDeviceFeatures2(device->m_physicalDevice, &supportedFeatures);
 	device->m_timelineSupported = supported12.timelineSemaphore == VK_TRUE;
+	device->m_sampledArrayDynamicIndexing =
+		supportedFeatures.features.shaderSampledImageArrayDynamicIndexing == VK_TRUE;
 	device->m_bindlessSupported = supported12.descriptorIndexing == VK_TRUE
 		&& supported12.descriptorBindingPartiallyBound == VK_TRUE
-		&& supportedFeatures.features.shaderSampledImageArrayDynamicIndexing == VK_TRUE;
+		&& device->m_sampledArrayDynamicIndexing;
+	device->m_staticHeapTier = device->m_bindlessSupported
+		? StaticHeapTier::DescriptorIndexing : StaticHeapTier::FixedArray;
+	if (desc.forceFixedArrayHeap) {
+		device->m_staticHeapTier = StaticHeapTier::FixedArray;
+		device->m_bindlessSupported = false;
+	}
 	device->m_depthBoundsSupported = supportedFeatures.features.depthBounds == VK_TRUE;
 	device->m_independentBlendSupported = supportedFeatures.features.independentBlend == VK_TRUE;
 	device->m_tessellationSupported = supportedFeatures.features.tessellationShader == VK_TRUE;
@@ -922,7 +947,8 @@ std::unique_ptr<Device> Device::Create(const DeviceDesc& desc)
 	features2.features.geometryShader = device->m_geometrySupported ? VK_TRUE : VK_FALSE;
 	features2.features.vertexPipelineStoresAndAtomics =
 		device->m_vertexPipelineStoresAndAtomics ? VK_TRUE : VK_FALSE;
-	if (device->m_bindlessSupported)
+	// 固定数组回退也允许 shader 使用动态索引（能力存在即启用）
+	if (device->m_sampledArrayDynamicIndexing)
 		features2.features.shaderSampledImageArrayDynamicIndexing = VK_TRUE;
 
 	VkDeviceCreateInfo deviceCI{};
@@ -2182,9 +2208,9 @@ std::unique_ptr<Pipeline> Device::CreatePipeline(const GraphicsPipelineDesc& des
 
 	std::vector<std::vector<uint32_t>> codes(desc.shaders.size());
 	for (size_t i = 0; i < desc.shaders.size(); ++i) {
-		codes[i] = ReadSpirv(desc.shaders[i].spirvPath);
+		codes[i] = LoadStageCode(desc.shaders[i]);
 		if (codes[i].empty()) {
-			std::cerr << "[RHI] 读取 SPIR-V 失败: " << desc.shaders[i].spirvPath << "\n";
+			std::cerr << "[RHI] 读取 SPIR-V 失败: " << StageLabel(desc.shaders[i]) << "\n";
 			return nullptr;
 		}
 	}
@@ -2439,9 +2465,9 @@ std::unique_ptr<Pipeline> Device::CreateComputePipeline(const ComputePipelineDes
 		return nullptr;
 	}
 
-	const std::vector<uint32_t> code = ReadSpirv(desc.shader.spirvPath);
+	const std::vector<uint32_t> code = LoadStageCode(desc.shader);
 	if (code.empty()) {
-		std::cerr << "[RHI] 读取 SPIR-V 失败: " << desc.shader.spirvPath << "\n";
+		std::cerr << "[RHI] 读取 SPIR-V 失败: " << StageLabel(desc.shader) << "\n";
 		return nullptr;
 	}
 
@@ -2911,8 +2937,10 @@ static uint32_t TexelBytes(VkFormat format)
 {
 	switch (format) {
 	case VK_FORMAT_R8_UNORM:
+	case VK_FORMAT_R8_SRGB:
 	case VK_FORMAT_S8_UINT:                              return 1;
 	case VK_FORMAT_R8G8_UNORM:
+	case VK_FORMAT_R8G8_SRGB:
 	case VK_FORMAT_R16_SFLOAT:                           return 2;
 	case VK_FORMAT_R8G8B8A8_UNORM:
 	case VK_FORMAT_R8G8B8A8_SRGB:

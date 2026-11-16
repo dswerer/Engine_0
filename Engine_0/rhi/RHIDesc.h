@@ -16,12 +16,43 @@ namespace dEngine::rhi {
 	// 精简实用集，每个值均可映射到后端 format
 	enum class ImageFormat {
 		None,
-		R8, RG8, RGBA8, BGRA8,
+		R8, R8Srgb,
+		RG8, RG8Srgb,
+		RGBA8, RGBA8Srgb,
+		BGRA8, BGRA8Srgb,
 		R16F, RG16F, RGBA16F,
 		R32F, RG32F, RGBA32F,
 		R11G11B10F,
 		D32F, D24S8, S8
 	};
+
+	// sRGB 变体只存在于 8 位 UNORM；浮点/深度格式没有对应变体
+	inline bool IsSrgbFormat(ImageFormat format) {
+		return format == ImageFormat::R8Srgb || format == ImageFormat::RG8Srgb
+			|| format == ImageFormat::RGBA8Srgb || format == ImageFormat::BGRA8Srgb;
+	}
+
+	// 已是 sRGB 时原样返回；无 sRGB 变体返回 None
+	inline ImageFormat ToSrgbFormat(ImageFormat format) {
+		switch (format) {
+		case ImageFormat::R8:       return ImageFormat::R8Srgb;
+		case ImageFormat::RG8:      return ImageFormat::RG8Srgb;
+		case ImageFormat::RGBA8:    return ImageFormat::RGBA8Srgb;
+		case ImageFormat::BGRA8:    return ImageFormat::BGRA8Srgb;
+		case ImageFormat::R8Srgb:   return ImageFormat::R8Srgb;
+		case ImageFormat::RG8Srgb:  return ImageFormat::RG8Srgb;
+		case ImageFormat::RGBA8Srgb: return ImageFormat::RGBA8Srgb;
+		case ImageFormat::BGRA8Srgb: return ImageFormat::BGRA8Srgb;
+		default:                    return ImageFormat::None;
+		}
+	}
+
+	// 清单里的 srgb 修饰符：显式 sRGB 格式优先；无变体时 srgb = true 返回 None
+	inline ImageFormat ResolveSrgbFormat(ImageFormat format, bool srgb) {
+		if (IsSrgbFormat(format))
+			return format;
+		return srgb ? ToSrgbFormat(format) : format;
+	}
 
 	enum class ImageViewType {
 		None, Dim1D, Dim2D, Dim3D, Dim1DArray, Dim2DArray, Cube, CubeArray
@@ -181,6 +212,13 @@ namespace dEngine::rhi {
 	}
 
 	inline constexpr uint32_t kMaxColorAttachments = 8;
+
+	// 静态纹理堆能力分级（set 0 / binding 0 的 sampler2D 数组）
+	enum class StaticHeapTier {
+		None,               // 采样器数组不可用
+		FixedArray,         // 固定长度数组，全部槽位绑定（常量索引即可用）
+		DescriptorIndexing  // 稀疏绑定 + 动态索引（bindless）
+	};
 
 #pragma endregion
 
@@ -368,10 +406,11 @@ namespace dEngine::rhi {
 	// 可编程着色器阶段；Tess/Geometry 已支持，Task/Mesh 仍为预留。
 	enum class ShaderStage { Vertex, Fragment, TessControl, TessEval, Geometry, Task, Mesh, Compute };
 
-	// 单个着色器阶段：SPIR-V 二进制路径（离线编译产出，如 glslc），RHI 直接读取
+	// 单个着色器阶段：磁盘路径或内存 SPIR-V（离线编译产出，如 glslc）
 	struct ShaderStageDesc {
 		ShaderStage stage;
-		std::string spirvPath;
+		std::string spirvPath;          // 文件源：RHI 按路径读取
+		std::vector<uint32_t> spirv;    // 内存源：非空时优先于 spirvPath
 		// 入口点名；默认 "main"（glslc 默认产出）
 		std::string entryPoint = "main";
 	};

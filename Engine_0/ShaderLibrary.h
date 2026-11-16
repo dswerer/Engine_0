@@ -1,5 +1,5 @@
 #pragma once
-#include "AssetResolver.h"
+#include "ContentResolver.h"
 #include "rhi/RHIDesc.h"
 
 #include <map>
@@ -15,7 +15,7 @@ namespace dEngine {
 	struct ShaderEntry {
 		std::string                      name;        // 逻辑键："blur.comp"
 		std::optional<rhi::ShaderStage>  stage;       // 空则由逻辑路径扩展名推断
-		std::string                      logicalPath; // 相对 AssetResolver："shaders/blur.comp.spv"
+		std::string                      logicalPath; // 相对 ContentResolver："shaders/blur.comp.spv"
 		std::string                      entryPoint = "main";
 		std::vector<std::string>         defines;     // 仅记录用于对照构建参数，运行期不参与解析
 	};
@@ -27,7 +27,7 @@ namespace dEngine {
 
 	class ShaderLibrary {
 	public:
-		explicit ShaderLibrary(const AssetResolver& resolver) : m_resolver(&resolver) {}
+		explicit ShaderLibrary(const ContentResolver& resolver) : m_resolver(&resolver) {}
 
 		// 由构建期清单批量登记（格式见 docs 注释）；warnings 收非致命问题。
 		// 文件不可读、JSON 解析失败或有条目登记失败时返回 false。
@@ -36,7 +36,9 @@ namespace dEngine {
 		bool Register(ShaderEntry entry, std::string* error = nullptr);
 
 		bool Contains(std::string_view name) const;
+		const ShaderEntry* Find(std::string_view name) const;
 		std::vector<std::string> Names() const; // 按名字升序
+		const ContentResolver& Resolver() const { return *m_resolver; }
 
 		// 主出口：解析为 RHI 可消费的阶段描述（含绝对路径与入口点）。
 		// 失败返回 nullopt，error 给出原因
@@ -55,7 +57,7 @@ namespace dEngine {
 		static std::optional<rhi::ShaderStage> StageFromExtension(std::string_view logicalPath);
 
 	private:
-		const AssetResolver* m_resolver = nullptr;
+		const ContentResolver* m_resolver = nullptr;
 		std::map<std::string, ShaderEntry> m_entries; // 有序，便于诊断输出稳定
 	};
 }

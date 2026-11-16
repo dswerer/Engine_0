@@ -1,5 +1,7 @@
 #include "RenderGraphDocument.h"
 
+#include "ContentResolver.h"
+
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
@@ -320,8 +322,10 @@ namespace dEngine {
 
 		const std::pair<ImageFormat, const char*> kImageFormats[] = {
 			{ ImageFormat::None, "None" },
-			{ ImageFormat::R8, "R8" }, { ImageFormat::RG8, "RG8" },
-			{ ImageFormat::RGBA8, "RGBA8" }, { ImageFormat::BGRA8, "BGRA8" },
+			{ ImageFormat::R8, "R8" }, { ImageFormat::R8Srgb, "R8Srgb" },
+			{ ImageFormat::RG8, "RG8" }, { ImageFormat::RG8Srgb, "RG8Srgb" },
+			{ ImageFormat::RGBA8, "RGBA8" }, { ImageFormat::RGBA8Srgb, "RGBA8Srgb" },
+			{ ImageFormat::BGRA8, "BGRA8" }, { ImageFormat::BGRA8Srgb, "BGRA8Srgb" },
 			{ ImageFormat::R16F, "R16F" }, { ImageFormat::RG16F, "RG16F" }, { ImageFormat::RGBA16F, "RGBA16F" },
 			{ ImageFormat::R32F, "R32F" }, { ImageFormat::RG32F, "RG32F" }, { ImageFormat::RGBA32F, "RGBA32F" },
 			{ ImageFormat::R11G11B10F, "R11G11B10F" },
@@ -366,6 +370,12 @@ namespace dEngine {
 			{ rhi::QueueClass::Transfer, "Transfer" },
 		};
 
+		const std::pair<ModulePortKind, const char*> kModulePortKinds[] = {
+			{ ModulePortKind::Input, "Input" },
+			{ ModulePortKind::Output, "Output" },
+			{ ModulePortKind::Inout, "Inout" },
+		};
+
 		const std::pair<Usage, const char*> kUsages[] = {
 			{ Usage::Auto, "Auto" },
 			{ Usage::ColorAttachment, "ColorAttachment" },
@@ -373,6 +383,7 @@ namespace dEngine {
 			{ Usage::ResolveSrc, "ResolveSrc" }, { Usage::ResolveDst, "ResolveDst" },
 			{ Usage::SampledRead, "SampledRead" },
 			{ Usage::StorageRead, "StorageRead" }, { Usage::StorageWrite, "StorageWrite" },
+			{ Usage::StorageReadWrite, "StorageReadWrite" },
 			{ Usage::UniformRead, "UniformRead" },
 			{ Usage::VertexInputRead, "VertexInputRead" }, { Usage::IndexRead, "IndexRead" },
 			{ Usage::IndirectRead, "IndirectRead" },
@@ -1534,8 +1545,11 @@ namespace dEngine {
 			record.barrierRange = decl.barrierRange;
 			record.initialLayout = decl.initialLayout;
 			record.crossFrame = decl.crossFrame;
-			record.externalImage = decl.externalImage != nullptr;
-			record.externalBuffer = decl.externalBuffer != nullptr;
+			record.externalImage = decl.externalImage != nullptr
+				|| (decl.external && decl.type == Resource::Image);
+			record.externalBuffer = decl.externalBuffer != nullptr
+				|| (decl.external && decl.type == Resource::Buffer);
+			record.asset = decl.asset;
 			document.m_resources.push_back(std::move(record));
 		}
 
@@ -1547,12 +1561,24 @@ namespace dEngine {
 			record.queue = decl.queue;
 			record.reads = decl.reads;
 			record.writes = decl.writes;
+			record.inPlace = decl.inPlace;
 			record.desc = decl.desc;
 			document.m_passes.push_back(std::move(record));
 		}
 
 		document.m_edges = builder.m_edges;
 		document.m_aliasGroups = builder.m_aliasGroups;
+
+		document.m_staticTextures.reserve(builder.m_staticTextures.size());
+		for (const auto& decl : builder.m_staticTextures) {
+			StaticTextureRecord record;
+			record.name = decl.name;
+			record.asset = decl.asset;
+			record.view = decl.view;
+			record.viewFormat = decl.viewFormat;
+			record.sampler = decl.sampler;
+			document.m_staticTextures.push_back(std::move(record));
+		}
 		return document;
 	}
 
@@ -1570,6 +1596,8 @@ namespace dEngine {
 				item.Set("external", Json::Str("image"));
 			else if (record.externalBuffer)
 				item.Set("external", Json::Str("buffer"));
+			if (!record.asset.empty())
+				item.Set("asset", Json::Str(record.asset));
 			item.Set("desc", EncodeResourceDesc(record.desc));
 			item.Set("view", EncodeSubresource(record.view));
 			item.Set("viewFormat", Json::Str(NameOf(record.viewFormat, kImageFormats)));
@@ -1594,6 +1622,10 @@ namespace dEngine {
 			for (const auto& name : record.writes)
 				writes.Push(Json::Str(name));
 			item.Set("writes", std::move(writes));
+			Json inPlace = Json::Arr();
+			for (const auto& name : record.inPlace)
+				inPlace.Push(Json::Str(name));
+			item.Set("inPlace", std::move(inPlace));
 			item.Set("desc", EncodePassDesc(record.type, record.desc));
 			passes.Push(std::move(item));
 		}
@@ -1616,6 +1648,20 @@ namespace dEngine {
 			aliases.Push(std::move(names));
 		}
 		root.Set("aliases", std::move(aliases));
+
+		Json staticTextures = Json::Arr();
+		for (const auto& record : m_staticTextures) {
+			Json item = Json::Obj();
+			item.Set("name", Json::Str(record.name));
+			if (!record.asset.empty())
+				item.Set("asset", Json::Str(record.asset));
+			item.Set("view", EncodeSubresource(record.view));
+			item.Set("viewFormat", Json::Str(NameOf(record.viewFormat, kImageFormats)));
+			if (record.sampler.has_value())
+				item.Set("sampler", EncodeSampler(*record.sampler));
+			staticTextures.Push(std::move(item));
+		}
+		root.Set("staticTextures", std::move(staticTextures));
 
 		std::string text;
 		Dump(root, text, 0);
@@ -1660,6 +1706,7 @@ namespace dEngine {
 				const std::string external = item.Str("external");
 				record.externalImage = external == "image";
 				record.externalBuffer = external == "buffer";
+				record.asset = item.Str("asset");
 				if (const Json* desc = item.Object("desc"))
 					record.desc = DecodeResourceDesc(*desc, &errors, path + ".desc");
 				record.view = DecodeSubresource(item.Find("view"), &errors, path + ".view");
@@ -1693,6 +1740,12 @@ namespace dEngine {
 							record.writes.insert(name.text);
 					}
 				}
+				if (const Json* inPlace = item.Array("inPlace")) {
+					for (const Json& name : inPlace->items) {
+						if (name.kind == Json::Kind::String)
+							record.inPlace.insert(name.text);
+					}
+				}
 				if (const Json* desc = item.Object("desc"))
 					record.desc = DecodePassDesc(record.type, *desc, &errors, path + ".desc");
 				document.m_passes.push_back(std::move(record));
@@ -1720,6 +1773,25 @@ namespace dEngine {
 						names.push_back(name.text);
 				}
 				document.m_aliasGroups.push_back(std::move(names));
+			}
+		}
+
+		if (const Json* textures = reader.Array("staticTextures")) {
+			for (size_t i = 0; i < textures->items.size(); ++i) {
+				const Json& node = textures->items[i];
+				if (node.kind != Json::Kind::Object) continue;
+				const std::string path = "staticTextures[" + std::to_string(i) + "]";
+				Reader item{ node, path, &errors };
+				StaticTextureRecord record;
+				record.name = item.Str("name");
+				record.asset = item.Str("asset");
+				record.view = DecodeSubresource(item.Find("view"), &errors, path + ".view");
+				record.viewFormat = item.EnumOf("viewFormat", ImageFormat::None, kImageFormats);
+				if (const Json* sampler = item.Object("sampler"))
+					record.sampler = DecodeSampler(*sampler, &errors, path + ".sampler");
+				if (record.name.empty())
+					errors.push_back(path + ": name 为空");
+				document.m_staticTextures.push_back(std::move(record));
 			}
 		}
 
@@ -1762,6 +1834,18 @@ namespace dEngine {
 		return FromJson(buffer.str(), error);
 	}
 
+	std::optional<RenderGraphDocument> RenderGraphDocument::Load(
+		const ContentResolver& resolver, std::string_view logicalPath, std::string* error) {
+		std::string readError;
+		const auto bytes = resolver.ReadBinary(logicalPath, &readError);
+		if (!bytes) {
+			if (error) *error = readError;
+			return std::nullopt;
+		}
+		return FromJson(
+			std::string_view(reinterpret_cast<const char*>(bytes->data()), bytes->size()), error);
+	}
+
 	bool RenderGraphDocument::Restore(RenderGraphBuilder& builder, const ExternalBindings& externals,
 		std::vector<std::string>* errors) const {
 		bool ok = true;
@@ -1773,35 +1857,72 @@ namespace dEngine {
 		for (const auto& record : m_resources) {
 			if (record.externalImage) {
 				const rhi::Image* image = externals.image ? externals.image(record.name) : nullptr;
+				if (image == nullptr && !record.asset.empty() && externals.imageAsset)
+					image = externals.imageAsset(record.asset);
 				if (image == nullptr) {
-					Fail("外部图像未绑定: " + record.name);
+					std::string message = "外部图像未绑定: " + record.name;
+					if (!record.asset.empty())
+						message += "（asset: " + record.asset + "）";
+					Fail(std::move(message));
 					continue;
 				}
-				ResourceOptions options;
+				ImageOptions options;
 				options.view = record.view;
 				options.viewFormat = record.viewFormat;
 				options.barrierRange = record.barrierRange;
 				options.initialLayout = record.initialLayout;
 				options.crossFrame = record.crossFrame;
-				builder.DeclareResource(record.name, image, options);
+				builder.DeclareImageResource(record.name, image, options, record.asset);
 				continue;
 			}
 			if (record.externalBuffer) {
 				const rhi::Buffer* buffer = externals.buffer ? externals.buffer(record.name) : nullptr;
+				if (buffer == nullptr && !record.asset.empty() && externals.bufferAsset)
+					buffer = externals.bufferAsset(record.asset);
 				if (buffer == nullptr) {
-					Fail("外部缓冲未绑定: " + record.name);
+					std::string message = "外部缓冲未绑定: " + record.name;
+					if (!record.asset.empty())
+						message += "（asset: " + record.asset + "）";
+					Fail(std::move(message));
 					continue;
 				}
-				builder.DeclareResource(record.name, buffer);
+				BufferOptions options;
+				options.crossFrame = record.crossFrame;
+				builder.DeclareBufferResource(record.name, buffer, options, record.asset);
 				continue;
 			}
-			ResourceOptions options;
-			options.view = record.view;
-			options.viewFormat = record.viewFormat;
-			options.barrierRange = record.barrierRange;
-			options.initialLayout = record.initialLayout;
-			options.crossFrame = record.crossFrame;
-			builder.DeclareResource(record.name, record.desc, options);
+			if (auto* imageDesc = std::get_if<ImageDesc>(&record.desc)) {
+				ImageOptions options;
+				options.view = record.view;
+				options.viewFormat = record.viewFormat;
+				options.barrierRange = record.barrierRange;
+				options.initialLayout = record.initialLayout;
+				options.crossFrame = record.crossFrame;
+				builder.DeclareImageResource(record.name, *imageDesc, options);
+			}
+			else if (auto* bufferDesc = std::get_if<BufferDesc>(&record.desc)) {
+				BufferOptions options;
+				options.crossFrame = record.crossFrame;
+				builder.DeclareBufferResource(record.name, *bufferDesc, options);
+			}
+			else {
+				Fail("资源描述缺失: " + record.name);
+			}
+		}
+
+		for (const auto& record : m_staticTextures) {
+			const rhi::Image* image = externals.staticImage ? externals.staticImage(record.name) : nullptr;
+			if (image == nullptr && !record.asset.empty() && externals.staticImageAsset)
+				image = externals.staticImageAsset(record.asset);
+			if (image == nullptr) {
+				std::string message = "静态纹理未绑定: " + record.name;
+				if (!record.asset.empty())
+					message += "（asset: " + record.asset + "）";
+				Fail(std::move(message));
+				continue;
+			}
+			builder.DeclareStaticTexture(record.name, image, record.view, record.viewFormat,
+				record.sampler, record.asset);
 		}
 
 		for (const auto& record : m_passes) {
@@ -1815,8 +1936,8 @@ namespace dEngine {
 						host->callback = found->second;
 				}
 			}
-			builder.DeclarePass(record.name, record.reads, record.writes, record.type,
-				std::move(desc), record.queue);
+			builder.DeclarePass(record.name, record.reads, record.writes, record.inPlace,
+				record.type, std::move(desc), record.queue);
 		}
 
 		if (!m_edges.empty()) {
@@ -1828,5 +1949,466 @@ namespace dEngine {
 			builder.AliasLogicalResources(group);
 
 		return ok;
+	}
+
+	// ================= 模块文档 =================
+
+	RenderGraphModuleDocument RenderGraphModuleDocument::Capture(const RenderGraphModule& module) {
+		RenderGraphModuleDocument document;
+		document.m_name = module.mName;
+
+		document.m_ports.reserve(module.mPorts.size());
+		for (const auto& port : module.mPorts)
+			document.m_ports.push_back(PortRecord{ port.port.name, port.port.kind });
+
+		const RenderGraphBuilder& builder = module.mDecl;
+		document.m_resources.reserve(builder.m_resources.size());
+		for (const auto& decl : builder.m_resources) {
+			ResourceRecord record;
+			record.name = decl.name;
+			record.type = decl.type;
+			record.desc = decl.desc;
+			record.view = decl.view;
+			record.viewFormat = decl.viewFormat;
+			record.barrierRange = decl.barrierRange;
+			record.initialLayout = decl.initialLayout;
+			record.crossFrame = decl.crossFrame;
+			record.externalImage = decl.externalImage != nullptr
+				|| (decl.external && decl.type == Resource::Image);
+			record.externalBuffer = decl.externalBuffer != nullptr
+				|| (decl.external && decl.type == Resource::Buffer);
+			record.asset = decl.asset;
+			document.m_resources.push_back(std::move(record));
+		}
+
+		document.m_passes.reserve(builder.m_passes.size());
+		for (const auto& decl : builder.m_passes) {
+			PassRecord record;
+			record.name = decl.name;
+			record.type = decl.type;
+			record.queue = decl.queue;
+			record.reads = decl.reads;
+			record.writes = decl.writes;
+			record.inPlace = decl.inPlace;
+			record.desc = decl.desc;
+			document.m_passes.push_back(std::move(record));
+		}
+
+		document.m_edges = builder.m_edges;
+		document.m_aliasGroups = builder.m_aliasGroups;
+		return document;
+	}
+
+	size_t RenderGraphModuleDocument::FixedResourceCount() const {
+		size_t count = 0;
+		for (const auto& record : m_resources)
+			if (record.externalImage || record.externalBuffer) ++count;
+		return count;
+	}
+
+	std::vector<std::string> RenderGraphModuleDocument::ShaderRefs() const {
+		std::set<std::string> refs;
+		for (const auto& record : m_passes) {
+			if (const auto* render = std::get_if<RenderPassDesc>(&record.desc)) {
+				for (const auto& ref : render->pipeline.shaderRefs)
+					if (!ref.empty()) refs.insert(ref);
+			}
+			else if (const auto* compute = std::get_if<ComputePassDesc>(&record.desc)) {
+				if (!compute->shaderRef.empty()) refs.insert(compute->shaderRef);
+			}
+		}
+		return { refs.begin(), refs.end() };
+	}
+
+	std::vector<std::string> RenderGraphModuleDocument::AssetKeys() const {
+		std::set<std::string> keys;
+		for (const auto& record : m_resources)
+			if ((record.externalImage || record.externalBuffer) && !record.asset.empty())
+				keys.insert(record.asset);
+		return { keys.begin(), keys.end() };
+	}
+
+	std::string RenderGraphModuleDocument::ToJson() const {
+		Json root = Json::Obj();
+		root.Set("format", Json::Str("dEngine.rendergraph.module"));
+		root.Set("version", Json::Int(1));
+		root.Set("name", Json::Str(m_name));
+
+		Json ports = Json::Arr();
+		for (const auto& port : m_ports) {
+			Json item = Json::Obj();
+			item.Set("name", Json::Str(port.name));
+			item.Set("kind", Json::Str(NameOf(port.kind, kModulePortKinds)));
+			ports.Push(std::move(item));
+		}
+		root.Set("ports", std::move(ports));
+
+		Json resources = Json::Arr();
+		for (const auto& record : m_resources) {
+			Json item = Json::Obj();
+			item.Set("name", Json::Str(record.name));
+			item.Set("type", Json::Str(NameOf(record.type, kResourceTypes)));
+			if (record.externalImage)
+				item.Set("external", Json::Str("image"));
+			else if (record.externalBuffer)
+				item.Set("external", Json::Str("buffer"));
+			if (!record.asset.empty())
+				item.Set("asset", Json::Str(record.asset));
+			item.Set("desc", EncodeResourceDesc(record.desc));
+			item.Set("view", EncodeSubresource(record.view));
+			item.Set("viewFormat", Json::Str(NameOf(record.viewFormat, kImageFormats)));
+			item.Set("barrierRange", EncodeRange(record.barrierRange));
+			item.Set("initialLayout", Json::Str(NameOf(record.initialLayout, kImageLayouts)));
+			item.Set("crossFrame", Json::Bool(record.crossFrame));
+			resources.Push(std::move(item));
+		}
+		root.Set("resources", std::move(resources));
+
+		Json passes = Json::Arr();
+		for (const auto& record : m_passes) {
+			Json item = Json::Obj();
+			item.Set("name", Json::Str(record.name));
+			item.Set("type", Json::Str(NameOf(record.type, kPassTypes)));
+			item.Set("queue", Json::Str(NameOf(record.queue, kQueueClasses)));
+			Json reads = Json::Arr();
+			for (const auto& name : record.reads)
+				reads.Push(Json::Str(name));
+			item.Set("reads", std::move(reads));
+			Json writes = Json::Arr();
+			for (const auto& name : record.writes)
+				writes.Push(Json::Str(name));
+			item.Set("writes", std::move(writes));
+			Json inPlace = Json::Arr();
+			for (const auto& name : record.inPlace)
+				inPlace.Push(Json::Str(name));
+			item.Set("inPlace", std::move(inPlace));
+			item.Set("desc", EncodePassDesc(record.type, record.desc));
+			passes.Push(std::move(item));
+		}
+		root.Set("passes", std::move(passes));
+
+		Json edges = Json::Arr();
+		for (const auto& edge : m_edges) {
+			Json item = Json::Obj();
+			item.Set("from", Json::Str(edge.from));
+			item.Set("to", Json::Str(edge.to));
+			edges.Push(std::move(item));
+		}
+		root.Set("edges", std::move(edges));
+
+		Json aliases = Json::Arr();
+		for (const auto& group : m_aliasGroups) {
+			Json names = Json::Arr();
+			for (const auto& name : group)
+				names.Push(Json::Str(name));
+			aliases.Push(std::move(names));
+		}
+		root.Set("aliases", std::move(aliases));
+
+		std::string text;
+		Dump(root, text, 0);
+		text.push_back('\n');
+		return text;
+	}
+
+	std::optional<RenderGraphModuleDocument> RenderGraphModuleDocument::FromJson(
+		std::string_view text, std::string* error) {
+		Json root;
+		JsonParser parser(text);
+		std::string parseError;
+		if (!parser.Parse(root, parseError)) {
+			if (error) *error = "JSON 解析失败: " + parseError;
+			return std::nullopt;
+		}
+		if (root.kind != Json::Kind::Object) {
+			if (error) *error = "模块文档根节点须为对象";
+			return std::nullopt;
+		}
+
+		std::vector<std::string> errors;
+		Reader reader{ root, "", &errors };
+		const std::string format = reader.Str("format");
+		if (format != "dEngine.rendergraph.module")
+			errors.push_back("format 字段缺失或不匹配: " + format);
+		const uint32_t version = reader.U32("version", 0);
+		if (version != 1)
+			errors.push_back("不支持的模块文档版本: " + std::to_string(version));
+
+		RenderGraphModuleDocument document;
+		document.m_name = reader.Str("name");
+		if (document.m_name.empty())
+			errors.push_back("name 为空");
+
+		std::set<std::string> portNames;
+		if (const Json* ports = reader.Array("ports")) {
+			for (size_t i = 0; i < ports->items.size(); ++i) {
+				const Json& node = ports->items[i];
+				if (node.kind != Json::Kind::Object) continue;
+				const std::string path = "ports[" + std::to_string(i) + "]";
+				Reader item{ node, path, &errors };
+				PortRecord record;
+				record.name = item.Str("name");
+				record.kind = item.EnumOf("kind", ModulePortKind::Input, kModulePortKinds);
+				if (record.name.empty())
+					errors.push_back(path + ": name 为空");
+				else if (!portNames.insert(record.name).second)
+					errors.push_back(path + ": 端口名重复 " + record.name);
+				document.m_ports.push_back(std::move(record));
+			}
+		}
+
+		if (const Json* resources = reader.Array("resources")) {
+			for (size_t i = 0; i < resources->items.size(); ++i) {
+				const Json& node = resources->items[i];
+				if (node.kind != Json::Kind::Object) continue;
+				const std::string path = "resources[" + std::to_string(i) + "]";
+				Reader item{ node, path, &errors };
+				ResourceRecord record;
+				record.name = item.Str("name");
+				record.type = item.EnumOf("type", Resource::None, kResourceTypes);
+				const std::string external = item.Str("external");
+				record.externalImage = external == "image";
+				record.externalBuffer = external == "buffer";
+				record.asset = item.Str("asset");
+				if (const Json* desc = item.Object("desc"))
+					record.desc = DecodeResourceDesc(*desc, &errors, path + ".desc");
+				record.view = DecodeSubresource(item.Find("view"), &errors, path + ".view");
+				record.viewFormat = item.EnumOf("viewFormat", ImageFormat::None, kImageFormats);
+				record.barrierRange = DecodeRange(item.Find("barrierRange"), &errors, path + ".barrierRange");
+				record.initialLayout = item.EnumOf("initialLayout", rhi::ImageLayout::Undefined, kImageLayouts);
+				record.crossFrame = item.Bool("crossFrame", false);
+				if (record.name.empty())
+					errors.push_back(path + ": name 为空");
+				if (record.externalImage && record.type != Resource::Image)
+					errors.push_back(path + ": external image 的资源类型须为 Image");
+				if (record.externalBuffer && record.type != Resource::Buffer)
+					errors.push_back(path + ": external buffer 的资源类型须为 Buffer");
+				if (!record.externalImage && !record.externalBuffer
+					&& record.desc.index() == 0)
+					errors.push_back(path + ": 缺少资源描述（desc.kind = none）");
+				document.m_resources.push_back(std::move(record));
+			}
+		}
+
+		if (const Json* passes = reader.Array("passes")) {
+			for (size_t i = 0; i < passes->items.size(); ++i) {
+				const Json& node = passes->items[i];
+				if (node.kind != Json::Kind::Object) continue;
+				const std::string path = "passes[" + std::to_string(i) + "]";
+				Reader item{ node, path, &errors };
+				PassRecord record;
+				record.name = item.Str("name");
+				record.type = item.EnumOf("type", Pass::None, kPassTypes);
+				record.queue = item.EnumOf("queue", rhi::QueueClass::Graphics, kQueueClasses);
+				if (const Json* reads = item.Array("reads")) {
+					for (const Json& name : reads->items) {
+						if (name.kind == Json::Kind::String)
+							record.reads.insert(name.text);
+					}
+				}
+				if (const Json* writes = item.Array("writes")) {
+					for (const Json& name : writes->items) {
+						if (name.kind == Json::Kind::String)
+							record.writes.insert(name.text);
+					}
+				}
+				if (const Json* inPlace = item.Array("inPlace")) {
+					for (const Json& name : inPlace->items) {
+						if (name.kind == Json::Kind::String)
+							record.inPlace.insert(name.text);
+					}
+				}
+				if (const Json* desc = item.Object("desc"))
+					record.desc = DecodePassDesc(record.type, *desc, &errors, path + ".desc");
+				if (record.name.empty())
+					errors.push_back(path + ": name 为空");
+				document.m_passes.push_back(std::move(record));
+			}
+		}
+
+		if (const Json* edges = reader.Array("edges")) {
+			for (size_t i = 0; i < edges->items.size(); ++i) {
+				const Json& node = edges->items[i];
+				if (node.kind != Json::Kind::Object) continue;
+				Reader item{ node, "edges[" + std::to_string(i) + "]", &errors };
+				BuilderEdge edge;
+				edge.from = item.Str("from");
+				edge.to = item.Str("to");
+				document.m_edges.push_back(std::move(edge));
+			}
+		}
+
+		if (const Json* aliases = reader.Array("aliases")) {
+			for (const Json& group : aliases->items) {
+				if (group.kind != Json::Kind::Array) continue;
+				std::vector<std::string> names;
+				for (const Json& name : group.items) {
+					if (name.kind == Json::Kind::String)
+						names.push_back(name.text);
+				}
+				document.m_aliasGroups.push_back(std::move(names));
+			}
+		}
+
+		if (!errors.empty()) {
+			if (error) {
+				std::string message = "模块文档校验失败:";
+				for (const auto& entry : errors)
+					message += "\n  " + entry;
+				*error = std::move(message);
+			}
+			return std::nullopt;
+		}
+		return document;
+	}
+
+	bool RenderGraphModuleDocument::Save(const std::string& path, std::string* error) const {
+		std::ofstream file(path, std::ios::binary | std::ios::trunc);
+		if (!file) {
+			if (error) *error = "无法写入模块文档: " + path;
+			return false;
+		}
+		file << ToJson();
+		if (!file) {
+			if (error) *error = "写入模块文档失败: " + path;
+			return false;
+		}
+		return true;
+	}
+
+	std::optional<RenderGraphModuleDocument> RenderGraphModuleDocument::Load(
+		const std::string& path, std::string* error) {
+		std::ifstream file(path, std::ios::binary);
+		if (!file) {
+			if (error) *error = "无法打开模块文档: " + path;
+			return std::nullopt;
+		}
+		std::ostringstream buffer;
+		buffer << file.rdbuf();
+		return FromJson(buffer.str(), error);
+	}
+
+	std::optional<RenderGraphModuleDocument> RenderGraphModuleDocument::Load(
+		const ContentResolver& resolver, std::string_view logicalPath, std::string* error) {
+		std::string readError;
+		const auto bytes = resolver.ReadBinary(logicalPath, &readError);
+		if (!bytes) {
+			if (error) *error = readError;
+			return std::nullopt;
+		}
+		return FromJson(
+			std::string_view(reinterpret_cast<const char*>(bytes->data()), bytes->size()), error);
+	}
+
+	bool RenderGraphModuleDocument::Restore(RenderGraphModule& out,
+		const FixedBindings* bindings, std::vector<std::string>* errors) const {
+		bool ok = true;
+		auto Fail = [&](std::string message) {
+			ok = false;
+			if (errors) errors->push_back(std::move(message));
+		};
+
+		RenderGraphBuilder builder;
+		for (const auto& record : m_resources) {
+			if (record.externalImage) {
+				ImageOptions options;
+				options.view = record.view;
+				options.viewFormat = record.viewFormat;
+				options.barrierRange = record.barrierRange;
+				options.initialLayout = record.initialLayout;
+				options.crossFrame = record.crossFrame;
+				builder.DeclareImageResource(record.name, record.asset, options);
+				continue;
+			}
+			if (record.externalBuffer) {
+				BufferOptions options;
+				options.crossFrame = record.crossFrame;
+				builder.DeclareBufferResource(record.name, record.asset, options);
+				continue;
+			}
+			if (auto* imageDesc = std::get_if<ImageDesc>(&record.desc)) {
+				ImageOptions options;
+				options.view = record.view;
+				options.viewFormat = record.viewFormat;
+				options.barrierRange = record.barrierRange;
+				options.initialLayout = record.initialLayout;
+				options.crossFrame = record.crossFrame;
+				builder.DeclareImageResource(record.name, *imageDesc, options);
+			}
+			else if (auto* bufferDesc = std::get_if<BufferDesc>(&record.desc)) {
+				BufferOptions options;
+				options.crossFrame = record.crossFrame;
+				builder.DeclareBufferResource(record.name, *bufferDesc, options);
+			}
+			else {
+				Fail("资源描述缺失: " + record.name);
+			}
+		}
+
+		for (const auto& record : m_passes) {
+			PassDesc desc = record.desc;
+			if (auto* host = std::get_if<HostPassDesc>(&desc)) {
+				if (!host->callbackKey.empty() && bindings != nullptr) {
+					const auto found = bindings->hostCallbacks.find(host->callbackKey);
+					if (found == bindings->hostCallbacks.end())
+						Fail("Host 回调未绑定: " + host->callbackKey);
+					else
+						host->callback = found->second;
+				}
+			}
+			builder.DeclarePass(record.name, record.reads, record.writes, record.inPlace,
+				record.type, std::move(desc), record.queue);
+		}
+
+		if (!m_edges.empty()) {
+			RenderGraphBuilder::Topology topology;
+			topology.edges = m_edges;
+			builder.DeclareTopology(std::move(topology));
+		}
+		for (const auto& group : m_aliasGroups)
+			builder.AliasLogicalResources(group);
+
+		// 先解析固定引用，避免编译成功但模块不可用
+		std::vector<ModuleFixedBinding> resolved;
+		if (bindings != nullptr) {
+			for (const auto& record : m_resources) {
+				if (!record.externalImage && !record.externalBuffer)
+					continue;
+				if (record.externalImage) {
+					const rhi::Image* image = bindings->image ? bindings->image(record.name) : nullptr;
+					if (image == nullptr && !record.asset.empty() && bindings->imageAsset)
+						image = bindings->imageAsset(record.asset);
+					if (image == nullptr)
+						Fail("固定引用未绑定: " + record.name);
+					else
+						resolved.push_back({ record.name, image, nullptr });
+				}
+				else {
+					const rhi::Buffer* buffer = bindings->buffer ? bindings->buffer(record.name) : nullptr;
+					if (buffer == nullptr && !record.asset.empty() && bindings->bufferAsset)
+						buffer = bindings->bufferAsset(record.asset);
+					if (buffer == nullptr)
+						Fail("固定引用未绑定: " + record.name);
+					else
+						resolved.push_back({ record.name, nullptr, buffer });
+				}
+			}
+		}
+
+		if (!ok)
+			return false;
+
+		std::vector<ModulePort> ports;
+		ports.reserve(m_ports.size());
+		for (const auto& port : m_ports)
+			ports.push_back(ModulePort{ port.name, port.kind });
+
+		if (!builder.CompileModule(m_name, ports, &out, errors))
+			return false;
+
+		if (bindings != nullptr && !resolved.empty()
+			&& !out.Initialize(resolved, errors))
+			return false;
+		return true;
 	}
 }

@@ -4,7 +4,7 @@ add_executable(QUAD
 	"main.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/../../RenderGraph.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/../../RenderGraphNodes.cpp"
-	"${CMAKE_CURRENT_SOURCE_DIR}/../../AssetResolver.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../ContentResolver.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/../../ShaderLibrary.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/../../rhi/RHI.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/../../vmaExporter.cpp"

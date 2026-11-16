@@ -2,14 +2,13 @@
 #define WIN32_LEAN_AND_MEAN
 
 #include "RenderGraphAbstracted.h"
+#include "RenderGraphBuilder.h"
 #include "RenderGraphNodes.h"
-#include "AssetResolver.h"
+#include "ContentResolver.h"
 #include "ShaderLibrary.h"
 #include "rhi/RHI.h"
 
-#define STB_IMAGE_IMPLEMENTATION
 #include "stb_image/stb_image.h"
-#define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image/stb_image_write.h"
 
 #define GLFW_EXPOSE_NATIVE_WIN32
@@ -134,50 +133,58 @@ unique_ptr<rhi::Image> UploadEnvironment(rhi::Device& device, const string& path
 
 bool BuildFrameGraph(RenderGraph& graph,
 	const rhi::Buffer* vertexBuffer, const rhi::Buffer* indexBuffer,
-	const rhi::Image* envTexture, const rhi::Image* backbuffer, bool smoke) {
+	const rhi::Image* envTexture, const rhi::Image* backbuffer, bool smoke, bool useHeap) {
+	RenderGraphBuilder builder;
+
 	BufferDesc uboDesc;
 	uboDesc.size = sizeof(SceneUniforms);
 	uboDesc.usage = rhi::BufferUsage::Uniform;
 	uboDesc.hostVisible = true;
-	graph.RegisterResource("SceneUniforms", { "Cube", "Composite" }, "UpdateScene",
-		Resource::Buffer, uboDesc);
+	builder.DeclareBufferResource("SceneUniforms", uboDesc);
 
-	graph.RegisterResource("CubeVB", { "Cube" }, "", vertexBuffer);
-	graph.RegisterResource("CubeIB", { "Cube" }, "", indexBuffer);
+	builder.DeclareBufferResource("CubeVB", vertexBuffer);
+	builder.DeclareBufferResource("CubeIB", indexBuffer);
 
-	graph.RegisterResource("EnvTexture", { "Cube", "Composite" }, "", envTexture, {},
-		rhi::ImageLayout::ShaderReadOnly, rhi::ImageFormat::None,
-		rhi::ImageSubresourceRange{}, true);
+	ImageOptions envOptions;
+	envOptions.initialLayout = rhi::ImageLayout::ShaderReadOnly;
+	envOptions.crossFrame = true;
+	builder.DeclareImageResource("EnvTexture", envTexture, envOptions);
 
 	ImageDesc sceneDesc;
 	sceneDesc.width = kWidth;
 	sceneDesc.height = kHeight;
 	sceneDesc.format = ImageFormat::RGBA8;
-	graph.RegisterResource("SceneColor", { "Composite" }, "Cube", Resource::Image, sceneDesc);
+	builder.DeclareImageResource("SceneColor", sceneDesc);
 
 	ImageDesc depthDesc;
 	depthDesc.width = kWidth;
 	depthDesc.height = kHeight;
 	depthDesc.format = ImageFormat::D32F;
-	graph.RegisterResource("Depth", {}, "Cube", Resource::Image, depthDesc);
+	builder.DeclareImageResource("Depth", depthDesc);
 
 	if (smoke) {
 		ImageDesc backDesc;
 		backDesc.width = kWidth;
 		backDesc.height = kHeight;
 		backDesc.format = ImageFormat::RGBA8;
-		graph.RegisterResource("Backbuffer", { "Capture" }, "Composite", Resource::Image, backDesc);
+		builder.DeclareImageResource("Backbuffer", backDesc);
 	}
 	else {
-		graph.RegisterResource("Backbuffer", { "Present" }, "Composite", backbuffer, {},
-			rhi::ImageLayout::Undefined);
+		ImageOptions backOptions;
+		backOptions.initialLayout = rhi::ImageLayout::Undefined;
+		builder.DeclareImageResource("Backbuffer", backbuffer, backOptions);
 	}
 
-	graph.RegisterPass("UpdateScene", {}, { "SceneUniforms" }, Pass::Host, HostPassDesc{});
+	builder.DeclarePass("UpdateScene", {}, { "SceneUniforms" }, Pass::Host, HostPassDesc{});
 
 	rhi::SamplerDesc envSampler = rhi::SamplerDesc::Linear(rhi::SamplerAddressMode::Repeat);
 	envSampler.addressV = rhi::SamplerAddressMode::ClampToEdge;
 	envSampler.addressW = rhi::SamplerAddressMode::ClampToEdge;
+
+	// 环境贴图进入静态纹理堆（slot 0），Composite 通过绑定数组采样
+	if (useHeap && envTexture != nullptr)
+		builder.DeclareStaticTexture("EnvTexture", envTexture, {},
+			rhi::ImageFormat::None, envSampler, "skyview");
 
 	RenderPassDesc cubeDesc;
 	{
@@ -208,7 +215,7 @@ bool BuildFrameGraph(RenderGraph& graph,
 		cubeDesc.vertexStreams.push_back(VertexStreamBinding{ "CubeVB", {}, 0 });
 		cubeDesc.indexStream = IndexStreamBinding{ "CubeIB", {}, 0, IndexType::UInt32 };
 	}
-	graph.RegisterPass("Cube", { "SceneUniforms", "EnvTexture", "CubeVB", "CubeIB" },
+	builder.DeclarePass("Cube", { "SceneUniforms", "EnvTexture", "CubeVB", "CubeIB" },
 		{ "SceneColor", "Depth" }, Pass::Render, cubeDesc);
 
 	RenderPassDesc compositeDesc;
@@ -220,26 +227,48 @@ bool BuildFrameGraph(RenderGraph& graph,
 		color.store = StoreOp::Store;
 		compositeDesc.attachments.push_back(color);
 
-		compositeDesc.pipeline.shaderRefs = { "fullscreen.vert", "composite.frag" };
+		compositeDesc.pipeline.shaderRefs = useHeap
+			? std::vector<std::string>{ "fullscreen.vert", "composite_heap.frag" }
+			: std::vector<std::string>{ "fullscreen.vert", "composite.frag" };
 		compositeDesc.pipeline.cullMode = CullMode::None;
 		compositeDesc.pipeline.depthStencil.depthTestEnable = false;
+		compositeDesc.bindStaticHeap = useHeap;
 
 		compositeDesc.shaderBindings = {
 			ShaderBinding::Uniform("SceneUniforms"),
-			ShaderBinding::Sampled("SceneColor", rhi::SamplerDesc::Nearest()),
-			ShaderBinding::Sampled("EnvTexture", envSampler) };
+			ShaderBinding::Sampled("SceneColor", rhi::SamplerDesc::Nearest()) };
+		if (!useHeap)
+			compositeDesc.shaderBindings.push_back(ShaderBinding::Sampled("EnvTexture", envSampler));
 	}
-	graph.RegisterPass("Composite", { "SceneUniforms", "SceneColor", "EnvTexture" },
+	// 走静态堆时，EnvTexture 的访问不在图的拓扑里（堆状态由声明保证 ShaderReadOnly），
+	// 不能把它留在读集中，否则 Usage::Auto 会把它转到 General，与堆描述符布局冲突。
+	std::set<std::string> compositeReads = { "SceneUniforms", "SceneColor" };
+	if (!useHeap)
+		compositeReads.insert("EnvTexture");
+	builder.DeclarePass("Composite", compositeReads,
 		{ "Backbuffer" }, Pass::Render, compositeDesc);
 
 	if (smoke)
-		graph.RegisterPass("Capture", { "Backbuffer" }, {}, Pass::Host, HostPassDesc{});
+		builder.DeclarePass("Capture", { "Backbuffer" }, {}, Pass::Host, HostPassDesc{});
 	else
-		graph.RegisterPass("Present", { "Backbuffer" }, {}, Pass::Present, PresentPassDesc{});
+		builder.DeclarePass("Present", { "Backbuffer" }, {}, Pass::Present, PresentPassDesc{});
 
+	LowerResult lower = builder.Lower();
+	if (!lower.ok) {
+		for (const auto& diagnostic : lower.diagnostics)
+			cerr << "RenderGraphBuilder: " << diagnostic.message << "\n";
+		return false;
+	}
+	builder.Build(graph);
 	graph.ProcessRegister();
 	graph.GenerateSubmitSequence();
 	graph.RealizeAll();
+
+	if (useHeap && envTexture != nullptr) {
+		// 重复注册同名条目会返回已有 slot，用于确认 Build 已完成堆注册
+		const uint32_t envSlot = graph.RegisterStaticTexture("EnvTexture", *envTexture);
+		cout << "Static texture heap ok: slot=" << envSlot << "\n";
+	}
 
 	for (uint32_t i = 0; graph.GetPass(i) != nullptr; ++i) {
 		Pass* p = graph.GetPass(i);
@@ -303,6 +332,8 @@ int main(int argc, char** argv) {
 	rhi::DeviceDesc deviceDesc;
 	deviceDesc.enableValidation = true;
 	deviceDesc.maxFramesInFlight = 2;
+	if (std::getenv("ENGINE_FORCE_FIXED_HEAP") != nullptr)
+		deviceDesc.forceFixedArrayHeap = true;
 	if (window != nullptr) {
 		deviceDesc.nativeWindowHandle = glfwGetWin32Window(window);
 		deviceDesc.width = kWidth;
@@ -317,8 +348,12 @@ int main(int argc, char** argv) {
 		return 1;
 	}
 	cout << "Device: " << device->DeviceName() << "\n";
+	cout << "Static heap tier: "
+	     << (device->GetStaticHeapTier() == rhi::StaticHeapTier::DescriptorIndexing
+	         ? "bindless" : "fixed-array") << "\n";
+	const bool useHeap = device->GetStaticHeapTier() != rhi::StaticHeapTier::None;
 
-	AssetResolver assets;
+	ContentResolver assets;
 	assets.Mount("shaders", shaderDir);
 	assets.Mount("assets", assetDir);
 	ShaderLibrary shaders(assets);
@@ -413,7 +448,7 @@ int main(int argc, char** argv) {
 			graph.emplace(device.get(), &shaders);
 			if (!BuildFrameGraph(*graph, vertexBuffer.get(), indexBuffer.get(),
 				envTexture.get(), currentFrame.has_value() ? currentFrame->backbuffer : nullptr,
-				options.smoke)) {
+				options.smoke, useHeap)) {
 				return 1;
 			}
 

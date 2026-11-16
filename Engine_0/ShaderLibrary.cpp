@@ -2,7 +2,7 @@
 
 #include <cctype>
 #include <cstdint>
-#include <fstream>
+#include <cstring>
 #include <utility>
 
 namespace dEngine {
@@ -328,7 +328,7 @@ namespace dEngine {
 			SetError(error, "shader entry has empty name");
 			return false;
 		}
-		const std::string normalized = AssetResolver::Normalize(entry.logicalPath);
+		const std::string normalized = ContentResolver::NormalizePath(entry.logicalPath);
 		if (normalized.empty()) {
 			SetError(error, "invalid shader path \"" + entry.logicalPath + "\" for " + entry.name);
 			return false;
@@ -391,7 +391,7 @@ namespace dEngine {
 		for (auto& manifestShader : shaders) {
 			ShaderEntry entry;
 			entry.name = manifestShader.name;
-			entry.logicalPath = manifestShader.path;
+			entry.logicalPath = ContentResolver::InheritPath(logicalPath, manifestShader.path);
 			entry.entryPoint = manifestShader.entry;
 			entry.defines = std::move(manifestShader.defines);
 			if (manifestShader.hasStage) {
@@ -414,6 +414,11 @@ namespace dEngine {
 
 	bool ShaderLibrary::Contains(std::string_view name) const {
 		return m_entries.find(std::string(name)) != m_entries.end();
+	}
+
+	const ShaderEntry* ShaderLibrary::Find(std::string_view name) const {
+		const auto it = m_entries.find(std::string(name));
+		return it == m_entries.end() ? nullptr : &it->second;
 	}
 
 	std::vector<std::string> ShaderLibrary::Names() const {
@@ -449,18 +454,42 @@ namespace dEngine {
 			return std::nullopt;
 		}
 
-		// 提前拦住误把 GLSL 源当 SPIR-V 配置的情况
-		std::ifstream stream(file->absolutePath, std::ios::binary);
+		// 提前拦住误把 GLSL 源当 SPIR-V 配置的情况；内存源与磁盘源统一走 Resolver
+		const auto view = m_resolver->ViewBinary(entry.logicalPath, nullptr);
+		std::vector<uint8_t> owned;
+		std::span<const uint8_t> bytes;
+		if (view) {
+			bytes = *view;
+		}
+		else {
+			auto data = m_resolver->ReadBinary(entry.logicalPath, &resolveError);
+			if (!data) {
+				SetError(error, "cannot read shader: " + entry.logicalPath + " (" + resolveError + ")");
+				return std::nullopt;
+			}
+			owned = std::move(*data);
+			bytes = owned;
+		}
+		if (bytes.size() < 4 || bytes.size() % 4 != 0) {
+			SetError(error, "not a SPIR-V module: " + entry.logicalPath);
+			return std::nullopt;
+		}
 		uint32_t magic = 0;
-		stream.read(reinterpret_cast<char*>(&magic), sizeof(magic));
-		if (!stream || magic != kSpirvMagic) {
+		std::memcpy(&magic, bytes.data(), sizeof(magic));
+		if (magic != kSpirvMagic) {
 			SetError(error, "not a SPIR-V module: " + entry.logicalPath);
 			return std::nullopt;
 		}
 
 		rhi::ShaderStageDesc desc;
 		desc.stage = *entry.stage;
-		desc.spirvPath = file->absolutePath.string();
+		if (file->absolutePath) {
+			desc.spirvPath = file->absolutePath->string();
+		}
+		else {
+			desc.spirv.resize(bytes.size() / sizeof(uint32_t));
+			std::memcpy(desc.spirv.data(), bytes.data(), bytes.size());
+		}
 		desc.entryPoint = entry.entryPoint;
 		return desc;
 	}

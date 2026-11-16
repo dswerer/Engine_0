@@ -26,21 +26,31 @@ ProcessRegister / RealizeAll / 帧循环（后端既有流程）
 ### 2.1 资源
 
 ```cpp
-// 选项聚合：默认即常用路径（锚点 mip0/layer0、全图 barrier、Undefined 初态、帧内）
-struct ResourceOptions {
+// 选项按资源类型拆分
+struct ImageOptions {
     ImageSubresource      view {};
     rhi::ImageFormat      viewFormat = rhi::ImageFormat::None;
     ImageSubresourceRange barrierRange { {}, 0, 0 };
     rhi::ImageLayout      initialLayout = rhi::ImageLayout::Undefined;
     bool                  crossFrame = false;
 };
+struct BufferOptions { bool crossFrame = false; };
 
 // 自有资源（owned）
-void DeclareResource(std::string name, ResourceDesc desc, ResourceOptions options = {});
-// 借用外部图像
-void DeclareResource(std::string name, const rhi::Image* external, ResourceOptions options = {});
-// 借用外部 Buffer
-void DeclareResource(std::string name, const rhi::Buffer* external);
+void DeclareImageResource(std::string name, ImageDesc desc, ImageOptions options = {});
+void DeclareBufferResource(std::string name, BufferDesc desc, BufferOptions options = {});
+
+// 借用外部句柄（assetKey 仅用于文档记录，可为空）
+void DeclareImageResource(std::string name, const rhi::Image* external,
+    ImageOptions options = {}, std::string assetKey = {});
+void DeclareBufferResource(std::string name, const rhi::Buffer* external,
+    BufferOptions options = {}, std::string assetKey = {});
+
+// 资产键：有 AssetLoader 时现场装载，否则声明为未绑定，等待初始化
+bool DeclareImageResource(std::string name, std::string assetKey,
+    ImageOptions options = {}, std::string* error = nullptr);
+bool DeclareBufferResource(std::string name, std::string assetKey,
+    BufferOptions options = {}, std::string* error = nullptr);
 ```
 
 - 资源名即逻辑名；同一逻辑名的多次写入由 Lower 分配版本。
@@ -71,7 +81,8 @@ void DeclarePass(std::string name,
 推导版传入 Host/Present/Mux 或 desc 与类型不匹配时触发 `ErrorCode::PassIoNotDerivable`。
 
 - reads/writes 用逻辑名；Lower 推导每个 pass 触达的版本。
-- **同一 pass 内同一逻辑名不允许既读又写**（`SamePassReadWrite`，error）。SPIR-V 变量只能绑一个版本，RMW 需拆成两个逻辑资源 + mux 乒乓。
+- **同一 pass 内同一逻辑名既读又写**时，必须声明 `inPlace`（`StorageReadWrite` 会自动填充）；Lower 会把读绑定到写版本，并与前一版本共用内存。未声明 `inPlace` 视为跨帧双缓冲意图，当前报 `DoubleBufferNotImplemented`。
+- 模块内 in-place pass 必须在显式拓扑中拥有前驱/后继（首/末 pass 可缺一侧），否则 `CompileModule` 直接报错；in-place 资源跨队列直接拒绝。
 
 ### 2.3 ShaderBinding 双名分离
 
@@ -143,7 +154,7 @@ bool Build(RenderGraph& out, LowerResult* result = nullptr) const;
   - `versions`（`BuilderVersionInfo`：资源 × 版本 × 生产者）
   - `graph`（`LoweredGraph`：版本化资源 / pass / 别名组 / 顺序边）
 - `Build()` 把 Lower 结果注册进目标 `RenderGraph`：**只写声明，不调用 ProcessRegister**。失败时图保持为空。
-- 诊断类别：`ImpliedEdgeAdded`（warning）、`Contradiction`、`WriterOrderUndetermined`、`ReadBeforeProducer`、`SamePassReadWrite`、`VersionAliasConflict`、`DuplicateName`、`UnknownName`、`EmptyName`、`MuxMultiWriter`。
+- 诊断类别：`ImpliedEdgeAdded`（warning）、`Contradiction`、`WriterOrderUndetermined`、`ReadBeforeProducer`、`DoubleBufferNotImplemented`、`InPlaceNotReadWrite`、`InPlaceQueueMismatch`、`VersionAliasConflict`、`DuplicateName`、`UnknownName`、`EmptyName`、`MuxMultiWriter`。
 
 ## 6. 前端合并
 
@@ -178,7 +189,9 @@ bool CompileModule(std::string name, std::vector<ModulePort> ports,
 
 校验（任一失败即拒）：
 
+- 端口可以为空：只含固定引用的自包含模块合法；
 - 端口必须先 `DeclareResource` 为 **owned** 资源（外部借用不可做端口），且被至少一个 pass 引用；
+- 端口与固定引用都按借用资源语义收敛到父级：父级声明优先，仅校验类型与 `crossFrame` 单向约束，不要求 Desc / 视图 / `initialLayout` 逐字段相等；
 - 端口不得出现在别名组中；
 - 封闭世界：模块内 pass 引用的资源都在模块内声明；
 - 禁 Present / Mux 节点；
@@ -221,8 +234,8 @@ builder.DeclareTopology(RenderGraphBuilder::Topology{}
 
 ```cpp
 dEngine::RenderGraphBuilder b(device);
-b.DeclareResource("Hdr", ImageDesc{ ... });
-b.DeclareResource("Ldr", ImageDesc{ ... });
+b.DeclareImageResource("Hdr", ImageDesc{ ... });
+b.DeclareImageResource("Ldr", ImageDesc{ ... });
 b.DeclarePass("Lighting", {}, {"Hdr"}, Pass::Render, renderDesc);
 b.DeclarePass("Tonemap", {"Hdr"}, {"Ldr"}, Pass::Render, tonemapDesc);
 // 多写者场景下用拓扑定序：
@@ -353,3 +366,131 @@ resolve.usage = Usage::ResolveDst;
 - `Usage::ResolveSrc` 可选：若声明，必须与同 slot 的颜色附件同源，且该 slot 配备 `ResolveDst`。Builder 前端不必声明它（同一个逻辑名不能在一个 pass 里既读又写，`ColorAttachment` 已在写集里）。
 - 深度附件可以是 MSAA，但当前不做深度解算。
 - 多颜色附件可只解算其中一部分（解算是逐附件的，不存在"全有或全无"限制）。
+
+## 11. 资产与打包
+
+### 11.1 ContentResolver
+
+逻辑路径到内容源（磁盘挂载或内存包）的唯一入口，避免在 C++ 中散落构建机绝对路径。
+
+```cpp
+ContentResolver assets;
+assets.Mount("shaders", ENGINE_SHADER_DIR);   // 前缀 -> 根目录
+assets.Mount("assets",  ENGINE_ASSET_DIR);
+
+auto pack = AssetPack::LoadFile("game.pak");  // DENGPAK1 整包，一次读入内存
+assets.SetPack(pack ? &*pack : nullptr);
+
+auto file   = assets.Resolve("shaders/blur.comp.spv");      // 磁盘
+auto packed = assets.Resolve("pack:shaders/blur.comp.spv"); // 内存包
+```
+
+- 无 `pack:` 头只走磁盘挂载；`pack:` 只查内存包，绝不回退磁盘，也不向工作目录解压。
+- `ViewBinary` 对包返回零拷贝切片；磁盘源返回 `nullopt`，调用方回退 `ReadBinary`。
+- 清单自身来自 `pack:` 时，条目里无头的相对路径自动继承 `pack:`；显式 `pack:` 条目保持不变。
+- 挂载前缀按最长前缀匹配，未匹配时退到兜底根；`Normalize` 拒绝绝对路径、盘符与 `..` 越界。
+- 构造后只读，可多线程共享；错误经 `std::string*` 返回，不抛异常。
+
+### 11.2 ShaderLibrary
+
+构建期为每个目标生成 `shaders.manifest.json`，与 `glslc` 共用同一份源列表；运行时以逻辑名解析阶段、SPIR-V 路径与入口点。
+
+```cpp
+ShaderLibrary shaders(assets);
+std::vector<std::string> warnings;
+shaders.LoadManifest("shaders/shaders.manifest.json", &warnings);
+auto stage = shaders.Resolve("blur.comp");  // 阶段 + 路径 + entryPoint
+```
+
+- 阶段可由清单显式给出，也可按 `.vert/.frag/.comp/.tesc/.tese/.geom` 推断；冲突时登记失败。
+- `Resolve` 校验文件存在与 SPIR-V 魔数（`0x07230203`），避免把 GLSL 源误配为 `.spv`。
+- `ResolveStages` 批量解析并汇总全部失败原因；`Revision(name)` 返回 mtime/size 供变更检测。
+- 新增着色器只需加入对应目标的 `*_SHADER_SOURCES`，清单与 C++ 引用都无需手写路径。
+
+### 11.3 AssetCatalog 与 AssetLoader
+
+`AssetCatalog` 只做资产清单：逻辑键到来源路径与创建参数，**不解码、不上传、不持有 GPU 资源**。
+
+```cpp
+AssetCatalog catalog(assets);
+catalog.LoadManifest("assets/resources.manifest.json");
+const ImageAsset* image = catalog.FindImage("skyview");  // 只给描述
+```
+
+- 可多次 `LoadManifest` 聚合多份清单，键跨图像/缓冲唯一；支持 `Revision` 与 `Validate`。
+- 宿主侧 `AssetLoader` 负责实际解码与上传，按解析后的绝对路径缓存句柄，同一文件的多个逻辑键共享；只允许缓存只读、布局稳定的资源。
+
+### 11.4 模块自动打包
+
+`BuildModulePack` 从 `RenderGraphModuleDocument` 自动扫描 `shaderRefs` 与 asset 键，只收集被实际引用的依赖，生成自包含 DENGPAK1 包：
+
+- `modules/<name>.json` + `modules/index.json`
+- `manifests/shaders.json` / `manifests/assets.json`（只含被引用项）
+- 引用的 SPIR-V 与资产文件
+
+```cpp
+ModulePackResult result;
+BuildModulePack(moduleDoc, shaders, catalog, &result, &error);
+// 或直接落盘：磁盘模块 JSON / 内存模块文档两种入口
+BuildModulePackFile("blur.module.json", shaders, catalog, "blur.pak", &result, &error);
+BuildModulePackFile(moduleDoc, shaders, catalog, "blur.pak", &result, &error);
+```
+
+发射流程不需要中间 JSON：`Capture` 得到的内存文档可直接传给 `BuildModulePackFile`，输出目录中只保留 `.pak`。
+
+运行时挂载包后，通过 `pack:manifests/...` 加载过滤清单、`pack:modules/<name>.json` 恢复模块。首版限制：一次只打单个模块，无批量入口与独立 CLI。
+
+## 12. 渲染图文档
+
+`RenderGraphDocument` 与 `RenderGraphModuleDocument` 只持久化**声明层**：资源、Pass、拓扑边、别名组、静态纹理堆条目。注册期回填字段（`resourceId`、`set`/`binding`）、外部句柄、函数指针不落盘，同一份文档可跨机器、跨构建目录共享。
+
+```cpp
+RenderGraphDocument doc = RenderGraphDocument::Capture(builder);
+doc.Save("out/graph.json");
+
+auto loaded = RenderGraphDocument::Load("out/graph.json");
+// 内存包来源走 ContentResolver 重载：
+// RenderGraphDocument::Load(resolver, "pack:docs/graph.json");
+
+RenderGraphBuilder restored;
+RenderGraphDocument::ExternalBindings externals;
+externals.image = [&](const std::string& name) -> const rhi::Image* { /* ... */ };
+externals.buffer = [&](const std::string& name) -> const rhi::Buffer* { /* ... */ };
+externals.hostCallbacks["update.params"] = [](HostContext&) {};
+loaded->Restore(restored, externals);
+restored.Lower();   // 校验仍由 Lower 负责
+```
+
+- 外部资源只记 `external: "image" | "buffer"` 与可选 `asset` 清单键；`Restore` 时经 `ExternalBindings` 按名注入，缺失返回错误而非静默降级；记录了 asset 键时可回退到 `imageAsset` / `bufferAsset` 解析。
+- Host 回调以 `HostPassDesc::callbackKey` 关联；静态纹理由 `staticImage` / `staticImageAsset` 解析，`Build` 按声明顺序重新注册堆 slot。
+- 模块文档的固定引用只持久化资产键不存句柄，`Restore` 时可只重建未初始化定义，或传入 `FixedBindings` 完成初始化后直接实例化。
+- 输出为字段顺序固定的 JSON，可直接 diff，round-trip 逐字节一致。
+- 模块实例按展开后的扁平声明保存在图文档里，模块定义本身由模块文档单独持久化。
+
+## 13. Pass 类型参考
+
+| 类型 | Desc | 关键字段 |
+|---|---|---|
+| `Pass::Render` | `RenderPassDesc` | 附件、`ShaderBinding`、顶点/索引流、viewport、`PipelineDesc` |
+| `Pass::Compute` | `ComputePassDesc` | compute shader、工作组数、间接派发 buffer |
+| `Pass::Host` | `HostPassDesc` | CPU 回调（运行期可用 `SetCallback` 覆盖） |
+| `Pass::Transfer` | `TransferPassDesc` | Buffer↔Image、Buffer↔Buffer、Image↔Image、ClearImage；区域拷贝与 Blit |
+| `Pass::Mux` | `MuxPassDesc` | `alternatives` 候选名；零命令选择点 |
+| `Pass::Present` | `PresentPassDesc` | 只把被读图像转到 `PresentSrc` |
+
+资源类型：
+
+- `Resource::Image` / `Resource::Buffer`：Own（按 Desc 创建）或 Borrow（包装外部句柄，图不拥有）。
+- 静态只读纹理经 `DeclareStaticTexture` 进入固定 set 0 的 bindless 堆，一次绑定长期有效，不参与图内 barrier 与别名。
+
+### 细分 / 几何着色器
+
+`PipelineDesc` 支持 Vertex + TessControl + TessEval + [Geometry] + Fragment 完整组合：
+
+```cpp
+desc.pipeline.shaderRefs = { "tess.vert", "tess.tesc", "tess.tese", "tess.geom", "tess.frag" };
+desc.pipeline.topology = PrimitiveTopology::PatchList; // 细分管线必须
+desc.pipeline.tessPatchControlPoints = 3;              // 1..maxTessellationPatchSize
+```
+
+创建管线时校验：设备支持 `tessellationShader` / `geometryShader`；TessControl 与 TessEval 成对；细分管线必须 `PatchList`；控制点数在设备上限内。Task/Mesh 阶段仍为预留。
