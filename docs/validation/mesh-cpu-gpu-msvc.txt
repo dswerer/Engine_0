@@ -1,0 +1,65 @@
+UpdateCTestConfiguration  from :D:/code/C++/Engine_0-main/out/mesh-render-msvc/DartConfiguration.tcl
+Parse Config file:D:/code/C++/Engine_0-main/out/mesh-render-msvc/DartConfiguration.tcl
+Test project D:/code/C++/Engine_0-main/out/mesh-render-msvc
+Constructing a list of tests
+Done constructing a list of tests
+Updating test list for fixtures
+Added 0 tests to meet fixture requirements
+Checking test dependency graph...
+Checking test dependency graph end
+test 1
+    Start 1: mesh.gpu_smoke
+
+1: Test command: D:\code\C++\Engine_0-main\out\mesh-render-msvc\Engine_0\examples\cube_reflection\CubeReflection.exe "--smoke" "3"
+1: Working Directory: D:/code/C++/Engine_0-main/out/mesh-render-msvc
+1: Test timeout computed to be: 60
+1: Mesh: Cube vertices=24 indices=36 submeshes=1 sourceBinding=7 -> gpuBinding=0 draw.count=36 Validate=PASS
+1: Device: NVIDIA GeForce RTX 5060 Laptop GPU
+1: Static heap tier: bindless
+1: Environment texture uploaded: D:/code/C++/Engine_0-main/Engine_0/examples/cube_reflection/../../assets/skyview.jpg 900x403 ch=3
+1: Mesh pipeline compatibility=PASS
+1: Static texture heap ok: slot=0
+1: Smoke image: min=79 max=205 mean=120.762
+1: Mesh coverage pixels=339843/921600
+1: Cube reflection smoke PASS: out/cube_reflection_smoke.png
+1: Rendered frames=3
+1/4 Test #1: mesh.gpu_smoke ...................   Passed    0.75 sec
+test 2
+    Start 2: mesh.cpu
+
+2: Test command: D:\code\C++\Engine_0-main\out\mesh-render-msvc\tests\Engine0MeshTests.exe
+2: Working Directory: D:/code/C++/Engine_0-main/out/mesh-render-msvc/tests
+2: Test timeout computed to be: 1500
+2: Mesh checks passed: 68
+2/4 Test #2: mesh.cpu .........................   Passed    0.04 sec
+test 3
+    Start 3: mesh.draw_mapping
+
+3: Test command: D:\code\C++\Engine_0-main\out\mesh-render-msvc\tests\Engine0MeshDrawTests.exe
+3: Working Directory: D:/code/C++/Engine_0-main/out/mesh-render-msvc/tests
+3: Test timeout computed to be: 1500
+3: Mesh draw checks passed: 25
+3: Mesh pipeline checks passed: 28
+3/4 Test #3: mesh.draw_mapping ................   Passed    0.04 sec
+test 4
+    Start 4: mesh.inspect
+
+4: Test command: D:\code\C++\Engine_0-main\out\mesh-render-msvc\tests\Engine0MeshInspect.exe
+4: Working Directory: D:/code/C++/Engine_0-main/out/mesh-render-msvc/tests
+4: Test timeout computed to be: 1500
+4: Mesh: Cube
+4: vertices=24 indices=36 submeshes=1
+4: bounds.min=(-1,-1,-1) bounds.max=(1,1,1)
+4: Position0 sourceBinding=7 -> gpuBinding=0 location=0 offset=0
+4: Normal0 sourceBinding=7 -> gpuBinding=0 location=1 offset=12
+4: draw=DrawIndexed count=36 first=0 baseVertex=0 materialSlot=0
+4: Validate=PASS
+4: PipelineCompatible=PASS
+4/4 Test #4: mesh.inspect .....................   Passed    0.04 sec
+
+100% tests passed out of 4
+
+Label Time Summary:
+gpu    =   0.75 sec*proc (1 test)
+
+Total Test time (real) =   0.89 sec

@@ -2,6 +2,9 @@
 
 add_executable(CubeReflection
 	"main.cpp"
+	"CubeMesh.h"
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../Mesh.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../MeshDrawData.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/../../RenderGraph.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/../../RenderGraphBuilder.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/../../RenderGraphNodes.cpp"
@@ -25,6 +28,14 @@ target_include_directories(CubeReflection PRIVATE
 
 set_property(TARGET CubeReflection PROPERTY CXX_STANDARD 20)
 set_property(TARGET CubeReflection PROPERTY CXX_STANDARD_REQUIRED ON)
+
+# GPU verification is opt-in so ordinary CPU tests do not require a Vulkan device.
+option(ENGINE0_ENABLE_GPU_TESTS "Register the Mesh Vulkan smoke test with CTest" OFF)
+if(BUILD_TESTING AND ENGINE0_ENABLE_GPU_TESTS)
+	add_test(NAME mesh.gpu_smoke COMMAND CubeReflection --smoke 3)
+	set_tests_properties(mesh.gpu_smoke PROPERTIES LABELS gpu TIMEOUT 60
+		WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+endif()
 
 if (MSVC)
 	target_compile_options(CubeReflection PRIVATE /utf-8)

@@ -6,6 +6,7 @@ add_executable(Retrieve
 	"AssimpMesh.cpp"
 	"FrameData.h"
 	"Camera.h"
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../Mesh.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/../../RenderGraph.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/../../RenderGraphBuilder.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/../../RenderGraphNodes.cpp"

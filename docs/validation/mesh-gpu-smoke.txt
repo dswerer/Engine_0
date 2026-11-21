@@ -1,0 +1,10 @@
+Mesh: Cube vertices=24 indices=36 submeshes=1 sourceBinding=7 -> gpuBinding=0 draw.count=36 Validate=PASS
+Device: NVIDIA GeForce RTX 5060 Laptop GPU
+Static heap tier: bindless
+Environment texture uploaded: D:/code/C++/Engine_0-main/Engine_0/examples/cube_reflection/../../assets/skyview.jpg 900x403 ch=3
+Mesh pipeline compatibility=PASS
+Static texture heap ok: slot=0
+Smoke image: min=79 max=205 mean=120.762
+Mesh coverage pixels=339843/921600
+Cube reflection smoke PASS: out/cube_reflection_smoke.png
+Rendered frames=3
