@@ -1,0 +1,45 @@
+UpdateCTestConfiguration  from :D:/code/C++/Engine_0-main/out/mesh-tests-gcc/DartConfiguration.tcl
+Parse Config file:D:/code/C++/Engine_0-main/out/mesh-tests-gcc/DartConfiguration.tcl
+Test project D:/code/C++/Engine_0-main/out/mesh-tests-gcc
+Constructing a list of tests
+Done constructing a list of tests
+Updating test list for fixtures
+Added 0 tests to meet fixture requirements
+Checking test dependency graph...
+Checking test dependency graph end
+test 1
+    Start 1: mesh.cpu
+
+1: Test command: D:\code\C++\Engine_0-main\out\mesh-tests-gcc\tests\Engine0MeshTests.exe
+1: Working Directory: D:/code/C++/Engine_0-main/out/mesh-tests-gcc/tests
+1: Test timeout computed to be: 1500
+1: Mesh checks passed: 68
+1/3 Test #1: mesh.cpu .........................   Passed    0.11 sec
+test 2
+    Start 2: mesh.draw_mapping
+
+2: Test command: D:\code\C++\Engine_0-main\out\mesh-tests-gcc\tests\Engine0MeshDrawTests.exe
+2: Working Directory: D:/code/C++/Engine_0-main/out/mesh-tests-gcc/tests
+2: Test timeout computed to be: 1500
+2: Mesh draw checks passed: 25
+2: Mesh pipeline checks passed: 28
+2/3 Test #2: mesh.draw_mapping ................   Passed    0.11 sec
+test 3
+    Start 3: mesh.inspect
+
+3: Test command: D:\code\C++\Engine_0-main\out\mesh-tests-gcc\tests\Engine0MeshInspect.exe
+3: Working Directory: D:/code/C++/Engine_0-main/out/mesh-tests-gcc/tests
+3: Test timeout computed to be: 1500
+3: Mesh: Cube
+3: vertices=24 indices=36 submeshes=1
+3: bounds.min=(-1,-1,-1) bounds.max=(1,1,1)
+3: Position0 sourceBinding=7 -> gpuBinding=0 location=0 offset=0
+3: Normal0 sourceBinding=7 -> gpuBinding=0 location=1 offset=12
+3: draw=DrawIndexed count=36 first=0 baseVertex=0 materialSlot=0
+3: Validate=PASS
+3: PipelineCompatible=PASS
+3/3 Test #3: mesh.inspect .....................   Passed    0.11 sec
+
+100% tests passed out of 3
+
+Total Test time (real) =   0.34 sec

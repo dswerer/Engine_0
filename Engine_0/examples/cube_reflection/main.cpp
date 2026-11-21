@@ -7,6 +7,8 @@
 #include "ContentResolver.h"
 #include "ShaderLibrary.h"
 #include "rhi/RHI.h"
+#include "MeshDrawData.h"
+#include "CubeMesh.h"
 
 #include "stb_image/stb_image.h"
 #include "stb_image/stb_image_write.h"
@@ -46,10 +48,10 @@ namespace {
 constexpr uint32_t kWidth = 1280;
 constexpr uint32_t kHeight = 720;
 constexpr float    kFovY = 45.0f;
-constexpr float    kCubeHalfSize = 1.0f;
 
 struct Options {
 	bool     smoke = false;
+	bool     limitFrames = false;
 	uint32_t frames = 30;
 };
 
@@ -63,48 +65,6 @@ struct SceneUniforms {
 	glm::vec4 resolution; // x,y = 像素尺寸；z = tan(fov/2)
 };
 static_assert(sizeof(SceneUniforms) == 208, "SceneUniforms 必须与 GLSL std140 布局一致");
-
-struct CubeVertex {
-	glm::vec3 position;
-	glm::vec3 normal;
-};
-
-// 单位立方体：每面 4 个顶点，法线逐面显式给出
-void BuildCube(vector<CubeVertex>& vertices, vector<uint32_t>& indices) {
-	struct Face {
-		glm::vec3 normal;
-		glm::vec3 u;
-		glm::vec3 v;
-	};
-	const Face faces[6] = {
-		{ { 1, 0, 0}, { 0, 0,-1}, { 0, 1, 0} },
-		{ {-1, 0, 0}, { 0, 0, 1}, { 0, 1, 0} },
-		{ { 0, 1, 0}, { 1, 0, 0}, { 0, 0,-1} },
-		{ { 0,-1, 0}, { 1, 0, 0}, { 0, 0, 1} },
-		{ { 0, 0, 1}, { 1, 0, 0}, { 0, 1, 0} },
-		{ { 0, 0,-1}, {-1, 0, 0}, { 0, 1, 0} },
-	};
-	vertices.clear();
-	indices.clear();
-	const float s = kCubeHalfSize;
-	for (int f = 0; f < 6; ++f) {
-		const glm::vec3 base = faces[f].normal * s;
-		const glm::vec3 u = faces[f].u * s;
-		const glm::vec3 v = faces[f].v * s;
-		const glm::vec3 corners[4] = {
-			base - u - v, base + u - v, base + u + v, base - u + v
-		};
-		const uint32_t first = static_cast<uint32_t>(vertices.size());
-		for (int c = 0; c < 4; ++c)
-			vertices.push_back(CubeVertex{ corners[c], faces[f].normal });
-		indices.push_back(first + 0);
-		indices.push_back(first + 1);
-		indices.push_back(first + 2);
-		indices.push_back(first + 0);
-		indices.push_back(first + 2);
-		indices.push_back(first + 3);
-	}
-}
 
 // 用一次性 Host + Transfer 通道把全景图上传为 ShaderReadOnly 采样纹理
 unique_ptr<rhi::Image> UploadEnvironment(rhi::Device& device, const string& path) {
@@ -131,7 +91,8 @@ unique_ptr<rhi::Image> UploadEnvironment(rhi::Device& device, const string& path
 	return env;
 }
 
-bool BuildFrameGraph(RenderGraph& graph,
+bool BuildFrameGraph(RenderGraph& graph, const Mesh& cubeMesh,
+	const vector<MeshShaderInput>& cubeInputs, const MeshDrawData& cubeDraw,
 	const rhi::Buffer* vertexBuffer, const rhi::Buffer* indexBuffer,
 	const rhi::Image* envTexture, const rhi::Image* backbuffer, bool smoke, bool useHeap) {
 	RenderGraphBuilder builder;
@@ -143,7 +104,7 @@ bool BuildFrameGraph(RenderGraph& graph,
 	builder.DeclareBufferResource("SceneUniforms", uboDesc);
 
 	builder.DeclareBufferResource("CubeVB", vertexBuffer);
-	builder.DeclareBufferResource("CubeIB", indexBuffer);
+	if (cubeDraw.indexType) builder.DeclareBufferResource("CubeIB", indexBuffer);
 
 	ImageOptions envOptions;
 	envOptions.initialLayout = rhi::ImageLayout::ShaderReadOnly;
@@ -204,19 +165,31 @@ bool BuildFrameGraph(RenderGraph& graph,
 		cubeDesc.attachments.push_back(depth);
 
 		cubeDesc.pipeline.shaderRefs = { "cube.vert", "cube.frag" };
+		cubeDesc.pipeline.vertexBindings = cubeDraw.vertexBindings;
+		cubeDesc.pipeline.vertexAttributes = cubeDraw.vertexAttributes;
+		cubeDesc.pipeline.topology = cubeDraw.topology;
+		cubeDesc.pipeline.tessPatchControlPoints = cubeDraw.patchControlPoints;
 		cubeDesc.pipeline.cullMode = CullMode::None;
 		cubeDesc.pipeline.depthStencil.depthTestEnable = true;
 		cubeDesc.pipeline.depthStencil.depthWriteEnable = true;
 		cubeDesc.pipeline.depthStencil.depthCompareOp = CompareOp::LessEqual;
 
+		string pipelineError;
+		if (!ValidateMeshPipeline(cubeMesh, 0, cubeInputs, cubeDesc.pipeline, &pipelineError)) {
+			cerr << pipelineError << '\n';
+			return false;
+		}
+		cout << "Mesh pipeline compatibility=PASS\n";
+
 		cubeDesc.shaderBindings = {
 			ShaderBinding::Uniform("SceneUniforms"),
 			ShaderBinding::Sampled("EnvTexture", envSampler) };
 		cubeDesc.vertexStreams.push_back(VertexStreamBinding{ "CubeVB", {}, 0 });
-		cubeDesc.indexStream = IndexStreamBinding{ "CubeIB", {}, 0, IndexType::UInt32 };
+		if (cubeDraw.indexType)
+			cubeDesc.indexStream = IndexStreamBinding{ "CubeIB", {}, 0, *cubeDraw.indexType };
 	}
-	builder.DeclarePass("Cube", { "SceneUniforms", "EnvTexture", "CubeVB", "CubeIB" },
-		{ "SceneColor", "Depth" }, Pass::Render, cubeDesc);
+	// 顶点和索引缓冲的读依赖由绑定描述导出。
+	builder.DeclarePass("Cube", Pass::Render, cubeDesc);
 
 	RenderPassDesc compositeDesc;
 	{
@@ -249,7 +222,7 @@ bool BuildFrameGraph(RenderGraph& graph,
 		{ "Backbuffer" }, Pass::Render, compositeDesc);
 
 	if (smoke)
-		builder.DeclarePass("Capture", { "Backbuffer" }, {}, Pass::Host, HostPassDesc{});
+		builder.DeclarePass("Capture", { "Backbuffer", "SceneColor" }, {}, Pass::Host, HostPassDesc{});
 	else
 		builder.DeclarePass("Present", { "Backbuffer" }, {}, Pass::Present, PresentPassDesc{});
 
@@ -277,10 +250,7 @@ bool BuildFrameGraph(RenderGraph& graph,
 		DrawSource draw;
 		draw.kind = DrawSource::Direct;
 		if (p->get_name() == "Cube") {
-			draw.count = 36;
-			draw.first = 0;
-			draw.vertexOffset = 0;
-			draw.instanceCount = 1;
+			draw = cubeDraw.draw;
 		}
 		else {
 			draw.count = 3;
@@ -298,6 +268,7 @@ int main(int argc, char** argv) {
 	for (int i = 1; i < argc; ++i) {
 		if (std::strcmp(argv[i], "--smoke") == 0) {
 			options.smoke = true;
+			options.limitFrames = true;
 			if (i + 1 < argc) {
 				const int n = std::atoi(argv[i + 1]);
 				if (n > 0) {
@@ -306,7 +277,32 @@ int main(int argc, char** argv) {
 				}
 			}
 		}
+		else if (std::strcmp(argv[i], "--frames") == 0) {
+			if (i + 1 >= argc || std::atoi(argv[i + 1]) <= 0) {
+				cerr << "--frames 需要正整数\n";
+				return 2;
+			}
+			options.frames = static_cast<uint32_t>(std::atoi(argv[++i]));
+			options.limitFrames = true;
+		}
 	}
+
+	Mesh cubeMesh = examples::CreateCubeMesh();
+	MeshDrawData cubeDraw;
+	string meshError;
+	const vector<MeshShaderInput> cubeInputs = {
+		{VertexSemantic::Position, 0, 0, rhi::VertexFormat::Float3},
+		{VertexSemantic::Normal, 0, 1, rhi::VertexFormat::Float3}
+	};
+	if (!cubeMesh.RecalculateBounds(&meshError)
+		|| !BuildMeshDrawData(cubeMesh, 0, cubeInputs, cubeDraw, &meshError)) {
+		cerr << meshError << '\n';
+		return 1;
+	}
+	cout << "Mesh: " << cubeMesh.name << " vertices=" << cubeMesh.vertexCount
+	     << " indices=" << cubeMesh.indices->IndexCount() << " submeshes=" << cubeMesh.submeshes.size()
+	     << " sourceBinding=" << cubeDraw.sourceBindings[0] << " -> gpuBinding=0"
+	     << " draw.count=" << cubeDraw.draw.count << " Validate=PASS\n";
 
 	const string shaderDir = CUBE_REFLECTION_SHADER_DIR;
 	const string assetDir = CUBE_REFLECTION_ASSET_DIR;
@@ -321,7 +317,9 @@ int main(int argc, char** argv) {
 		glfwInitialized = true;
 		glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
 		glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
-		window = glfwCreateWindow(kWidth, kHeight, "Engine_0 cube reflection", nullptr, nullptr);
+		const string title = "Engine_0 Mesh: " + cubeMesh.name + " | " + to_string(cubeMesh.vertexCount)
+			+ " vertices | " + to_string(cubeMesh.indices->IndexCount()) + " indices";
+		window = glfwCreateWindow(kWidth, kHeight, title.c_str(), nullptr, nullptr);
 		if (window == nullptr) {
 			cerr << "窗口创建失败\n";
 			glfwTerminate();
@@ -376,19 +374,16 @@ int main(int argc, char** argv) {
 		return 1;
 	}
 
-	vector<CubeVertex> vertices;
-	vector<uint32_t> indices;
-	BuildCube(vertices, indices);
-
-	auto vertexBuffer = device->UploadBuffer(vertices.data(),
-		static_cast<uint64_t>(vertices.size() * sizeof(CubeVertex)), rhi::BufferUsage::Vertex,
+	const auto& vertexBytes = cubeMesh.FindVertexStream(cubeDraw.sourceBindings[0])->bytes;
+	auto vertexBuffer = device->UploadBuffer(vertexBytes.data(),
+		static_cast<uint64_t>(vertexBytes.size()), rhi::BufferUsage::Vertex,
 		rhi::PipelineStage::VertexInput, rhi::Access::VertexAttributeRead);
 	if (!vertexBuffer) {
 		cerr << "顶点缓冲创建失败\n";
 		return 1;
 	}
-	auto indexBuffer = device->UploadBuffer(indices.data(),
-		static_cast<uint64_t>(indices.size() * sizeof(uint32_t)), rhi::BufferUsage::Index,
+	auto indexBuffer = device->UploadBuffer(cubeMesh.indices->bytes.data(),
+		static_cast<uint64_t>(cubeMesh.indices->bytes.size()), rhi::BufferUsage::Index,
 		rhi::PipelineStage::VertexInput, rhi::Access::IndexRead);
 	if (!indexBuffer) {
 		cerr << "索引缓冲创建失败\n";
@@ -425,12 +420,14 @@ int main(int argc, char** argv) {
 	bool captureRequested = false;
 	bool captured = false;
 	vector<unsigned char> capturedPixels;
+	vector<unsigned char> capturedScenePixels;
 	uint32_t renderedFrames = 0;
 
 	using Clock = std::chrono::steady_clock;
 	const auto startTime = Clock::now();
 
 	while (true) {
+		if (options.limitFrames && renderedFrames >= options.frames) break;
 		if (window != nullptr) {
 			if (glfwWindowShouldClose(window))
 				break;
@@ -446,7 +443,7 @@ int main(int argc, char** argv) {
 
 		if (!graphReady) {
 			graph.emplace(device.get(), &shaders);
-			if (!BuildFrameGraph(*graph, vertexBuffer.get(), indexBuffer.get(),
+			if (!BuildFrameGraph(*graph, cubeMesh, cubeInputs, cubeDraw, vertexBuffer.get(), indexBuffer.get(),
 				envTexture.get(), currentFrame.has_value() ? currentFrame->backbuffer : nullptr,
 				options.smoke, useHeap)) {
 				return 1;
@@ -462,6 +459,10 @@ int main(int argc, char** argv) {
 							std::memcpy(capturedPixels.data(), px, capturedPixels.size());
 							captured = true;
 						}
+						if (void* px = ctx.ReadImage("SceneColor")) {
+							capturedScenePixels.resize(static_cast<size_t>(kWidth) * kHeight * 4);
+							std::memcpy(capturedScenePixels.data(), px, capturedScenePixels.size());
+						}
 					}
 					ctx.SignalGpu();
 				});
@@ -472,7 +473,7 @@ int main(int argc, char** argv) {
 			graph->RetargetBorrowedImage("Backbuffer", currentFrame->backbuffer);
 		}
 
-		const float now = std::chrono::duration<float>(Clock::now() - startTime).count();
+		const float now = options.smoke ? 0.75f : std::chrono::duration<float>(Clock::now() - startTime).count();
 
 		glm::mat4 model = glm::rotate(glm::mat4(1.0f), now * 0.8f, glm::vec3(0.0f, 1.0f, 0.0f));
 		model = glm::rotate(model, now * 0.45f, glm::vec3(1.0f, 0.0f, 0.0f));
@@ -520,8 +521,9 @@ int main(int argc, char** argv) {
 		++renderedFrames;
 	}
 
+	bool smokeOk = !options.smoke;
 	if (options.smoke) {
-		if (!captured || capturedPixels.empty()) {
+		if (!captured || capturedPixels.empty() || capturedScenePixels.empty()) {
 			cerr << "Cube reflection smoke FAILED: 未捕获到输出图像\n";
 		}
 		else {
@@ -536,15 +538,21 @@ int main(int argc, char** argv) {
 				sumLuma += luma;
 			}
 			const double meanLuma = sumLuma / (static_cast<double>(kWidth) * kHeight);
+			size_t cubePixels = 0;
+			for (size_t i = 3; i < capturedScenePixels.size(); i += 4)
+				if (capturedScenePixels[i] > 127) ++cubePixels;
 
 			std::filesystem::create_directories("out");
 			const string outputPath = "out/cube_reflection_smoke.png";
-			stbi_write_png(outputPath.c_str(), static_cast<int>(kWidth), static_cast<int>(kHeight),
-				4, capturedPixels.data(), static_cast<int>(kWidth) * 4);
+			const bool written = stbi_write_png(outputPath.c_str(), static_cast<int>(kWidth), static_cast<int>(kHeight),
+				4, capturedPixels.data(), static_cast<int>(kWidth) * 4) != 0;
+			smokeOk = written && maxLuma > minLuma && cubePixels > 0
+				&& cubePixels < static_cast<size_t>(kWidth) * kHeight;
 
 			cout << "Smoke image: min=" << minLuma << " max=" << maxLuma
 			     << " mean=" << meanLuma << "\n";
-			cout << "Cube reflection smoke ok: wrote " << outputPath << "\n";
+			cout << "Mesh coverage pixels=" << cubePixels << '/' << kWidth * kHeight << '\n';
+			cout << "Cube reflection smoke " << (smokeOk ? "PASS" : "FAIL") << ": " << outputPath << "\n";
 		}
 	}
 
@@ -556,5 +564,6 @@ int main(int argc, char** argv) {
 	}
 	device->WaitIdle();
 	if (glfwInitialized) glfwTerminate();
-	return 0;
+	cout << "Rendered frames=" << renderedFrames << '\n';
+	return smokeOk ? 0 : 1;
 }

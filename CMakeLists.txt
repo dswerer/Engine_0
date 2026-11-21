@@ -11,5 +11,13 @@ endif()
 
 project ("Engine_0")
 
-# 包含子项目。
-add_subdirectory ("Engine_0")
+option(ENGINE0_BUILD_RENDERER "Build the Vulkan renderer and its enabled examples" ON)
+include(CTest)
+
+if(ENGINE0_BUILD_RENDERER)
+  add_subdirectory ("Engine_0")
+endif()
+
+if(BUILD_TESTING)
+  add_subdirectory(tests)
+endif()

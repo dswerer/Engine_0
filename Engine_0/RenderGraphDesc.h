@@ -246,7 +246,7 @@ namespace dEngine {
 		std::vector<ShaderBinding> shaderBindings;
 		// 逻辑名（ShaderLibrary 登记键）：非空时优先于 shader 的直接路径
 		std::string                shaderRef;
-		ShaderStageDesc            shader { rhi::ShaderStage::Compute, {} };
+		ShaderStageDesc            shader { rhi::ShaderStage::Compute, {}, {}, "main" };
 		uint32_t                   pushConstantSize = 0;
 		uint32_t                   groupCountX = 1;
 		uint32_t                   groupCountY = 1;

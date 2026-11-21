@@ -6,6 +6,10 @@
 add_executable (Engine_0 
 "Engine_0.cpp" 
 "Engine_0.h" 
+"Mesh.h"
+"Mesh.cpp"
+"MeshDrawData.h"
+"MeshDrawData.cpp"
 "ContentResolver.h"
 "ContentResolver.cpp"
 "ShaderLibrary.h"
@@ -147,7 +151,13 @@ else()
 endif()
 
 # 示例：独立可执行目标
-add_subdirectory("examples/retrieve")
-add_subdirectory("examples/cube_reflection")
+option(ENGINE0_BUILD_RETRIEVE "Build the Assimp retrieve example" ON)
+option(ENGINE0_BUILD_CUBE_REFLECTION "Build the Mesh cube reflection example" ON)
+if(ENGINE0_BUILD_RETRIEVE)
+	add_subdirectory("examples/retrieve")
+endif()
+if(ENGINE0_BUILD_CUBE_REFLECTION)
+	add_subdirectory("examples/cube_reflection")
+endif()
 
 # TODO: 如有需要，请添加测试并安装目标。
