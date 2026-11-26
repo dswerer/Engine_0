@@ -111,21 +111,25 @@ int main() {
 		Check(data.indexType == rhi::IndexType::UInt16 && data.draw.first == 1
 			&& data.draw.count == 3 && data.draw.vertexOffset == -1, "range units and signed offset are preserved");
 		shifted.submeshes[0].topology = rhi::PrimitiveTopology::PatchList;
+		shifted.submeshes[0].patchControlPoints = 1;
 		Check(BuildMeshDrawData(shifted, 0, inputs, data) && data.topology == rhi::PrimitiveTopology::PatchList
-			&& data.patchControlPoints == 3, "patch topology reaches pipeline preparation");
+			&& data.patchControlPoints == 1, "patch topology and control point count reach pipeline preparation");
 		error = "previous failure";
 		Check(BuildMeshDrawData(mesh, 0, inputs, data, &error) && error.empty(), "success clears stale error");
 		const int mappingChecks = checks;
 		auto MakePipeline = [](const MeshDrawData& geometry) {
 			PipelineDesc pipeline;
 			pipeline.shaderRefs = {"cube.vert", "cube.frag"};
-			pipeline.vertexBindings = geometry.vertexBindings;
-			pipeline.vertexAttributes = geometry.vertexAttributes;
-			pipeline.topology = geometry.topology;
-			pipeline.tessPatchControlPoints = geometry.patchControlPoints;
+			pipeline.cullMode = rhi::CullMode::None;
+			pipeline.depthStencil.depthTestEnable = true;
+			pipeline.pushConstantSize = 16;
+			ApplyMeshPipeline(geometry, pipeline);
 			return pipeline;
 		};
 		const PipelineDesc pipeline = MakePipeline(data);
+		Check(pipeline.shaderRefs == std::vector<std::string>{"cube.vert", "cube.frag"}
+			&& pipeline.cullMode == rhi::CullMode::None && pipeline.depthStencil.depthTestEnable
+			&& pipeline.pushConstantSize == 16, "automatic mesh geometry preserves technique state");
 		error = "previous failure";
 		Check(ValidateMeshPipeline(mesh, 0, inputs, pipeline, &error) && error.empty(),
 			"actual pipeline matches mesh geometry and clears old error");

@@ -8,8 +8,10 @@
 
 namespace dEngine::examples {
 
+	enum class CubeVertexStreams { Interleaved, Separate };
+
 	// 窗口示例、CPU 检查程序和测试共同使用同一份几何生成代码。
-	inline Mesh CreateCubeMesh() {
+	inline Mesh CreateCubeMesh(CubeVertexStreams storage = CubeVertexStreams::Interleaved) {
 		struct Vertex { glm::vec3 position; glm::vec3 normal; };
 		static_assert(std::is_standard_layout_v<Vertex> && std::is_trivially_copyable_v<Vertex>);
 		struct Face { glm::vec3 normal; glm::vec3 u; glm::vec3 v; };
@@ -40,11 +42,26 @@ namespace dEngine::examples {
 			{VertexSemantic::Position, 0, 7, rhi::VertexFormat::Float3, static_cast<uint32_t>(offsetof(Vertex, position))},
 			{VertexSemantic::Normal, 0, 7, rhi::VertexFormat::Float3, static_cast<uint32_t>(offsetof(Vertex, normal))}
 		};
-		VertexStreamData stream;
-		stream.binding = 7;
-		stream.bytes.resize(vertices.size() * sizeof(Vertex));
-		std::memcpy(stream.bytes.data(), vertices.data(), stream.bytes.size());
-		mesh.vertexStreams.push_back(std::move(stream));
+		if (storage == CubeVertexStreams::Separate) {
+			constexpr uint32_t stride = sizeof(glm::vec3);
+			mesh.layout.bindings = {{7, stride, false}, {2, stride, false}};
+			mesh.layout.attributes[0].offset = 0;
+			mesh.layout.attributes[1].binding = 2;
+			mesh.layout.attributes[1].offset = 0;
+			auto addStream = [&](uint32_t binding, glm::vec3 Vertex::*member) {
+				VertexStreamData stream{binding, std::vector<std::byte>(vertices.size() * stride)};
+				for (size_t i = 0; i < vertices.size(); ++i)
+					std::memcpy(stream.bytes.data() + i * stride, &(vertices[i].*member), stride);
+				mesh.vertexStreams.push_back(std::move(stream));
+			};
+			addStream(2, &Vertex::normal);
+			addStream(7, &Vertex::position);
+		}
+		else {
+			VertexStreamData stream{7, std::vector<std::byte>(vertices.size() * sizeof(Vertex))};
+			std::memcpy(stream.bytes.data(), vertices.data(), stream.bytes.size());
+			mesh.vertexStreams.push_back(std::move(stream));
+		}
 		mesh.indices = IndexData{rhi::IndexType::UInt32, std::vector<std::byte>(indices.size() * sizeof(uint32_t))};
 		std::memcpy(mesh.indices->bytes.data(), indices.data(), mesh.indices->bytes.size());
 		Submesh submesh;

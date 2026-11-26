@@ -7,7 +7,8 @@
 #include "ContentResolver.h"
 #include "ShaderLibrary.h"
 #include "rhi/RHI.h"
-#include "MeshDrawData.h"
+#include "MeshGpu.h"
+#include "MeshRenderGraph.h"
 #include "CubeMesh.h"
 
 #include "stb_image/stb_image.h"
@@ -31,6 +32,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #ifndef CUBE_REFLECTION_SHADER_DIR
@@ -91,9 +93,7 @@ unique_ptr<rhi::Image> UploadEnvironment(rhi::Device& device, const string& path
 	return env;
 }
 
-bool BuildFrameGraph(RenderGraph& graph, const Mesh& cubeMesh,
-	const vector<MeshShaderInput>& cubeInputs, const MeshDrawData& cubeDraw,
-	const rhi::Buffer* vertexBuffer, const rhi::Buffer* indexBuffer,
+bool BuildFrameGraph(RenderGraph& graph, const MeshGpu& cubeMesh,
 	const rhi::Image* envTexture, const rhi::Image* backbuffer, bool smoke, bool useHeap) {
 	RenderGraphBuilder builder;
 
@@ -102,9 +102,6 @@ bool BuildFrameGraph(RenderGraph& graph, const Mesh& cubeMesh,
 	uboDesc.usage = rhi::BufferUsage::Uniform;
 	uboDesc.hostVisible = true;
 	builder.DeclareBufferResource("SceneUniforms", uboDesc);
-
-	builder.DeclareBufferResource("CubeVB", vertexBuffer);
-	if (cubeDraw.indexType) builder.DeclareBufferResource("CubeIB", indexBuffer);
 
 	ImageOptions envOptions;
 	envOptions.initialLayout = rhi::ImageLayout::ShaderReadOnly;
@@ -165,31 +162,27 @@ bool BuildFrameGraph(RenderGraph& graph, const Mesh& cubeMesh,
 		cubeDesc.attachments.push_back(depth);
 
 		cubeDesc.pipeline.shaderRefs = { "cube.vert", "cube.frag" };
-		cubeDesc.pipeline.vertexBindings = cubeDraw.vertexBindings;
-		cubeDesc.pipeline.vertexAttributes = cubeDraw.vertexAttributes;
-		cubeDesc.pipeline.topology = cubeDraw.topology;
-		cubeDesc.pipeline.tessPatchControlPoints = cubeDraw.patchControlPoints;
 		cubeDesc.pipeline.cullMode = CullMode::None;
 		cubeDesc.pipeline.depthStencil.depthTestEnable = true;
 		cubeDesc.pipeline.depthStencil.depthWriteEnable = true;
 		cubeDesc.pipeline.depthStencil.depthCompareOp = CompareOp::LessEqual;
 
-		string pipelineError;
-		if (!ValidateMeshPipeline(cubeMesh, 0, cubeInputs, cubeDesc.pipeline, &pipelineError)) {
-			cerr << pipelineError << '\n';
-			return false;
-		}
-		cout << "Mesh pipeline compatibility=PASS\n";
-
 		cubeDesc.shaderBindings = {
 			ShaderBinding::Uniform("SceneUniforms"),
 			ShaderBinding::Sampled("EnvTexture", envSampler) };
-		cubeDesc.vertexStreams.push_back(VertexStreamBinding{ "CubeVB", {}, 0 });
-		if (cubeDraw.indexType)
-			cubeDesc.indexStream = IndexStreamBinding{ "CubeIB", {}, 0, *cubeDraw.indexType };
+	}
+	const vector<MeshShaderInput> cubeInputs = {
+		{VertexSemantic::Position, 0, 0, rhi::VertexFormat::Float3},
+		{VertexSemantic::Normal, 0, 1, rhi::VertexFormat::Float3}
+	};
+	string meshError;
+	const auto cubeDraw = BindMeshGeometry(builder, cubeDesc, "CubeGeometry", cubeMesh, 0, cubeInputs, &meshError);
+	if (!cubeDraw) {
+		cerr << meshError << '\n';
+		return false;
 	}
 	// 顶点和索引缓冲的读依赖由绑定描述导出。
-	builder.DeclarePass("Cube", Pass::Render, cubeDesc);
+	builder.DeclarePass("Cube", Pass::Render, std::move(cubeDesc));
 
 	RenderPassDesc compositeDesc;
 	{
@@ -226,13 +219,12 @@ bool BuildFrameGraph(RenderGraph& graph, const Mesh& cubeMesh,
 	else
 		builder.DeclarePass("Present", { "Backbuffer" }, {}, Pass::Present, PresentPassDesc{});
 
-	LowerResult lower = builder.Lower();
-	if (!lower.ok) {
+	LowerResult lower;
+	if (!builder.Build(graph, &lower)) {
 		for (const auto& diagnostic : lower.diagnostics)
 			cerr << "RenderGraphBuilder: " << diagnostic.message << "\n";
 		return false;
 	}
-	builder.Build(graph);
 	graph.ProcessRegister();
 	graph.GenerateSubmitSequence();
 	graph.RealizeAll();
@@ -243,21 +235,10 @@ bool BuildFrameGraph(RenderGraph& graph, const Mesh& cubeMesh,
 		cout << "Static texture heap ok: slot=" << envSlot << "\n";
 	}
 
-	for (uint32_t i = 0; graph.GetPass(i) != nullptr; ++i) {
-		Pass* p = graph.GetPass(i);
-		if (p->get_type() != Pass::Render)
-			continue;
-		DrawSource draw;
-		draw.kind = DrawSource::Direct;
-		if (p->get_name() == "Cube") {
-			draw = cubeDraw.draw;
-		}
-		else {
-			draw.count = 3;
-			draw.instanceCount = 1;
-		}
-		static_cast<RenderPass*>(p)->SetDraw(draw);
-	}
+	static_cast<RenderPass*>(graph.FindPass("Cube"))->SetDraw(*cubeDraw);
+	DrawSource fullscreenDraw;
+	fullscreenDraw.count = 3;
+	static_cast<RenderPass*>(graph.FindPass("Composite"))->SetDraw(fullscreenDraw);
 	return true;
 }
 
@@ -287,22 +268,12 @@ int main(int argc, char** argv) {
 		}
 	}
 
-	Mesh cubeMesh = examples::CreateCubeMesh();
-	MeshDrawData cubeDraw;
+	Mesh cubeMesh = examples::CreateCubeMesh(examples::CubeVertexStreams::Separate);
 	string meshError;
-	const vector<MeshShaderInput> cubeInputs = {
-		{VertexSemantic::Position, 0, 0, rhi::VertexFormat::Float3},
-		{VertexSemantic::Normal, 0, 1, rhi::VertexFormat::Float3}
-	};
-	if (!cubeMesh.RecalculateBounds(&meshError)
-		|| !BuildMeshDrawData(cubeMesh, 0, cubeInputs, cubeDraw, &meshError)) {
+	if (!cubeMesh.RecalculateBounds(&meshError)) {
 		cerr << meshError << '\n';
 		return 1;
 	}
-	cout << "Mesh: " << cubeMesh.name << " vertices=" << cubeMesh.vertexCount
-	     << " indices=" << cubeMesh.indices->IndexCount() << " submeshes=" << cubeMesh.submeshes.size()
-	     << " sourceBinding=" << cubeDraw.sourceBindings[0] << " -> gpuBinding=0"
-	     << " draw.count=" << cubeDraw.draw.count << " Validate=PASS\n";
 
 	const string shaderDir = CUBE_REFLECTION_SHADER_DIR;
 	const string assetDir = CUBE_REFLECTION_ASSET_DIR;
@@ -374,21 +345,16 @@ int main(int argc, char** argv) {
 		return 1;
 	}
 
-	const auto& vertexBytes = cubeMesh.FindVertexStream(cubeDraw.sourceBindings[0])->bytes;
-	auto vertexBuffer = device->UploadBuffer(vertexBytes.data(),
-		static_cast<uint64_t>(vertexBytes.size()), rhi::BufferUsage::Vertex,
-		rhi::PipelineStage::VertexInput, rhi::Access::VertexAttributeRead);
-	if (!vertexBuffer) {
-		cerr << "顶点缓冲创建失败\n";
+	const auto cubeGpu = UploadMesh(*device, cubeMesh, &meshError);
+	if (!cubeGpu) {
+		cerr << meshError << '\n';
+		if (window) glfwDestroyWindow(window);
+		if (glfwInitialized) glfwTerminate();
 		return 1;
 	}
-	auto indexBuffer = device->UploadBuffer(cubeMesh.indices->bytes.data(),
-		static_cast<uint64_t>(cubeMesh.indices->bytes.size()), rhi::BufferUsage::Index,
-		rhi::PipelineStage::VertexInput, rhi::Access::IndexRead);
-	if (!indexBuffer) {
-		cerr << "索引缓冲创建失败\n";
-		return 1;
-	}
+	cout << "Mesh: " << cubeMesh.name << " vertices=" << cubeMesh.vertexCount
+	     << " indices=" << cubeMesh.indices->IndexCount() << " submeshes=" << cubeMesh.submeshes.size()
+	     << " vertexStreams=" << cubeMesh.vertexStreams.size() << " uploaded\n";
 
 	// 俯视相机：从斜上方看向原点，画面中同时可见顶面与两个侧面
 	const glm::vec3 eye(0.0f, 3.3f, 2.0f);
@@ -443,7 +409,7 @@ int main(int argc, char** argv) {
 
 		if (!graphReady) {
 			graph.emplace(device.get(), &shaders);
-			if (!BuildFrameGraph(*graph, cubeMesh, cubeInputs, cubeDraw, vertexBuffer.get(), indexBuffer.get(),
+			if (!BuildFrameGraph(*graph, *cubeGpu,
 				envTexture.get(), currentFrame.has_value() ? currentFrame->backbuffer : nullptr,
 				options.smoke, useHeap)) {
 				return 1;

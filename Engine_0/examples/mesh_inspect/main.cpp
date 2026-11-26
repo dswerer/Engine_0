@@ -22,10 +22,7 @@ int main() {
 	}
 	PipelineDesc pipeline;
 	pipeline.shaderRefs = {"cube.vert", "cube.frag"};
-	pipeline.vertexBindings = render.vertexBindings;
-	pipeline.vertexAttributes = render.vertexAttributes;
-	pipeline.topology = render.topology;
-	pipeline.tessPatchControlPoints = render.patchControlPoints;
+	ApplyMeshPipeline(render, pipeline);
 	if (!ValidateMeshPipeline(mesh, 0, inputs, pipeline, &error)) {
 		std::cerr << error << '\n';
 		return 1;

@@ -272,12 +272,51 @@ namespace dEngine {
 		return it != vertexStreams.end() ? &*it : nullptr;
 	}
 
-	const MeshAttribute* Mesh::FindAttribute(VertexSemantic semantic, uint32_t semanticIndex) const {
-		const auto it = std::find_if(layout.attributes.begin(), layout.attributes.end(),
+	const MeshAttribute* VertexLayout::FindAttribute(VertexSemantic semantic, uint32_t semanticIndex) const {
+		const auto it = std::find_if(attributes.begin(), attributes.end(),
 			[&](const MeshAttribute& attribute) {
 				return attribute.semantic == semantic && attribute.semanticIndex == semanticIndex;
 			});
-		return it != layout.attributes.end() ? &*it : nullptr;
+		return it != attributes.end() ? &*it : nullptr;
+	}
+
+	const MeshAttribute* Mesh::FindAttribute(VertexSemantic semantic, uint32_t semanticIndex) const {
+		return layout.FindAttribute(semantic, semanticIndex);
+	}
+
+	std::optional<MeshDrawMetadata> detail::GetMeshDrawMetadata(const std::vector<Submesh>& submeshes,
+		size_t submeshIndex, std::optional<rhi::IndexType> indexType) {
+		if (submeshIndex >= submeshes.size()) return std::nullopt;
+		const auto& submesh = submeshes[submeshIndex];
+
+		MeshDrawMetadata metadata;
+		metadata.topology = submesh.topology;
+		metadata.patchControlPoints = submesh.patchControlPoints;
+		metadata.materialSlot = submesh.materialSlot;
+		metadata.localBounds = submesh.localBounds;
+		if (const auto* indexed = std::get_if<IndexedRange>(&submesh.range)) {
+			if (!indexType) return std::nullopt;
+			metadata.indexType = indexType;
+			metadata.count = indexed->indexCount;
+			metadata.first = indexed->firstIndex;
+			metadata.baseVertex = indexed->baseVertex;
+		}
+		else {
+			const auto& vertices = std::get<VertexRange>(submesh.range);
+			metadata.count = vertices.vertexCount;
+			metadata.first = vertices.firstVertex;
+		}
+		return metadata;
+	}
+
+	std::optional<MeshDrawMetadata> Mesh::GetDrawMetadata(size_t submeshIndex) const {
+		const auto metadata = detail::GetMeshDrawMetadata(submeshes, submeshIndex,
+			indices ? std::optional{indices->type} : std::nullopt);
+		if (!metadata || !ValidPrimitiveCount(submeshes[submeshIndex], metadata->count))
+			return std::nullopt;
+		const size_t elementCount = metadata->indexType ? indices->IndexCount() : vertexCount;
+		if (uint64_t(metadata->first) + metadata->count > elementCount) return std::nullopt;
+		return metadata;
 	}
 
 	bool Mesh::Validate(std::vector<std::string>* errors) const {

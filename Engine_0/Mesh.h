@@ -42,6 +42,8 @@ namespace dEngine {
 	struct VertexLayout {
 		std::vector<rhi::VertexInputBinding> bindings;
 		std::vector<MeshAttribute> attributes;
+
+		const MeshAttribute* FindAttribute(VertexSemantic semantic, uint32_t semanticIndex = 0) const;
 	};
 
 	// binding 显式对应 VertexLayout，不依赖 vertexStreams 的排列顺序。
@@ -82,6 +84,23 @@ namespace dEngine {
 		Aabb localBounds;
 	};
 
+	// 单个子网格的几何参数，可用于直接绘制或生成间接命令。
+	struct MeshDrawMetadata {
+		uint32_t count = 0; // 本条命令读取的索引数或顶点数
+		uint32_t first = 0; // firstIndex 或 firstVertex，按元素计数
+		int32_t baseVertex = 0; // IndexedRange 的有符号顶点偏移
+		std::optional<rhi::IndexType> indexType; // 有值时使用索引绘制
+		rhi::PrimitiveTopology topology = rhi::PrimitiveTopology::TriangleList;
+		uint32_t patchControlPoints = 3;
+		uint32_t materialSlot = 0;
+		Aabb localBounds;
+	};
+
+	namespace detail {
+		std::optional<MeshDrawMetadata> GetMeshDrawMetadata(const std::vector<Submesh>& submeshes,
+			size_t submeshIndex, std::optional<rhi::IndexType> indexType);
+	}
+
 	// 可共享的静态 CPU 几何资源，不持有对象变换、材质实例或 GPU 句柄。
 	// 修改顶点数据、布局或绘制范围后，需重新计算包围盒。
 	struct Mesh {
@@ -95,6 +114,9 @@ namespace dEngine {
 
 		const VertexStreamData* FindVertexStream(uint32_t binding) const;
 		const MeshAttribute* FindAttribute(VertexSemantic semantic, uint32_t semanticIndex = 0) const;
+
+		// O(1) 查询并检查所选范围。索引内容及包围盒的完整校验由 Validate 执行。
+		std::optional<MeshDrawMetadata> GetDrawMetadata(size_t submeshIndex) const;
 
 		// 创建或上传前校验：属性语义、统一流长度、拓扑、绘制范围及索引。
 		// 所有 Position0 坐标必须有限；子网格包围盒须覆盖其引用的顶点，Mesh 盒须包含所有子盒。

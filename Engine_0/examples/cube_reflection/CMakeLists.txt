@@ -5,6 +5,8 @@ add_executable(CubeReflection
 	"CubeMesh.h"
 	"${CMAKE_CURRENT_SOURCE_DIR}/../../Mesh.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/../../MeshDrawData.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../MeshGpu.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../MeshRenderGraph.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/../../RenderGraph.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/../../RenderGraphBuilder.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/../../RenderGraphNodes.cpp"

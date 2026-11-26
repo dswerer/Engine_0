@@ -63,15 +63,30 @@ int main() {
 		Check(Equal(mesh.submeshes[1].localBounds.min, {0, -1, -2}), "non-indexed bounds");
 		Check(mesh.FindVertexStream(7) == &mesh.vertexStreams[1]
 			&& mesh.FindVertexStream(99) == nullptr, "explicit binding lookup");
+		const auto indexedDraw = mesh.GetDrawMetadata(0);
+		Check(indexedDraw && indexedDraw->indexType == rhi::IndexType::UInt16
+			&& indexedDraw->first == 0 && indexedDraw->count == 3 && indexedDraw->baseVertex == 0,
+			"query UInt16 indexed command elements");
+		const auto vertexDraw = mesh.GetDrawMetadata(1);
+		Check(vertexDraw && !vertexDraw->indexType && vertexDraw->first == 1 && vertexDraw->count == 3
+			&& vertexDraw->baseVertex == 0 && vertexDraw->materialSlot == 1
+			&& Equal(vertexDraw->localBounds.min, mesh.submeshes[1].localBounds.min)
+			&& Equal(vertexDraw->localBounds.max, mesh.submeshes[1].localBounds.max),
+			"query non-indexed command and culling bounds from a mixed mesh");
+		Check(!mesh.GetDrawMetadata(mesh.submeshes.size()), "query rejects invalid submesh index");
 
 		Mesh shifted = MakeMesh();
-		const uint32_t shiftedIndices[] = {1, 2, 3};
+		const uint32_t shiftedIndices[] = {999, 1, 2, 3};
 		shifted.indices = IndexData{rhi::IndexType::UInt32, Bytes(shiftedIndices)};
 		shifted.submeshes.resize(1);
-		shifted.submeshes[0].range = IndexedRange{0, 3, -1};
+		shifted.submeshes[0].range = IndexedRange{1, 3, -1};
 		Check(shifted.RecalculateBounds() && shifted.Validate(), "valid negative baseVertex");
 		Check(Equal(shifted.localBounds.min, {-2, -1, 0}), "negative offset bounds");
-		shifted.submeshes[0].range = IndexedRange{0, 3, 1};
+		const auto shiftedDraw = shifted.GetDrawMetadata(0);
+		Check(shiftedDraw && shiftedDraw->indexType == rhi::IndexType::UInt32
+			&& shiftedDraw->first == 1 && shiftedDraw->count == 3 && shiftedDraw->baseVertex == -1,
+			"query keeps firstIndex in elements and baseVertex signed");
+		shifted.submeshes[0].range = IndexedRange{1, 3, 1};
 		Check(shifted.RecalculateBounds() && shifted.Validate(), "positive baseVertex");
 		Check(Equal(shifted.localBounds.max, {999, 999, 999}), "positive offset bounds");
 
@@ -93,6 +108,7 @@ int main() {
 		bad = mesh;
 		bad.submeshes[1].range = VertexRange{UINT32_MAX, 3};
 		Reject(bad, "vertex range addition overflow");
+		Check(!bad.GetDrawMetadata(1), "query rejects overflowing vertex range");
 		bad = mesh;
 		const uint32_t hugeIndices[] = {0, 1, UINT32_MAX};
 		bad.indices = IndexData{rhi::IndexType::UInt32, Bytes(hugeIndices)};
@@ -100,10 +116,12 @@ int main() {
 		bad = mesh;
 		bad.indices.reset();
 		Reject(bad, "missing index data");
+		Check(!bad.GetDrawMetadata(0) && bad.GetDrawMetadata(1), "only indexed query requires index data");
 		bad = mesh;
 		bad.indices->bytes.pop_back();
 		Check(bad.indices->IndexCount() == 0, "partial index count");
 		Reject(bad, "partial index bytes");
+		Check(!bad.GetDrawMetadata(0), "query rejects incomplete index storage");
 		bad = mesh;
 		bad.indices->type = static_cast<rhi::IndexType>(999);
 		Reject(bad, "invalid index enum without division by zero");

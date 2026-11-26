@@ -29,11 +29,11 @@ ctest --test-dir out/mesh-tests-root --output-on-failure -V
 
 | CTest 名称 | 覆盖内容 |
 |---|---|
-| mesh.cpu | 68 项几何检查：多流、索引/非索引、baseVertex、范围溢出、语义、多 UV/颜色、NaN/Inf、包围盒及失败不部分修改 |
-| mesh.draw_mapping | 25 项绘制适配检查，加 28 项实际 PipelineDesc 几何约束检查：stride、输入率、location/format/offset、拓扑、patch 大小、重复/额外输入及向量乱序 |
+| mesh.cpu | 75 项几何与元数据查询检查，覆盖多流、索引/非索引、baseVertex、范围溢出、语义、多 UV/颜色、NaN/Inf、包围盒及失败不部分修改 |
+| mesh.draw_mapping | 25 项绘制适配检查和 29 项管线检查，覆盖自动填充、技术状态保留、stride、输入率、location/format/offset、拓扑、patch 大小、重复/额外输入及向量乱序 |
 | mesh.inspect | 运行实际属性输出程序并检查成功状态 |
 
-68、25 和 28 是两个测试程序内部不同组的断言检查数量；CPU CTest 中是 3 个测试项，并不是 121 个独立 CTest 用例。两个断言程序在失败时返回非零状态，不依赖可能被 Release 构建禁用的 assert。
+这些数量对应测试程序内的断言。CTest 共注册 3 项 CPU 测试。两个断言程序在失败时返回非零状态，Release 构建也会执行检查。
 
 ## 查看可观测属性
 
@@ -58,7 +58,7 @@ PipelineCompatible=PASS
 
 ## 验证实际渲染
 
-CubeReflection 已使用同一个 CubeMesh 和 MeshDrawData 完成上传与绘制，并在 DeclarePass 前对实际 PipelineDesc 调用 ValidateMeshPipeline。需要本项目原有的 Vulkan SDK、GLFW 和 GLM；可关闭 Retrieve，避免本次测试额外依赖 Assimp。
+CubeReflection 使用源 binding 7 和 2 的双顶点流。测试通过 `UploadMesh` 和 `BindMeshGeometry` 覆盖整个上传、建图和绘制过程。运行该用例需要本项目原有的 Vulkan SDK、GLFW 和 GLM。可用 `ENGINE0_BUILD_RETRIEVE=OFF` 单独构建立方体示例。
 
 ```powershell
 cmake -S . -B out/mesh-render -G Ninja `
@@ -83,4 +83,6 @@ ctest --test-dir out/mesh-render --output-on-failure -V
 
 手动冒烟图像的 out 路径相对于运行时工作目录。SceneColor 的 alpha 清为 0，立方体片元写 1；测试要求覆盖像素大于 0 且小于全屏，避免只有环境背景也被当作几何绘制成功。缺失回读、图像写入失败或覆盖检查失败均返回非零状态。它是基础 GPU 冒烟，不替代所有材质/多物体场景验证。
 
-本次本机运行结果、日志副本和图像见 [Mesh 验证记录](../docs/Mesh验证记录.md)。
+启用 Assimp 并构建 Retrieve 后，可用 `Retrieve.exe --smoke 3` 运行共用 GPU 几何的阴影和主场景 Pass。
+
+此前的运行结果、日志副本和图像见 [Mesh 验证记录](../docs/Mesh验证记录.md)。

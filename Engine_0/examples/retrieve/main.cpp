@@ -12,6 +12,8 @@
 #include "ShaderLibrary.h"
 #include "rhi/RHI.h"
 #include "AssimpMesh.h"
+#include "MeshGpu.h"
+#include "MeshRenderGraph.h"
 #include "FrameData.h"
 #include "Camera.h"
 
@@ -37,6 +39,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #ifndef RETRIEVE_SHADER_DIR
@@ -379,13 +382,11 @@ bool PrecomputeAtmosphere(rhi::Device& device, const AtmosphereParams& params,
 	return true;
 }
 
-bool BuildFrameGraph(RenderGraph& graph, const rhi::Buffer* vb, const rhi::Buffer* ib,
-	uint32_t indexCount, const rhi::Buffer* atmoUBO, const rhi::Image* t2a,
+bool BuildFrameGraph(RenderGraph& graph, const MeshGpu& fishMesh,
+	const rhi::Buffer* atmoUBO, const rhi::Image* t2a,
 	const rhi::Image* ms, const rhi::Image* sa, const rhi::Image* backbuffer,
 	bool smoke, const RenderGraphModule& fishModule)
 {
-	(void)indexCount;
-
 	RenderGraphBuilder builder;
 
 	BufferDesc frameUBO;
@@ -428,9 +429,6 @@ bool BuildFrameGraph(RenderGraph& graph, const rhi::Buffer* vb, const rhi::Buffe
 		return false;
 	}
 
-	builder.DeclareBufferResource("FishVB", vb);
-	builder.DeclareBufferResource("FishIB", ib);
-
 	ImageDesc shadowMapDesc;
 	shadowMapDesc.width = kShadowSize;
 	shadowMapDesc.height = kShadowSize;
@@ -469,6 +467,11 @@ bool BuildFrameGraph(RenderGraph& graph, const rhi::Buffer* vb, const rhi::Buffe
 		builder.DeclareImageResource("Backbuffer", backbuffer, backOptions);
 	}
 
+	const vector<MeshShaderInput> fishInputs = {
+		{VertexSemantic::Position, 0, 0, rhi::VertexFormat::Float3},
+		{VertexSemantic::Normal, 0, 1, rhi::VertexFormat::Float3},
+		{VertexSemantic::TexCoord, 0, 2, rhi::VertexFormat::Float2}
+	};
 	RenderPassDesc shadowDesc0;
 	{
 		AttachmentBinding depth;
@@ -480,8 +483,6 @@ bool BuildFrameGraph(RenderGraph& graph, const rhi::Buffer* vb, const rhi::Buffe
 		shadowDesc0.attachments.push_back(depth);
 
 		shadowDesc0.pipeline.shaderRefs = { "shadow.vert", "fish.tesc", "fish.tese", "shadow.geom", "shadow.frag" };
-		shadowDesc0.pipeline.topology = PrimitiveTopology::PatchList;
-		shadowDesc0.pipeline.tessPatchControlPoints = 3;
 		shadowDesc0.pipeline.cullMode = CullMode::None;
 		shadowDesc0.pipeline.depthStencil.depthTestEnable = true;
 		shadowDesc0.pipeline.depthStencil.depthWriteEnable = true;
@@ -497,11 +498,14 @@ bool BuildFrameGraph(RenderGraph& graph, const rhi::Buffer* vb, const rhi::Buffe
 			ShaderBinding::Uniform("ShadowUniforms"),
 			ShaderBinding::Uniform("BoidsParams"),
 			ShaderBinding::StorageRead("fishes") };
-		shadowDesc0.vertexStreams.push_back(VertexStreamBinding{ "FishVB", {}, 0 });
-		shadowDesc0.indexStream = IndexStreamBinding{ "FishIB", {}, 0, IndexType::UInt32 };
 	}
-	builder.DeclarePass("Shadow", { "ShadowUniforms", "BoidsParams", "fishes", "FishVB", "FishIB" },
-		{ "shadowMap" }, Pass::Render, shadowDesc0);
+	string meshError;
+	auto shadowDraw = BindMeshGeometry(builder, shadowDesc0, "FishGeometry", fishMesh, 0, fishInputs, &meshError);
+	if (!shadowDraw) {
+		cerr << "Shadow: " << meshError << '\n';
+		return false;
+	}
+	builder.DeclarePass("Shadow", Pass::Render, std::move(shadowDesc0));
 
 	RenderPassDesc sceneDesc;
 	{
@@ -521,8 +525,6 @@ bool BuildFrameGraph(RenderGraph& graph, const rhi::Buffer* vb, const rhi::Buffe
 		sceneDesc.attachments.push_back(depth);
 
 		sceneDesc.pipeline.shaderRefs = { "fish.vert", "fish.tesc", "fish.tese", "fish.geom", "fish.frag" };
-		sceneDesc.pipeline.topology = PrimitiveTopology::PatchList;
-		sceneDesc.pipeline.tessPatchControlPoints = 3;
 		sceneDesc.pipeline.cullMode = CullMode::None;
 		sceneDesc.pipeline.depthStencil.depthTestEnable = true;
 		sceneDesc.pipeline.depthStencil.depthWriteEnable = true;
@@ -533,12 +535,13 @@ bool BuildFrameGraph(RenderGraph& graph, const rhi::Buffer* vb, const rhi::Buffe
 			ShaderBinding::StorageRead("fishes"),
 			ShaderBinding::Uniform("AtmosphereParams"),
 			ShaderBinding::Sampled("shadowMap", rhi::SamplerDesc::Nearest()) };
-		sceneDesc.vertexStreams.push_back(VertexStreamBinding{ "FishVB", {}, 0 });
-		sceneDesc.indexStream = IndexStreamBinding{ "FishIB", {}, 0, IndexType::UInt32 };
 	}
-	builder.DeclarePass("Scene",
-		{ "FrameUniforms", "BoidsParams", "fishes", "AtmosphereParams", "shadowMap", "FishVB", "FishIB" },
-		{ "canvas", "depth" }, Pass::Render, sceneDesc);
+	auto sceneDraw = BindMeshGeometry(builder, sceneDesc, "FishGeometry", fishMesh, 0, fishInputs, &meshError);
+	if (!sceneDraw) {
+		cerr << "Scene: " << meshError << '\n';
+		return false;
+	}
+	builder.DeclarePass("Scene", Pass::Render, std::move(sceneDesc));
 
 	RenderPassDesc backDesc;
 	{
@@ -572,16 +575,23 @@ bool BuildFrameGraph(RenderGraph& graph, const rhi::Buffer* vb, const rhi::Buffe
 	else
 		builder.DeclarePass("Present", { "Backbuffer" }, {}, Pass::Present, PresentPassDesc{});
 
-	LowerResult lower = builder.Lower();
-	if (!lower.ok) {
+	LowerResult lower;
+	if (!builder.Build(graph, &lower)) {
 		for (const auto& diagnostic : lower.diagnostics)
 			cerr << "RenderGraphBuilder: " << diagnostic.message << "\n";
 		return false;
 	}
-	builder.Build(graph);
 	graph.ProcessRegister();
 	graph.GenerateSubmitSequence();
 	graph.RealizeAll();
+
+	shadowDraw->instanceCount = kFishCount;
+	sceneDraw->instanceCount = kFishCount;
+	static_cast<RenderPass*>(graph.FindPass("Shadow"))->SetDraw(*shadowDraw);
+	static_cast<RenderPass*>(graph.FindPass("Scene"))->SetDraw(*sceneDraw);
+	DrawSource fullscreenDraw;
+	fullscreenDraw.count = 3;
+	static_cast<RenderPass*>(graph.FindPass("Back"))->SetDraw(fullscreenDraw);
 	return true;
 }
 
@@ -760,7 +770,7 @@ int main(int argc, char** argv) {
 		return 1;
 	}
 
-	FishMesh mesh;
+	Mesh mesh;
 	std::string meshError;
 	if (!LoadFishMesh(kAssetDir + "/lowpoly_fish.glb", mesh, &meshError)) {
 		cerr << "鱼网格加载失败: " << meshError << "\n";
@@ -768,22 +778,14 @@ int main(int argc, char** argv) {
 		if (glfwInitialized) glfwTerminate();
 		return 1;
 	}
-	cout << "Fish mesh loaded: verts=" << mesh.vertices.size()
-	     << " indices=" << mesh.indices.size() << "\n";
+	cout << "Fish mesh loaded: verts=" << mesh.vertexCount
+	     << " indices=" << mesh.indices->IndexCount() << "\n";
 
-	auto vertexBuffer = device->UploadBuffer(mesh.vertices.data(),
-		static_cast<uint64_t>(mesh.vertices.size() * sizeof(FishVertex)), rhi::BufferUsage::Vertex,
-		rhi::PipelineStage::VertexInput, rhi::Access::VertexAttributeRead);
-	if (vertexBuffer == nullptr) {
-		cerr << "顶点缓冲创建失败\n";
-		return 1;
-	}
-
-	auto indexBuffer = device->UploadBuffer(mesh.indices.data(),
-		static_cast<uint64_t>(mesh.indices.size() * sizeof(uint32_t)), rhi::BufferUsage::Index,
-		rhi::PipelineStage::VertexInput, rhi::Access::IndexRead);
-	if (indexBuffer == nullptr) {
-		cerr << "索引缓冲创建失败\n";
+	const auto fishGpu = UploadMesh(*device, mesh, &meshError);
+	if (!fishGpu) {
+		cerr << meshError << '\n';
+		if (window) glfwDestroyWindow(window);
+		if (glfwInitialized) glfwTerminate();
 		return 1;
 	}
 
@@ -886,30 +888,9 @@ int main(int argc, char** argv) {
 		if (!graphReady) {
 			graph.emplace(device.get(), &shaders);
 			const rhi::Image* backbuffer = currentFrame.has_value() ? currentFrame->backbuffer : nullptr;
-			if (!BuildFrameGraph(*graph, vertexBuffer.get(), indexBuffer.get(),
-				static_cast<uint32_t>(mesh.indices.size()), atmoUBO.get(),
+			if (!BuildFrameGraph(*graph, *fishGpu, atmoUBO.get(),
 				t2a.get(), ms.get(), sa.get(), backbuffer, options.smoke, fishModule)) {
 				return 1;
-			}
-
-			for (uint32_t i = 0; graph->GetPass(i) != nullptr; ++i) {
-				Pass* p = graph->GetPass(i);
-				if (p->get_type() != Pass::Render)
-					continue;
-				RenderPass* rp = static_cast<RenderPass*>(p);
-				DrawSource draw;
-				draw.kind = DrawSource::Direct;
-				if (p->get_name() == "Back") {
-					draw.count = 3;
-					draw.instanceCount = 1;
-				}
-				else {
-					draw.count = static_cast<uint32_t>(mesh.indices.size());
-					draw.first = 0;
-					draw.vertexOffset = 0;
-					draw.instanceCount = kFishCount;
-				}
-				rp->SetDraw(draw);
 			}
 
 			InitBoids(*graph, kFishCount, &initialPositions, &initialDirs);
