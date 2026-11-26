@@ -49,6 +49,9 @@ target_link_libraries(CubeReflection PRIVATE
 	Vulkan::Vulkan
 	glfw
 	glm::glm)
+	if(TARGET Engine0ShaderCompile)
+		target_link_libraries(CubeReflection PRIVATE Engine0ShaderCompile)
+	endif()
 
 # ---- Shader 编译：GLSL -> SPIR-V（glslc，Vulkan SDK 自带）----
 set(CUBE_REFLECTION_SHADER_DIR "${CMAKE_BINARY_DIR}/cube_reflection_shaders")

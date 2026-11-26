@@ -3388,12 +3388,11 @@ HostContext RenderGraph::MakeHostContext(uint32_t passId) {
 				m_graphicDevice->QueueTimeline(m_plan.batches[b].queue), m_batchTimelineValue[b] });
 		}
 		for (uint32_t hp : it->second.hostPasses) {
-			auto vit = m_hostSignalValue.find(hp);
-			if (vit != m_hostSignalValue.end() && m_hostTimeline)
-				upstream.push_back(HostContext::Upstream{ m_hostTimeline.get(), vit->second });
+			if (rhi::Semaphore* semaphore = HostSemaphore(hp))
+				upstream.push_back(HostContext::Upstream{ semaphore, m_hostSemaphoreValue });
 		}
 	}
-	const std::uint64_t signalValue = m_hostSignalValue.count(passId) ? m_hostSignalValue[passId] : 0;
+	const std::uint64_t signalValue = m_hostSemaphoreValue;
 
 	HostContext::Bindings bindings;
 	if (Pass* pass = GetPass(passId)) {
@@ -3437,7 +3436,12 @@ HostContext RenderGraph::MakeHostContext(uint32_t passId) {
 		}
 	}
 
-	return HostContext(m_hostTimeline.get(), signalValue, std::move(upstream), std::move(bindings));
+	return HostContext(HostSemaphore(passId), signalValue, std::move(upstream), std::move(bindings));
+}
+
+rhi::Semaphore* RenderGraph::HostSemaphore(uint32_t passId) {
+	auto it = m_hostSemaphores.find(passId);
+	return it != m_hostSemaphores.end() ? it->second.get() : nullptr;
 }
 
 void RenderGraph::LaunchHostWorkers(uint32_t batchIndex) {
@@ -4454,16 +4458,22 @@ void RenderGraph::SubmitGraph(const FrameSync& sync) {
 			std::cerr << "RenderGraph: FrameSync 需要图中存在 Present 节点" << std::endl;
 	}
 
-	m_hostSignalValue.clear();
-	for (uint32_t passId : m_hostPassOrder)
-		m_hostSignalValue[passId] = ++m_hostTimelineValue;
-	m_batchHostWait.assign(m_plan.batches.size(), 0);
-	for (uint32_t b = 0; b < m_batchHostPasses.size(); ++b)
-		for (uint32_t passId : m_batchHostPasses[b])
-			m_batchHostWait[b] = std::max(m_batchHostWait[b], m_hostSignalValue[passId]);
-
-	if (!m_hostPassOrder.empty() && !m_hostTimeline)
-		m_hostTimeline = m_graphicDevice->CreateTimelineSemaphore(0);
+	// 每个 Host 段一条独立 timeline：本帧统一取同一个新值。任一段只推进自己那条时间线，
+	// 因此后段先跑也只推进它自己的值，不会像共享时间线那样越权满足前段消费者的等待。
+	// 按 passId 惰性创建且只增不减：重建图时若段集合变化，旧信号量仍可能被在飞帧等待，
+	// 不能在此销毁（随图析构回收）。新建的信号量从 0 开始，而本帧值只增不减，仍严格递增。
+	m_hostSemaphoresReady = !m_hostPassOrder.empty();
+	for (uint32_t passId : m_hostPassOrder) {
+		auto it = m_hostSemaphores.find(passId);
+		if (it == m_hostSemaphores.end() || it->second == nullptr) {
+			m_hostSemaphores[passId] = m_graphicDevice->CreateTimelineSemaphore(0);
+			it = m_hostSemaphores.find(passId);
+		}
+		if (it == m_hostSemaphores.end() || it->second == nullptr)
+			m_hostSemaphoresReady = false; // 创建失败时退回内联执行，避免消费者永久等待
+	}
+	if (!m_hostPassOrder.empty())
+		++m_hostSemaphoreValue;
 
 	const bool timelineSync = m_graphicDevice->QueueTimeline(rhi::QueueClass::Graphics) != nullptr;
 	const uint32_t submitSlot = m_currentSlot < m_frameSlots.size() ? m_currentSlot : 0;
@@ -4478,7 +4488,7 @@ void RenderGraph::SubmitGraph(const FrameSync& sync) {
 	for (uint32_t b = 0; b < m_plan.batches.size(); ++b) {
 		const QueueBatch& batch = m_plan.batches[b];
 		if (!m_batchHasGpu[b]) {
-			if (m_hostTimeline)
+			if (m_hostSemaphoresReady)
 				LaunchHostWorkers(b);
 			else if (!m_hostPassOrder.empty())
 				RunHostPassesInline(b);
@@ -4488,7 +4498,7 @@ void RenderGraph::SubmitGraph(const FrameSync& sync) {
 		rhi::CommandList cmd = m_graphicDevice->BeginCommandList(batch.queue);
 		RecordBatch(cmd, b);
 
-		if (!m_hostTimeline && !m_hostPassOrder.empty())
+		if (!m_hostSemaphoresReady && !m_hostPassOrder.empty())
 			RunHostPassesInline(b);
 
 		std::vector<rhi::SemaphoreWait> waits;
@@ -4508,11 +4518,16 @@ void RenderGraph::SubmitGraph(const FrameSync& sync) {
 			if (sp < slotState.crossQueueSemaphores.size() && slotState.crossQueueSemaphores[sp])
 				waits.push_back(rhi::SemaphoreWait{ slotState.crossQueueSemaphores[sp].get(), waitStage });
 		}
-		if (m_hostTimeline && m_batchHostWait[b] != 0) {
+		// 本批 GPU 命令只等本批 Host 段各自的时间线；每条时间线只由它自己的段推进，
+		// 因此不会出现"后段的值替前段放行"。
+		if (m_hostSemaphoresReady && b < m_batchHostPasses.size()) {
 			const rhi::PipelineStage hostWaitStage =
 				b < m_batchHostStage.size() && m_batchHostStage[b] != rhi::PipelineStage::None
 				? m_batchHostStage[b] : rhi::PipelineStage::AllCommands;
-			waits.push_back(rhi::SemaphoreWait{ m_hostTimeline.get(), hostWaitStage, m_batchHostWait[b] });
+			for (uint32_t passId : m_batchHostPasses[b]) {
+				if (const rhi::Semaphore* semaphore = HostSemaphore(passId))
+					waits.push_back(rhi::SemaphoreWait{ semaphore, hostWaitStage, m_hostSemaphoreValue });
+			}
 		}
 
 		std::vector<rhi::SemaphoreSignal> signals;
@@ -4536,7 +4551,7 @@ void RenderGraph::SubmitGraph(const FrameSync& sync) {
 		info.signals = signals;
 		m_batchTimelineValue[b] = m_graphicDevice->Submit(info);
 
-		if (m_hostTimeline)
+		if (m_hostSemaphoresReady)
 			LaunchHostWorkers(b);
 	}
 	m_firstFramePending = false;

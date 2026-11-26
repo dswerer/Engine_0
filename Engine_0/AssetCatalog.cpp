@@ -1,7 +1,11 @@
 #include "AssetCatalog.h"
 
+#include "ManifestJson.h"
+
 #include <cctype>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <utility>
 
 namespace dEngine {
@@ -85,6 +89,49 @@ namespace dEngine {
 					return entry.first;
 			}
 			return std::nullopt;
+		}
+
+		template <typename E, size_t N>
+		const char* NameFrom(E value, const std::pair<E, const char*> (&table)[N]) {
+			for (const auto& entry : table) {
+				if (value == entry.first)
+					return entry.second;
+			}
+			return nullptr;
+		}
+
+		// 位标志写成字符串数组，例如 ["Sampled", "TransferDst"]；未知位由调用方决定是否报错。
+		template <typename E, size_t N>
+		bool AppendUsageArray(std::string& out, E usage,
+			const std::pair<E, const char*> (&table)[N], const char* label, std::string* error) {
+			uint32_t remaining = static_cast<uint32_t>(usage);
+			out.push_back('[');
+			bool first = true;
+			for (const auto& entry : table) {
+				const uint32_t bit = static_cast<uint32_t>(entry.first);
+				if ((remaining & bit) == 0)
+					continue;
+				if (!first)
+					out += ", ";
+				first = false;
+				detail::AppendJsonString(out, entry.second);
+				remaining &= ~bit;
+			}
+			out.push_back(']');
+			if (remaining != 0) {
+				if (error)
+					*error = std::string(label) + " contains unknown bits";
+				return false;
+			}
+			return true;
+		}
+
+		template <typename E, size_t N>
+		bool HasOnlyKnownUsageBits(E usage, const std::pair<E, const char*> (&table)[N]) {
+			uint32_t remaining = static_cast<uint32_t>(usage);
+			for (const auto& entry : table)
+				remaining &= ~static_cast<uint32_t>(entry.first);
+			return remaining == 0;
 		}
 
 		bool ValidateImageAsset(const ImageAsset& asset, std::string& error) {
@@ -625,6 +672,132 @@ namespace dEngine {
 			}
 		}
 		return ok;
+	}
+
+	std::string AssetCatalog::ToManifestJson() const {
+		std::string out = "{\n  \"version\": 1,\n  \"images\": {";
+		bool firstImage = true;
+		for (const auto& [name, asset] : m_images) {
+			if (!firstImage)
+				out += ",";
+			firstImage = false;
+
+			const char* format = NameFrom(asset.format, kImageFormats);
+			const char* layout = NameFrom(asset.initialLayout, kImageLayouts);
+			const char* viewType = NameFrom(asset.viewType, kViewTypes);
+
+			out += "\n    ";
+			detail::AppendJsonString(out, name);
+			out += ": {\n";
+			out += "      \"path\": ";
+			detail::AppendJsonString(out, asset.logicalPath);
+			out += ",\n      \"format\": ";
+			detail::AppendJsonString(out, format ? format : "None");
+			out += ",\n      \"usage\": ";
+			AppendUsageArray(out, asset.usage, kImageUsages, "image usage", nullptr);
+			out += ",\n      \"initialLayout\": ";
+			detail::AppendJsonString(out, layout ? layout : "Undefined");
+			out += ",\n      \"width\": ";
+			out += std::to_string(asset.width);
+			out += ",\n      \"height\": ";
+			out += std::to_string(asset.height);
+			out += ",\n      \"depth\": ";
+			out += std::to_string(asset.depth);
+			out += ",\n      \"arrayLayers\": ";
+			out += std::to_string(asset.arrayLayers);
+			out += ",\n      \"mipLevels\": ";
+			out += std::to_string(asset.mipLevels);
+			out += ",\n      \"samples\": ";
+			out += std::to_string(asset.samples);
+			out += ",\n      \"viewType\": ";
+			detail::AppendJsonString(out, viewType ? viewType : "None");
+			out += ",\n      \"srgb\": ";
+			out += asset.srgb ? "true" : "false";
+			out += ",\n      \"flipY\": ";
+			out += asset.flipY ? "true" : "false";
+			out += ",\n      \"generateMips\": ";
+			out += asset.generateMips ? "true" : "false";
+			out += "\n    }";
+		}
+		out += firstImage ? "},\n" : "\n  },\n";
+
+		out += "  \"buffers\": {";
+		bool firstBuffer = true;
+		for (const auto& [name, asset] : m_buffers) {
+			if (!firstBuffer)
+				out += ",";
+			firstBuffer = false;
+
+			out += "\n    ";
+			detail::AppendJsonString(out, name);
+			out += ": {\n";
+			out += "      \"path\": ";
+			detail::AppendJsonString(out, asset.logicalPath);
+			out += ",\n      \"usage\": ";
+			AppendUsageArray(out, asset.usage, kBufferUsages, "buffer usage", nullptr);
+			out += ",\n      \"hostVisible\": ";
+			out += asset.hostVisible ? "true" : "false";
+			out += ",\n      \"byteSize\": ";
+			out += std::to_string(asset.byteSize);
+			out += "\n    }";
+		}
+		out += firstBuffer ? "}\n" : "\n  }\n";
+		out += "}\n";
+		return out;
+	}
+
+	bool AssetCatalog::SaveManifest(const std::filesystem::path& path, std::string* error) const {
+		if (path.empty()) {
+			SetError(error, "asset manifest path is empty");
+			return false;
+		}
+
+		for (const auto& [name, asset] : m_images) {
+			if (!NameFrom(asset.format, kImageFormats)) {
+				SetError(error, "image \"" + name + "\" has an unknown format value");
+				return false;
+			}
+			if (!NameFrom(asset.initialLayout, kImageLayouts)) {
+				SetError(error, "image \"" + name + "\" has an unknown initialLayout value");
+				return false;
+			}
+			if (!NameFrom(asset.viewType, kViewTypes)) {
+				SetError(error, "image \"" + name + "\" has an unknown viewType value");
+				return false;
+			}
+			if (!HasOnlyKnownUsageBits(asset.usage, kImageUsages)) {
+				SetError(error, "image \"" + name + "\" usage contains unknown bits");
+				return false;
+			}
+		}
+		for (const auto& [name, asset] : m_buffers) {
+			if (!HasOnlyKnownUsageBits(asset.usage, kBufferUsages)) {
+				SetError(error, "buffer \"" + name + "\" usage contains unknown bits");
+				return false;
+			}
+		}
+
+		std::error_code ec;
+		const std::filesystem::path parent = path.parent_path();
+		if (!parent.empty())
+			std::filesystem::create_directories(parent, ec);
+		if (ec) {
+			SetError(error, "cannot create asset manifest directory \"" + parent.string() + "\": " + ec.message());
+			return false;
+		}
+
+		std::ofstream file(path, std::ios::binary | std::ios::trunc);
+		if (!file) {
+			SetError(error, "cannot open asset manifest for writing: " + path.string());
+			return false;
+		}
+		const std::string json = ToManifestJson();
+		file.write(json.data(), static_cast<std::streamsize>(json.size()));
+		if (!file) {
+			SetError(error, "cannot write asset manifest: " + path.string());
+			return false;
+		}
+		return true;
 	}
 
 	const ImageAsset* AssetCatalog::FindImage(std::string_view name) const {

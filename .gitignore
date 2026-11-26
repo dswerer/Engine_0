@@ -368,3 +368,9 @@ FodyWeavers.xsd
 
 # runtime logs
 run_log.txt
+
+# dsh
+.dsh-project-memory/
+
+# local scratch / reproduction artifacts
+.tmp_repro/

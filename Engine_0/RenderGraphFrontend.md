@@ -393,17 +393,21 @@ auto packed = assets.Resolve("pack:shaders/blur.comp.spv"); // 内存包
 
 ### 11.2 ShaderLibrary
 
-构建期为每个目标生成 `shaders.manifest.json`，与 `glslc` 共用同一份源列表；运行时以逻辑名解析阶段、SPIR-V 路径与入口点。
+构建期为每个目标生成 `shaders.manifest.json`，与 `glslc` 共用同一份源列表；运行时以逻辑名解析阶段、SPIR-V 路径与入口点。`Resolve` 也可把 GLSL 源按需编译为 SPIR-V：优先在进程内调用 `shaderc`，未编译进 `shaderc` 时回退到 `glslc` 子进程；结果按源码、阶段与宏缓存。
 
 ```cpp
 ShaderLibrary shaders(assets);
 std::vector<std::string> warnings;
 shaders.LoadManifest("shaders/shaders.manifest.json", &warnings);
-auto stage = shaders.Resolve("blur.comp");  // 阶段 + 路径 + entryPoint
+shaders.SetGlslcPath("C:/VulkanSDK/1.4.350.0/Bin/glslc.exe"); // 可省略，默认查找
+auto stage = shaders.Resolve("blur.comp");  // 阶段 + 路径或内存 SPIR-V + entryPoint
 ```
 
 - 阶段可由清单显式给出，也可按 `.vert/.frag/.comp/.tesc/.tese/.geom` 推断；冲突时登记失败。
-- `Resolve` 校验文件存在与 SPIR-V 魔数（`0x07230203`），避免把 GLSL 源误配为 `.spv`。
+- `.spv` 源会校验文件存在与 SPIR-V 魔数（`0x07230203`）；`.vert/.frag/.comp/.tesc/.tese/.geom/.task/.mesh/.glsl` 视为 GLSL 源，在 `Resolve` 时编译并填入 `ShaderStageDesc.spirv`，失败信息包含编译器诊断。
+- 运行期编译默认开启，可用 `SetRuntimeCompilation(false)` 关闭；`defines` 中的 `NAME`/`NAME=VALUE` 会作为宏传给编译器。
+- 编译器优先使用 CMake 找到并链接的 `shaderc`（构建输出 `runtime shader compilation enabled (shaderc)`）；没有 `shaderc` 时回退到 `glslc` 子进程，依次按 `SetGlslcPath`、`ENGINE0_GLSLC`、构建期路径、`VULKAN_SDK`、`PATH` 查找。
+- 编译结果按源码内容、逻辑路径、阶段、入口点、宏与后端做内存缓存；`SetCompileCacheDirectory` 可再启用磁盘缓存。
 - `ResolveStages` 批量解析并汇总全部失败原因；`Revision(name)` 返回 mtime/size 供变更检测。
 - 新增着色器只需加入对应目标的 `*_SHADER_SOURCES`，清单与 C++ 引用都无需手写路径。
 

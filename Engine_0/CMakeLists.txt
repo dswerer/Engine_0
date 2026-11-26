@@ -44,6 +44,16 @@ find_package(Vulkan REQUIRED)
 find_package(glfw3 REQUIRED)
 find_package(glm REQUIRED)
 
+# 运行期 GLSL -> SPIR-V：优先使用 shaderc（进程内编译），找不到时回退到 Vulkan SDK 的 glslc。
+# 两者都通过 Engine0ShaderCompile 传播给使用 ShaderLibrary 的目标。
+find_package(unofficial-shaderc CONFIG QUIET)
+add_library(Engine0ShaderCompile INTERFACE)
+if (TARGET unofficial::shaderc::shaderc)
+  target_link_libraries(Engine0ShaderCompile INTERFACE unofficial::shaderc::shaderc)
+  target_compile_definitions(Engine0ShaderCompile INTERFACE ENGINE0_HAS_SHADERC=1)
+  message(STATUS "Engine_0: runtime shader compilation enabled (shaderc)")
+endif()
+
 target_include_directories(Engine_0 PUBLIC ${CMAKE_SOURCE_DIR}/external)
 
 if (CMAKE_VERSION VERSION_GREATER 3.12)
@@ -64,7 +74,8 @@ target_compile_definitions (Engine_0 PRIVATE ENGINE_ASSET_DIR="${CMAKE_CURRENT_S
 target_link_libraries(Engine_0 PUBLIC
 	Vulkan::Vulkan
 	glfw
-	glm::glm)
+	glm::glm
+	Engine0ShaderCompile)
 
 # ---- Shader 清单：逻辑名 -> { stage, path }，与 glslc 共用同一份源列表 ----
 # 运行期由 ShaderLibrary 读取，避免在 C++ 中硬编码 SPIR-V 路径。
@@ -129,6 +140,17 @@ else()
 	find_program(ENGINE_GLSLC glslc HINTS "$ENV{VULKAN_SDK}/Bin")
 endif()
 
+if (TARGET Engine0ShaderCompile)
+  if (ENGINE_GLSLC)
+    file(TO_CMAKE_PATH "${ENGINE_GLSLC}" ENGINE_GLSLC_NORMALIZED)
+    target_compile_definitions(Engine0ShaderCompile INTERFACE
+      ENGINE0_GLSLC_PATH="${ENGINE_GLSLC_NORMALIZED}")
+    message(STATUS "Engine_0: runtime shader compilation enabled (glslc: ${ENGINE_GLSLC_NORMALIZED})")
+  else()
+    message(STATUS "Engine_0: glslc not found; runtime shader compilation unavailable")
+  endif()
+endif()
+
 if (ENGINE_GLSLC)
 	set(ENGINE_SPIRV_OUTPUTS "")
 	foreach(src ${ENGINE_SHADER_SOURCES})
@@ -153,11 +175,14 @@ endif()
 # 示例：独立可执行目标
 option(ENGINE0_BUILD_RETRIEVE "Build the Assimp retrieve example" ON)
 option(ENGINE0_BUILD_CUBE_REFLECTION "Build the Mesh cube reflection example" ON)
+option(ENGINE0_BUILD_DEFERRED "Build the deferred shading example" ON)
 if(ENGINE0_BUILD_RETRIEVE)
 	add_subdirectory("examples/retrieve")
 endif()
 if(ENGINE0_BUILD_CUBE_REFLECTION)
 	add_subdirectory("examples/cube_reflection")
 endif()
-
+if(ENGINE0_BUILD_DEFERRED)
+	add_subdirectory("examples/deferred")
+endif()
 # TODO: 如有需要，请添加测试并安装目标。
