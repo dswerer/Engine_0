@@ -4,6 +4,8 @@
 
 namespace dEngine {
 
+	class MeshGpu;
+
 	// 由渲染技术声明，与具体着色器的输入 location / 类型保持一致。
 	struct MeshShaderInput {
 		VertexSemantic semantic = VertexSemantic::Position;
@@ -26,13 +28,19 @@ namespace dEngine {
 		DrawSource draw;
 	};
 
-	// 在创建/上传阶段调用：先校验 Mesh，再匹配所需语义和格式，最后转换范围与 binding。
-	// 失败时 output 保持原值；成功时清空 error。不能在修改源 Mesh 后复用旧结果。
+	// CPU 入口先校验 Mesh。GPU 入口复用 UploadMesh 已校验的布局与范围快照。
+	// 失败时 output 保持原值，成功时清空 error。
 	bool BuildMeshDrawData(const Mesh& mesh, size_t submeshIndex,
 		const std::vector<MeshShaderInput>& inputs, MeshDrawData& output,
 		std::string* error = nullptr);
+	bool BuildMeshDrawData(const MeshGpu& mesh, size_t submeshIndex,
+		const std::vector<MeshShaderInput>& inputs, MeshDrawData& output,
+		std::string* error = nullptr);
 
-	// 第一条路径：Mesh 提供几何约束，渲染层提供实际要使用的 PipelineDesc。
+	// 将几何输入写入渲染技术选定的管线，着色器和光栅化等状态由技术配置。
+	void ApplyMeshPipeline(const MeshDrawData& geometry, PipelineDesc& pipeline);
+
+	// 校验渲染层显式填写的 PipelineDesc 是否与 Mesh 几何兼容。
 	// 检查显式布局的 binding/stride/input rate、location/format/offset、拓扑及 patch 大小。
 	// 布局须与 BuildMeshDrawData 的映射完全对应（向量顺序可不同）；此入口不接受额外实例流。
 	// 不修改 Mesh 或管线；不创建缓冲、注册 Pass 或反射 shader。inputs 的语义/location 契约由技术提供，

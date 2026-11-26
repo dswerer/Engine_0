@@ -4,7 +4,7 @@
 
 项目当前以冒烟测试程序作为主要运行入口，同时它也是两层 API 的完整使用样例。
 
-Mesh 新增入口：[设计与渲染对接](docs/Mesh设计与渲染对接.md)、[CPU/GPU 测试与属性查看](tests/README.md)、[本机验证记录](docs/Mesh验证记录.md)。CubeReflection 示例已通过 Mesh 数据和绘制适配完成渲染。
+CubeReflection 和 Retrieve 使用 `UploadMesh` 上传静态几何，通过 `BindMeshGeometry` 从网格填充管线的几何字段与绘制范围。[设计与渲染对接](docs/Mesh设计与渲染对接.md) · [CPU/GPU 测试与属性查看](tests/README.md)
 
 ## 目录
 

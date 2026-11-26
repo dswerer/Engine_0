@@ -1,4 +1,5 @@
 #include "MeshDrawData.h"
+#include "MeshGpu.h"
 
 #include <algorithm>
 #include <set>
@@ -6,15 +7,14 @@
 
 namespace dEngine {
 
-	bool BuildMeshDrawData(const Mesh& mesh, size_t submeshIndex,
+	// layout 和 metadata 来自同一次通过校验的 Mesh。
+	static bool BuildMeshDrawData(const VertexLayout& layout, const std::optional<MeshDrawMetadata>& metadata,
 		const std::vector<MeshShaderInput>& inputs, MeshDrawData& output, std::string* error) {
 		auto fail = [&](std::string message) {
 			if (error) *error = "MeshDrawData: " + std::move(message);
 			return false;
 		};
-		std::vector<std::string> errors;
-		if (!mesh.Validate(&errors)) return fail(errors.front());
-		if (submeshIndex >= mesh.submeshes.size()) return fail("子网格下标越界");
+		if (!metadata) return fail("子网格下标越界");
 		if (inputs.empty()) return fail("渲染技术未声明顶点输入");
 
 		MeshDrawData result;
@@ -24,7 +24,7 @@ namespace dEngine {
 			if (!locations.insert(input.location).second) return fail("重复的着色器 location");
 			if (!semantics.emplace(input.semantic, input.semanticIndex).second)
 				return fail("重复的着色器输入语义");
-			const auto* attribute = mesh.FindAttribute(input.semantic, input.semanticIndex);
+			const auto* attribute = layout.FindAttribute(input.semantic, input.semanticIndex);
 			if (attribute == nullptr)
 				return fail("Mesh 缺少 location " + std::to_string(input.location) + " 所需的属性");
 			if (attribute->format != input.format)
@@ -33,31 +33,45 @@ namespace dEngine {
 			auto source = std::find(result.sourceBindings.begin(), result.sourceBindings.end(), attribute->binding);
 			const uint32_t binding = static_cast<uint32_t>(source - result.sourceBindings.begin());
 			if (source == result.sourceBindings.end()) {
-				const auto layout = std::find_if(mesh.layout.bindings.begin(), mesh.layout.bindings.end(),
+				const auto sourceLayout = std::find_if(layout.bindings.begin(), layout.bindings.end(),
 					[&](const rhi::VertexInputBinding& b) { return b.binding == attribute->binding; });
 				result.sourceBindings.push_back(attribute->binding);
-				result.vertexBindings.push_back({binding, layout->stride, false});
+				result.vertexBindings.push_back({binding, sourceLayout->stride, false});
 			}
 			result.vertexAttributes.push_back({input.location, binding, input.format, attribute->offset});
 		}
 
-		const auto& submesh = mesh.submeshes[submeshIndex];
-		result.topology = submesh.topology;
-		result.patchControlPoints = submesh.patchControlPoints;
-		if (const auto* indexed = std::get_if<IndexedRange>(&submesh.range)) {
-			result.indexType = mesh.indices->type;
-			result.draw.count = indexed->indexCount;
-			result.draw.first = indexed->firstIndex;
-			result.draw.vertexOffset = indexed->baseVertex;
-		}
-		else {
-			const auto& direct = std::get<VertexRange>(submesh.range);
-			result.draw.count = direct.vertexCount;
-			result.draw.first = direct.firstVertex;
-		}
+		result.topology = metadata->topology;
+		result.patchControlPoints = metadata->patchControlPoints;
+		result.indexType = metadata->indexType;
+		result.draw.count = metadata->count;
+		result.draw.first = metadata->first;
+		result.draw.vertexOffset = metadata->baseVertex;
 		output = std::move(result);
 		if (error) error->clear();
 		return true;
+	}
+
+	bool BuildMeshDrawData(const Mesh& mesh, size_t submeshIndex,
+		const std::vector<MeshShaderInput>& inputs, MeshDrawData& output, std::string* error) {
+		std::vector<std::string> errors;
+		if (!mesh.Validate(&errors)) {
+			if (error) *error = "MeshDrawData: " + errors.front();
+			return false;
+		}
+		return BuildMeshDrawData(mesh.layout, mesh.GetDrawMetadata(submeshIndex), inputs, output, error);
+	}
+
+	bool BuildMeshDrawData(const MeshGpu& mesh, size_t submeshIndex,
+		const std::vector<MeshShaderInput>& inputs, MeshDrawData& output, std::string* error) {
+		return BuildMeshDrawData(mesh.Layout(), mesh.GetDrawMetadata(submeshIndex), inputs, output, error);
+	}
+
+	void ApplyMeshPipeline(const MeshDrawData& geometry, PipelineDesc& pipeline) {
+		pipeline.vertexBindings = geometry.vertexBindings;
+		pipeline.vertexAttributes = geometry.vertexAttributes;
+		pipeline.topology = geometry.topology;
+		pipeline.tessPatchControlPoints = geometry.patchControlPoints;
 	}
 
 	bool ValidateMeshPipeline(const Mesh& mesh, size_t submeshIndex,
