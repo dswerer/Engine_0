@@ -98,7 +98,7 @@ namespace dEngine {
 				if (b != nullptr) b->Invalidate();
 			}
 		}
-		// 先把主机写回写到设备可见内存，再推进主机 timeline 值（次序不能反）；幂等
+		// 先把主机写回写到设备可见内存，再推进本段 timeline 值（次序不能反）；幂等
 		void SignalGpu() {
 			if (mSigned) return;
 			for (const rhi::Buffer* b : mBindings.flush) {
@@ -605,11 +605,14 @@ namespace dEngine {
 		std::vector<bool> m_batchHasGpu;
 		std::vector<rhi::PipelineStage> m_batchHostStage;
 		std::vector<std::uint64_t> m_batchTimelineValue;
-		std::vector<std::uint64_t> m_batchHostWait;
 
-		std::unique_ptr<rhi::Semaphore> m_hostTimeline;
-		std::uint64_t m_hostTimelineValue = 0;
-		std::map<uint32_t, std::uint64_t> m_hostSignalValue;
+		// 每个 Host 段各自一条 timeline semaphore，信号值统一取当帧序号：任一段只推进自己那条时间线，
+		// 后段先于前段执行也只会推进后段自己的值，不会越权满足前段消费者的等待（共享时间线会）。
+		std::map<uint32_t, std::unique_ptr<rhi::Semaphore>> m_hostSemaphores;
+		std::uint64_t m_hostSemaphoreValue = 0;
+		bool m_hostSemaphoresReady = false;
+
+		rhi::Semaphore* HostSemaphore(uint32_t passId);
 
 		std::vector<std::thread> m_hostThreads;
 

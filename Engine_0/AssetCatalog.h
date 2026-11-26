@@ -3,6 +3,7 @@
 #include "rhi/RHIDesc.h"
 
 #include <cstdint>
+#include <filesystem>
 #include <map>
 #include <optional>
 #include <string>
@@ -52,6 +53,10 @@ namespace dEngine {
 
 		// 读取一份清单（可多次调用聚合多份）；errors 收全部问题
 		bool LoadManifest(std::string_view logicalPath, std::vector<std::string>* errors = nullptr);
+		// 将当前登记表序列化为与 LoadManifest 兼容的 JSON；不访问文件系统，也不校验路径是否存在
+		std::string ToManifestJson() const;
+		// 将清单写入磁盘路径（父目录不存在时自动创建）；枚举值非法时返回 false
+		bool SaveManifest(const std::filesystem::path& path, std::string* error = nullptr) const;
 		bool RegisterImage(ImageAsset asset, std::string* error = nullptr);
 		bool RegisterBuffer(BufferAsset asset, std::string* error = nullptr);
 

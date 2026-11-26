@@ -39,6 +39,24 @@
             }
         },
         {
+            "name": "vs2022",
+            "displayName": "Visual Studio 2022 (x64)",
+            "generator": "Visual Studio 17 2022",
+            "binaryDir": "${sourceDir}/out/build/vs2022",
+            "architecture": {
+                "value": "x64",
+                "strategy": "external"
+            },
+            "cacheVariables": {
+                "CMAKE_TOOLCHAIN_FILE": "C:/Users/DSwer/vcpkg/scripts/buildsystems/vcpkg.cmake"
+            },
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Windows"
+            }
+        },
+        {
             "name": "x86-debug",
             "displayName": "x86 Debug",
             "inherits": "windows-base",

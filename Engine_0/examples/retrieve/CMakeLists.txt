@@ -51,6 +51,9 @@ target_link_libraries(Retrieve PRIVATE
 	glfw
 	glm::glm
 	assimp::assimp)
+	if(TARGET Engine0ShaderCompile)
+		target_link_libraries(Retrieve PRIVATE Engine0ShaderCompile)
+	endif()
 
 # ---- Shader 编译：GLSL -> SPIR-V（glslc，Vulkan SDK 自带）----
 set(RETRIEVE_SHADER_DIR "${CMAKE_BINARY_DIR}/retrieve_shaders")

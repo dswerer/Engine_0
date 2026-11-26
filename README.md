@@ -60,6 +60,7 @@ RHI 层   dEngine::rhi（Vulkan 1.3，dynamic rendering + synchronization2）
 | 依赖 | 来源 |
 |---|---|
 | Vulkan、glslc | Vulkan SDK |
+| shaderc（可选，运行期编译） | vcpkg（`shaderc:x64-windows`，需与本机 MSVC 工具集匹配） |
 | GLFW、GLM | vcpkg |
 | assimp（retrieve 示例） | vcpkg（`assimp:x64-windows`） |
 | VMA、SPIR-V Reflect、stb_image、RenderDoc API | 仓库内 `Engine_0/external/` |
@@ -100,6 +101,7 @@ cmake --build out/build/x64-debug
 - 警告 C4819：源文件含中文注释但以 UTF-8 无 BOM 保存，MSVC 按代码页 936 读取，属已知无害警告。
 - 严禁 BOM：`CMakeLists.txt` 若被存成 UTF-8 with BOM，CMake 会报 `Parse error`；VS 保存编码须设为「UTF-8（无 BOM）」。
 - 找不到 `glslc` 时 CMake 跳过着色器编译并警告，依赖着色器的冒烟项不会执行。
+- `ShaderLibrary` 也可在 `Resolve` 时把 GLSL 源编译为 SPIR-V：默认启用，可用 `SetRuntimeCompilation(false)` 关闭。构建时找到 `shaderc` 则优先在进程内编译；否则回退到 `glslc` 子进程，按 `ENGINE0_GLSLC`、构建期记录的路径、`VULKAN_SDK`、`PATH` 查找，也可用 `SetGlslcPath` 指定。编译结果有内存缓存，`SetCompileCacheDirectory` 可再加磁盘缓存。
 
 ---
 
@@ -119,7 +121,7 @@ Engine_0/
 ├── ContentResolver.h/.cpp     # 逻辑路径 -> 内容源（磁盘/内存包、越界校验）
 ├── AssetCatalog / AssetLoader # 资产清单登记与宿主侧解码上传
 ├── AssetPack / ModulePack     # DENGPAK1 整包与模块自动打包
-├── ShaderLibrary.h/.cpp       # 逻辑名 -> 阶段 / SPIR-V 路径 / 入口点
+├── ShaderLibrary.h/.cpp       # 逻辑名 -> 阶段 / SPIR-V 或 GLSL 源 / 入口点
 ├── rhi/                       # RHI 层（详见 rhi/README.md）
 ├── shaders/                   # GLSL 源文件，构建期 glslc 编译
 ├── assets/                    # 纹理等运行时资源
@@ -282,7 +284,7 @@ loaded->Restore(restored, externals);   // 外部句柄与 Host 回调按名注�
 | 能力 | 说明 |
 |---|---|
 | 内容寻址 | ContentResolver 前缀挂载、越界拒绝、磁盘与 `pack:` 内存包两种来源 |
-| 着色器 | 构建期清单驱动，逻辑名解析、阶段推断、SPIR-V 魔数校验 |
+| 着色器 | 构建期清单或运行期编译 GLSL（进程内 shaderc，回退 glslc），逻辑名解析、阶段推断、SPIR-V 魔数校验、编译缓存 |
 | 资产清单 | AssetCatalog 纯描述登记；AssetLoader 宿主侧解码上传与句柄缓存 |
 | 整包 | DENGPAK1 内存整包零拷贝读取；模块自动收集依赖打包 |
 | 文档 | 图/模块声明层 JSON 序列化，round-trip 逐字节一致，支持从包内 Load |
@@ -350,6 +352,7 @@ cmake --build out\build\x64-debug --target retrieve_modules
 |---|---|
 | [Engine_0/RenderGraphFrontend.md](Engine_0/RenderGraphFrontend.md) | Builder 声明接口、拓扑与隐式版本规则、Lower/Build、前端合并、模块编译与实例化、资产与整包、图文档序列化、Pass 类型与 Tess/Geometry |
 | [Engine_0/rhi/README.md](Engine_0/rhi/README.md) | RHI 设计原则、Device/资源/管线/描述符、CommandList、帧循环与同步模型、多队列、陷阱备忘 |
+| [docs/词表.md](docs/词表.md) | 跨板块术语、结构体字段语义、易混词对照与缩写速查 |
 | [.trae/documents/](.trae/documents/) | 各阶段设计方案与实现计划（RHI 接口、多队列、子资源模型、borrow 布局跟踪等历史文档） |
 
 源码入口：前端 [RenderGraphBuilder.h](Engine_0/RenderGraphBuilder.h)、后端图 [RenderGraphAbstracted.h](Engine_0/RenderGraphAbstracted.h) 与 [RenderGraphDesc.h](Engine_0/RenderGraphDesc.h)、RHI [rhi/RHI.h](Engine_0/rhi/RHI.h) 与 [rhi/RHIDesc.h](Engine_0/rhi/RHIDesc.h)。

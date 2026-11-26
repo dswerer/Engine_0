@@ -5,6 +5,7 @@
 #include "RenderGraphDocument.h"
 #include "ShaderLibrary.h"
 
+#include <cstring>
 #include <fstream>
 #include <map>
 #include <sstream>
@@ -163,6 +164,16 @@ namespace dEngine {
 			return true;
 		}
 
+		// 包内清单必须指向 SPIR-V；GLSL 源在打包时已经编译，只改写扩展名
+		std::string PackedShaderPath(const std::string& logical) {
+			const auto parsed = ContentResolver::ParsePath(logical);
+			std::string path = parsed ? parsed->logical : logical;
+			const bool hasSpvSuffix = path.size() >= 4 && path.compare(path.size() - 4, 4, ".spv") == 0;
+			if (!hasSpvSuffix)
+				path += ".spv";
+			return path;
+		}
+
 		struct ShaderRec {
 			std::string name;
 			std::string stage;
@@ -277,17 +288,26 @@ namespace dEngine {
 				SetError(error, "shader not registered: " + ref);
 				return false;
 			}
-			if (!entry->stage) {
-				SetError(error, "shader stage not inferred: " + ref);
+			std::string resolveError;
+			const auto stage = shaders.Resolve(ref, &resolveError);
+			if (!stage) {
+				SetError(error, resolveError);
 				return false;
 			}
 			std::string path;
 			std::vector<uint8_t> bytes;
-			if (!ReadDependency(shaders.Resolver(), entry->logicalPath, path, bytes, error)
-				|| !AddFile(files, path, std::move(bytes), error))
+			if (!stage->spirv.empty()) {
+				path = PackedShaderPath(entry->logicalPath);
+				bytes.resize(stage->spirv.size() * sizeof(uint32_t));
+				std::memcpy(bytes.data(), stage->spirv.data(), bytes.size());
+			}
+			else if (!ReadDependency(shaders.Resolver(), entry->logicalPath, path, bytes, error)) {
 				return false;
-			shaderRecs.push_back({ ref, ShaderLibrary::StageToString(*entry->stage),
-				path, entry->entryPoint });
+			}
+			if (!AddFile(files, path, std::move(bytes), error))
+				return false;
+			shaderRecs.push_back({ ref, ShaderLibrary::StageToString(stage->stage),
+				path, stage->entryPoint });
 		}
 
 		std::vector<ImageRec> images;
